@@ -276,6 +276,11 @@ _LIVE_SORT_KEYS = {
 }
 
 
+def _live_sort_key(sort_by: str):
+    """Resolve a requested key, defaulting unknown values to newest-first age."""
+    return _LIVE_SORT_KEYS.get(sort_by or "age", _LIVE_SORT_KEYS["age"])
+
+
 def _sort_latest(items: List[dict], *date_fields: str) -> List[dict]:
     """Return API rows newest-first using the first populated date field.
 
@@ -335,7 +340,7 @@ async def list_jobs(
                 if j.get("spec", {}).get("owner") == owner
             ]
         summaries = [_live_job_to_summary(j) for j in jobs]
-        key_fn = _LIVE_SORT_KEYS.get(sort_by or "age")
+        key_fn = _live_sort_key(sort_by)
         summaries.sort(key=key_fn, reverse=(sort_dir == "desc"))
         total = len(summaries)
         offset = (page - 1) * per_page

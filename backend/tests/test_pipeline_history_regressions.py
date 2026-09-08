@@ -143,5 +143,16 @@ def test_testing_list_sort_uses_latest_available_date():
     ]
 
 
+def test_unknown_live_sort_key_falls_back_to_latest_age():
+    rows = [
+        {"name": "older", "created_at": "2026-09-05T09:00:00Z"},
+        {"name": "newer", "created_at": "2026-09-05T12:00:00Z"},
+    ]
+
+    rows.sort(key=fournos_api._live_sort_key("unsupported"), reverse=True)
+
+    assert [row["name"] for row in rows] == ["newer", "older"]
+
+
 def test_history_date_sort_falls_back_to_created_at():
     assert "coalesce" in str(db_service._SORT_COLUMNS["date"]).lower()
