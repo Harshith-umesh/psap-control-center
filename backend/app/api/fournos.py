@@ -276,6 +276,23 @@ _LIVE_SORT_KEYS = {
 }
 
 
+def _sort_latest(items: List[dict], *date_fields: str) -> List[dict]:
+    """Return API rows newest-first using the first populated date field.
+
+    Kubernetes list ordering is not a stable API contract. Keep every Testing
+    list deterministic at the backend boundary, while allowing the frontend's
+    sortable tables to apply a different user-selected order afterward.
+    """
+    return sorted(
+        items,
+        key=lambda item: (
+            next((item.get(field) for field in date_fields if item.get(field)), ""),
+            item.get("name", ""),
+        ),
+        reverse=True,
+    )
+
+
 # ─── routes: jobs ────────────────────────────────────────────────────────
 
 @router.get("/jobs", response_model=JobListResponse)
@@ -318,9 +335,8 @@ async def list_jobs(
                 if j.get("spec", {}).get("owner") == owner
             ]
         summaries = [_live_job_to_summary(j) for j in jobs]
-        key_fn = _LIVE_SORT_KEYS.get(sort_by)
-        if key_fn:
-            summaries.sort(key=key_fn, reverse=(sort_dir == "desc"))
+        key_fn = _LIVE_SORT_KEYS.get(sort_by or "age")
+        summaries.sort(key=key_fn, reverse=(sort_dir == "desc"))
         total = len(summaries)
         offset = (page - 1) * per_page
         summaries = summaries[offset: offset + per_page]
@@ -1081,7 +1097,11 @@ async def list_recurring_jobs(cluster: str = Query("")):
     jobs = await asyncio.to_thread(k8s.list_recurring_jobs)
     if cluster:
         jobs = [j for j in jobs if j.get("spec", {}).get("cluster") == cluster]
-    return [_recurring_job_to_response(j) for j in jobs]
+    return _sort_latest(
+        [_recurring_job_to_response(j) for j in jobs],
+        "last_scheduled_time",
+        "created_at",
+    )
 
 
 @router.get(
@@ -1158,7 +1178,11 @@ def _cluster_lock_to_response(job: dict) -> dict:
 @router.get("/cluster-locks", response_model=List[ClusterLockResponse])
 async def list_cluster_locks(cluster: str = Query("")):
     locks = await asyncio.to_thread(k8s.list_cluster_locks, None, cluster or None)
-    return [_cluster_lock_to_response(j) for j in locks]
+    return _sort_latest(
+        [_cluster_lock_to_response(j) for j in locks],
+        "scheduled_start_time",
+        "created_at",
+    )
 
 
 @router.post("/cluster-locks", response_model=ClusterLockResponse)
@@ -1223,8 +1247,16 @@ async def cluster_overview(cluster: str):
     return {
         "cluster": cluster,
         "current_jobs": [_live_job_to_summary(j) for j in current],
-        "recurring_jobs": [_recurring_job_to_response(j) for j in recurring],
-        "locks": [_cluster_lock_to_response(j) for j in locks],
+        "recurring_jobs": _sort_latest(
+            [_recurring_job_to_response(j) for j in recurring],
+            "last_scheduled_time",
+            "created_at",
+        ),
+        "locks": _sort_latest(
+            [_cluster_lock_to_response(j) for j in locks],
+            "scheduled_start_time",
+            "created_at",
+        ),
     }
 
 

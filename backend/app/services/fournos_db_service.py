@@ -32,7 +32,10 @@ _SORT_COLUMNS = {
     "cluster": FournosJob.cluster,
     "status": FournosJob.status,
     "owner": FournosJob.owner,
-    "date": FournosJob.completed_at,
+    # Some legacy/aborted jobs have no completed_at even though they are
+    # terminal. Treat their creation time as the best available date so NULL
+    # values do not float to the top of a descending PostgreSQL result.
+    "date": func.coalesce(FournosJob.completed_at, FournosJob.created_at),
     "duration": FournosJob.duration_seconds,
     "triggered_by": FournosJob.triggered_by_schedule,
 }
@@ -110,8 +113,9 @@ async def list_jobs(
     if created_before:
         filters.append(FournosJob.created_at <= created_before)
 
-    sort_col = _SORT_COLUMNS.get(sort_by or "date", FournosJob.completed_at)
+    sort_col = _SORT_COLUMNS.get(sort_by or "date", _SORT_COLUMNS["date"])
     order_by = sort_col.asc() if sort_dir == "asc" else sort_col.desc()
+    tie_breakers = (FournosJob.created_at.desc(), FournosJob.name.desc())
 
     is_pg = settings.DATABASE_URL.startswith("postgresql")
     if is_pg:
@@ -121,7 +125,7 @@ async def list_jobs(
         stmt = (
             select(FournosJob, func.count().over().label("total_count"))
             .where(*filters)
-            .order_by(order_by)
+            .order_by(order_by, *tie_breakers)
             .limit(limit)
             .offset(offset)
         )
@@ -142,7 +146,13 @@ async def list_jobs(
 
     # SQLite (and any other non-window-function-friendly backend): fall
     # back to the original two-query approach.
-    stmt = select(FournosJob).where(*filters).order_by(order_by).limit(limit).offset(offset)
+    stmt = (
+        select(FournosJob)
+        .where(*filters)
+        .order_by(order_by, *tie_breakers)
+        .limit(limit)
+        .offset(offset)
+    )
     count_stmt = select(func.count(FournosJob.id)).where(*filters)
 
     result = await session.execute(stmt)

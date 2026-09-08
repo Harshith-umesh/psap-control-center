@@ -2,6 +2,8 @@ from datetime import datetime, timedelta, timezone
 
 from app.services import fournos_k8s_client as k8s
 from app.services import fournos_watcher as watcher
+from app.api import fournos as fournos_api
+from app.services import fournos_db_service as db_service
 
 
 def test_taskrun_condition_specific_terminal_reasons_win_over_false_status():
@@ -109,3 +111,37 @@ def test_stage_snapshot_retries_are_timed_and_bounded():
     assert watcher._has_usable_stage_snapshot(
         [{"name": "test", "status": "Succeeded"}]
     ) is True
+
+
+def test_testing_list_sort_uses_latest_available_date():
+    rows = [
+        {
+            "name": "never-run",
+            "last_scheduled_time": None,
+            "created_at": "2026-09-05T09:00:00Z",
+        },
+        {
+            "name": "older-run",
+            "last_scheduled_time": "2026-09-05T10:00:00Z",
+            "created_at": "",
+        },
+        {
+            "name": "newer-run",
+            "last_scheduled_time": "2026-09-05T12:00:00Z",
+            "created_at": "",
+        },
+    ]
+
+    sorted_rows = fournos_api._sort_latest(
+        rows, "last_scheduled_time", "created_at"
+    )
+
+    assert [row["name"] for row in sorted_rows] == [
+        "newer-run",
+        "older-run",
+        "never-run",
+    ]
+
+
+def test_history_date_sort_falls_back_to_created_at():
+    assert "coalesce" in str(db_service._SORT_COLUMNS["date"]).lower()
