@@ -116,6 +116,11 @@ async def _run_migrations(conn):
 # via IF NOT EXISTS which both sqlite and postgres support).
 _INDEXES = [
     ("ix_fournos_jobs_completed", "fournos_jobs", "completed_at"),
+    (
+        "ix_fournos_jobs_effective_date",
+        "fournos_jobs",
+        "COALESCE(completed_at, created_at)",
+    ),
     ("ix_fournos_jobs_trigger_type", "fournos_jobs", "trigger_type"),
     ("ix_fournos_jobs_history", "fournos_jobs", "status, is_lock, trigger_type, completed_at"),
 ]

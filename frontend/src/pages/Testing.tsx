@@ -239,6 +239,11 @@ function RowActionsMenu({ items }: { items: Array<{ label: string; icon: Compone
 
 // ─── Job Table ──────────────────────────────────────────────────────────
 
+function formatHistoryDate(job: FournosJobSummary): string {
+  const timestamp = job.completed_at || job.created_at
+  return timestamp ? new Date(timestamp).toLocaleString() : '-'
+}
+
 function JobsTable({
   jobs,
   source,
@@ -299,7 +304,9 @@ function JobsTable({
                 </span>
               </td>
               <td className="px-4 py-3 text-sm text-gray-500">
-                {source === 'live' ? formatAge(job.created_at) : (job.completed_at ? new Date(job.completed_at).toLocaleString() : '-')}
+                {source === 'live'
+                  ? formatAge(job.created_at)
+                  : formatHistoryDate(job)}
               </td>
               <td className="px-4 py-3 text-sm text-gray-500">{job.owner || '-'}</td>
               <td className="px-4 py-3 text-sm text-gray-500">
@@ -1117,7 +1124,7 @@ function RecurringJobsPanel() {
   const [search, setSearch] = useState('')
   const [cluster, setCluster] = useState('')
   const [status, setStatus] = useState('')
-  const [sort, setSort] = useState<SortState>({ by: '', dir: 'asc' })
+  const [sort, setSort] = useState<SortState>({ by: 'last_run', dir: 'desc' })
 
   const clusterOptions = useMemo(
     () => Array.from(new Set((recurringJobs || []).map((r) => r.cluster))).sort(),
@@ -1141,7 +1148,7 @@ function RecurringJobsPanel() {
       schedule: (r) => r.schedule,
       cluster: (r) => r.cluster.toLowerCase(),
       phase: (r) => r.phase || '',
-      last_run: (r) => r.last_scheduled_time || '',
+      last_run: (r) => r.last_scheduled_time || r.created_at || '',
     })
   }, [recurringJobs, search, cluster, status, sort])
 
@@ -1221,7 +1228,7 @@ function ClusterLocksPanel() {
   const [search, setSearch] = useState('')
   const [cluster, setCluster] = useState('')
   const [status, setStatus] = useState('')
-  const [sort, setSort] = useState<SortState>({ by: '', dir: 'asc' })
+  const [sort, setSort] = useState<SortState>({ by: 'starts', dir: 'desc' })
 
   const clusterOptions = useMemo(
     () => Array.from(new Set((locks || []).map((l) => l.cluster))).sort(),
@@ -1359,7 +1366,7 @@ export default function Testing() {
   // rather than done in-browser (client-side sort would only reorder the
   // current page). Kept as two separate states since their sortable
   // columns differ slightly (Age vs. Date).
-  const [liveSort, setLiveSort] = useState<SortState>({ by: '', dir: 'desc' })
+  const [liveSort, setLiveSort] = useState<SortState>({ by: 'age', dir: 'desc' })
   const [historySort, setHistorySort] = useState<SortState>({ by: 'date', dir: 'desc' })
   const activeSort = activeTab === 'live' ? liveSort : historySort
   const setActiveSort = activeTab === 'live' ? setLiveSort : setHistorySort
