@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from app.services import fournos_k8s_client as k8s
 from app.services import fournos_watcher as watcher
 from app.api import fournos as fournos_api
+from app.core import database as database_core
 from app.services import fournos_db_service as db_service
 
 
@@ -156,3 +157,11 @@ def test_unknown_live_sort_key_falls_back_to_latest_age():
 
 def test_history_date_sort_falls_back_to_created_at():
     assert "coalesce" in str(db_service._SORT_COLUMNS["date"]).lower()
+
+
+def test_history_effective_date_index_is_created_for_existing_databases():
+    indexes = {name: columns for name, table, columns in database_core._INDEXES}
+
+    assert indexes["ix_fournos_jobs_effective_date"] == (
+        "COALESCE(completed_at, created_at)"
+    )

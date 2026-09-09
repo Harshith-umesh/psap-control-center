@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from sqlalchemy import (
     Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text, Index,
+    func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import relationship
@@ -72,6 +73,13 @@ class FournosJob(Base):
         # — without an index on completed_at, that ORDER BY forces a full
         # table scan + filesort that gets slower as history grows.
         Index("ix_fournos_jobs_completed", "completed_at"),
+        # History uses creation time only when a terminal job has no recorded
+        # completion time. Match that effective-date expression so the default
+        # newest-first query can remain an index scan as the table grows.
+        Index(
+            "ix_fournos_jobs_effective_date",
+            func.coalesce(completed_at, created_at),
+        ),
         Index("ix_fournos_jobs_trigger_type", "trigger_type"),
         # Composite index matching the History query's WHERE + ORDER BY
         # shape (status IN (...) AND is_lock = false AND trigger_type != ...
