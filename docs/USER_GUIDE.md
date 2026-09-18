@@ -181,8 +181,16 @@ Hearth provides GPU inventory discovery from a management cluster running the He
 ### Connecting Hearth
 
 1. Click the **Hearth** indicator in the sidebar (or the connect prompt on the Dashboard)
-2. Upload the kubeconfig for the Hearth management cluster
+2. Choose either:
+   - **Kubeconfig** — upload a kubeconfig for the Hearth/Fournos management cluster
+   - **OpenShift Login** — enter the cluster API URL and a specific user's username and password
 3. Once connected, GPU inventory appears on the Dashboard and cluster detail pages
+
+With OpenShift Login, the password is exchanged for that user's OAuth token
+and is not stored. Control Center keeps the user's existing permissions; it
+does not create or switch to a service account. The user must already be able
+to read the required Hearth and Fournos resources, and an expired OAuth token
+requires reconnecting.
 
 ### What Hearth Shows
 

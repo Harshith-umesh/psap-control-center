@@ -2,6 +2,17 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { hearthApi } from '../services/api'
 import toast from 'react-hot-toast'
 
+type HearthConnectionRequest =
+  | { method: 'kubeconfig'; file: File }
+  | {
+      method: 'credentials'
+      credentials: {
+        api_server_url: string
+        username: string
+        password: string
+      }
+    }
+
 export function useHearthStatus() {
   return useQuery({
     queryKey: ['hearthStatus'],
@@ -34,7 +45,10 @@ export function useConnectHearth() {
   const queryClient = useQueryClient()
 
   return useMutation({
-    mutationFn: (file: File) => hearthApi.connect(file),
+    mutationFn: (request: HearthConnectionRequest) =>
+      request.method === 'kubeconfig'
+        ? hearthApi.connect(request.file)
+        : hearthApi.connectWithCredentials(request.credentials),
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['hearthStatus'] })
       queryClient.invalidateQueries({ queryKey: ['hearthClusters'] })
