@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
 
 
@@ -61,3 +61,9 @@ class HearthStatusResponse(BaseModel):
 class HearthConnectResponse(BaseModel):
     success: bool
     message: str
+
+
+class HearthCredentialConnectRequest(BaseModel):
+    api_server_url: str = Field(..., min_length=1)
+    username: str = Field(..., min_length=1)
+    password: str = Field(..., min_length=1)
