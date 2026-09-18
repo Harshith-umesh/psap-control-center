@@ -187,7 +187,17 @@ oc logs deployment/psap-control-center-backend | tail -20
 
 **Cause**: No management cluster kubeconfig is configured, or the saved kubeconfig has expired.
 
-**Fix**: Click the Hearth indicator in the sidebar and upload a fresh kubeconfig for the management cluster.
+**Fix**: Click the Hearth indicator and either upload a fresh management-cluster kubeconfig or reconnect with the OpenShift API URL and the intended user's credentials. User-based connections must be renewed when their OAuth token expires.
+
+### OpenShift login succeeds but Hearth access fails
+
+**Cause**: The authenticated user does not have permission to list
+`FournosCluster` resources in the configured Hearth namespace, or the OAuth
+token expired after the connection was created.
+
+**Fix**: Grant that user the required read permissions and reconnect. Control
+Center deliberately keeps the supplied user's RBAC and does not elevate the
+connection through its service account.
 
 ### Hearth connected but no clusters listed
 

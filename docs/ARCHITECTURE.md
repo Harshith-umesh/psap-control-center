@@ -184,6 +184,7 @@ All endpoints live under `/api/v1`. OpenAPI docs available at `/docs`.
 | ------ | ---------------------------- | ---- | ------------------------------------ |
 | GET    | `/status`                    | No   | Hearth connection status             |
 | POST   | `/connect`                   | Yes  | Upload management cluster kubeconfig |
+| POST   | `/connect/credentials`       | Yes  | Login as a specific OpenShift user   |
 | POST   | `/disconnect`                | Yes  | Remove Hearth connection             |
 | GET    | `/clusters`                  | No   | List FournosCluster CRDs             |
 | GET    | `/clusters/{name}`           | No   | Get specific FournosCluster          |
@@ -415,6 +416,14 @@ Mutations (create, update, delete) automatically invalidate related query caches
 Hearth is an external system that manages GPU cluster inventory via Kubernetes Custom Resources.
 
 The integration works by connecting to a **management cluster** that runs the Hearth operator. The backend reads `FournosCluster` CRDs (group `fournos.dev`, version `v1`) from the configured namespace (default: `hearth`).
+
+The management connection can come from an uploaded kubeconfig or an
+OpenShift API URL, username, and password. Credential login stores the user's
+OAuth token in the generated kubeconfig and does not store the password or
+replace the user with Control Center's service account. Consequently, the
+user's existing RBAC applies and the connection must be renewed when that
+OAuth token expires. The same management kubeconfig is used by the Fournos
+Testing integration.
 
 ```
 PSAP Control Center Backend

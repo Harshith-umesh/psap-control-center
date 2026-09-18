@@ -6,9 +6,11 @@ from app.schemas.hearth import (
     HearthClusterListResponse,
     HearthClusterResponse,
     HearthConnectResponse,
+    HearthCredentialConnectRequest,
     HearthStatusResponse,
 )
 from app.services.hearth_service import get_hearth_service
+from app.services.kubernetes_service import KubernetesService
 from app.utils.logger import create_logger
 
 router = APIRouter()
@@ -73,6 +75,59 @@ async def connect_hearth(
                 f"{status.error}"
             ),
         )
+
+
+@router.post(
+    "/connect/credentials",
+    response_model=HearthConnectResponse,
+)
+async def connect_hearth_with_credentials(
+    credentials: HearthCredentialConnectRequest,
+    _user: dict = Depends(require_admin),
+):
+    """Connect to the Hearth/Fournos management cluster as a specific user."""
+    if not settings.HEARTH_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="Hearth integration is disabled",
+        )
+
+    login_result = await KubernetesService.login_with_credentials(
+        api_server=credentials.api_server_url,
+        username=credentials.username,
+        password=credentials.password,
+        storage_path=settings.KUBECONFIG_STORAGE_PATH,
+        cluster_name="hearth-management",
+        use_service_account=False,
+        allow_stored_password=False,
+    )
+    if not login_result.get("success"):
+        raise HTTPException(
+            status_code=400,
+            detail=login_result.get("error", "OpenShift login failed"),
+        )
+
+    service = get_hearth_service()
+    service.reset()
+    status = service.get_status()
+    if status.available:
+        return HearthConnectResponse(
+            success=True,
+            message=(
+                f"Connected to the management cluster as "
+                f"{credentials.username} — "
+                f"{status.cluster_count} cluster(s) discovered"
+            ),
+        )
+
+    service.remove_kubeconfig()
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "OpenShift login succeeded, but the user cannot access Hearth: "
+            f"{status.error}"
+        ),
+    )
 
 
 @router.post(

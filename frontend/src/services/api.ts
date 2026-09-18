@@ -277,6 +277,15 @@ export const hearthApi = {
     return data
   },
 
+  connectWithCredentials: async (credentials: {
+    api_server_url: string
+    username: string
+    password: string
+  }): Promise<HearthConnectResponse> => {
+    const { data } = await api.post('/hearth/connect/credentials', credentials)
+    return data
+  },
+
   disconnect: async (): Promise<HearthConnectResponse> => {
     const { data } = await api.post('/hearth/disconnect')
     return data

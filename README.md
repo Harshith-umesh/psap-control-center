@@ -113,6 +113,8 @@ Key endpoints:
 | `/api/v1/reservations/{id}/cancel` | POST | Yes | Cancel reservation |
 | `/api/v1/reservations/calendar` | GET | No | Calendar events |
 | `/api/v1/reservations/cluster/{id}/current` | GET | No | Multi-occupant cluster occupancy |
+| `/api/v1/hearth/connect` | POST | Yes | Connect management cluster with a kubeconfig |
+| `/api/v1/hearth/connect/credentials` | POST | Yes | Connect management cluster as an OpenShift user |
 | `/api/v1/hearth/clusters` | GET | No | Hearth GPU inventory |
 | `/api/v1/auth/check` | GET | Yes | Verify credentials |
 
