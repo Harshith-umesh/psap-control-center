@@ -336,6 +336,182 @@ def _resolve_field_options_ref(
         )
 
 
+def _rhaiis_cluster_profile_options() -> List[UiOption]:
+    """Return the RHAIIS cluster-profile presets used by Forge.
+
+    The actual Kubernetes cluster is selected by the surrounding Control
+    Center form. These presets are the RHAIIS-side cluster tags and deploy
+    overrides (image pull secrets, GPU family, and dashboard labels) that the
+    legacy FourNos form submitted as an additional Forge argument.
+    """
+    data = fetch_yaml("projects/rhaiis/orchestration/presets.d/clusters.yaml")
+    if not isinstance(data, dict):
+        return []
+
+    default_gpu_types = {
+        "hera": "h200",
+        "zeus": "h200",
+        "old-zeus": "h200",
+        "b200": "b200",
+        "mi355x": "amd",
+    }
+    options: List[UiOption] = []
+    for key, overrides in data.items():
+        if not isinstance(key, str) or key.startswith("_") or not isinstance(overrides, dict):
+            continue
+        cluster_tag = str(overrides.get("rhaiis.cluster_tag", key))
+        gpu_type = default_gpu_types.get(key) or default_gpu_types.get(cluster_tag)
+        if not gpu_type:
+            gpu_type = "amd" if any(str(k).endswith(".amd") for k in overrides) else "nvidia"
+        options.append(
+            UiOption(
+                value=key,
+                label=_titleize(key),
+                overrides=dict(overrides),
+                extra={"gpu_type": gpu_type},
+            )
+        )
+    return options
+
+
+def _augment_rhaiis_schema(schema: ProjectUiSchema) -> None:
+    """Add the legacy RHAIIS controls not expressible in submit.yaml yet.
+
+    Forge's declarative schema owns the normal fields and options. A few
+    controls are dashboard conveniences rather than Forge presets (custom
+    model/workload input, TP/GPU sizing, and the cluster profile argument), so
+    the Control Center adds them to the resolved schema in one place while
+    keeping the frontend renderer project-agnostic.
+    """
+    cluster_options: List[UiOption] = []
+    try:
+        cluster_options = _rhaiis_cluster_profile_options()
+    except Exception as exc:
+        logger.warning("Failed to resolve RHAIIS cluster profiles: %s", exc)
+
+    engine_defaults: Dict[str, Dict[str, str]] = {}
+    try:
+        rhaiis_config = fetch_yaml("projects/rhaiis/orchestration/config.d/rhaiis.yaml")
+        for engine, data in (rhaiis_config.get("engines") or {}).items():
+            if isinstance(data, dict) and isinstance(data.get("images"), dict):
+                engine_defaults[str(engine)] = {
+                    str(accelerator): str(image)
+                    for accelerator, image in data["images"].items()
+                    if isinstance(image, str)
+                }
+    except Exception as exc:
+        logger.warning("Failed to resolve RHAIIS engine defaults: %s", exc)
+
+    for mode in schema.modes:
+        all_fields = [field for section in mode.sections for field in section.fields]
+
+        infra = next((section for section in mode.sections if section.id == "infra"), None)
+        run_settings = next(
+            (
+                section
+                for section in mode.sections
+                if "run" in f"{section.id} {section.label}".lower()
+                or "setting" in f"{section.id} {section.label}".lower()
+            ),
+            mode.sections[-1] if mode.sections else None,
+        )
+        if infra is not None and cluster_options and not any(
+            field.key == "cluster_profile" for field in infra.fields
+        ):
+            infra.fields.append(
+                UiField(
+                    key="cluster_profile",
+                    label="Cluster Profile",
+                    type="select",
+                    required=True,
+                    help=(
+                        "RHAIIS deployment profile. Pick the profile matching "
+                        "the Kubernetes cluster selected above."
+                    ),
+                    options=[option.model_copy(deep=True) for option in cluster_options],
+                )
+            )
+            all_fields.append(infra.fields[-1])
+
+        if infra is not None and not any(field.key == "gpu_count" for field in infra.fields):
+            infra.fields.append(
+                UiField(
+                    key="gpu_count",
+                    label="GPU Count",
+                    type="number",
+                    default=1,
+                    min=1,
+                    help="Number of GPUs to reserve. Must be at least the TP size.",
+                )
+            )
+            all_fields.append(infra.fields[-1])
+
+        if run_settings is not None and not any(
+            field.key == "prefix_caching" for field in run_settings.fields
+        ):
+            run_settings.fields.append(
+                UiField(
+                    key="prefix_caching",
+                    label="Prefix Caching",
+                    type="boolean",
+                    default=False,
+                    help=(
+                        "Enable runtime prefix caching. The Forge override is "
+                        "selected automatically for the chosen engine."
+                    ),
+                )
+            )
+            if run_settings is not infra:
+                all_fields.append(run_settings.fields[-1])
+
+        for field in all_fields:
+            if field.key == "engine":
+                for option in field.options:
+                    engine = str(option.overrides.get(field.maps_to or "", option.value))
+                    images = engine_defaults.get(engine)
+                    if images:
+                        option.extra = {**option.extra, "images": images}
+            elif field.key == "model":
+                if not any(option.value == "__custom_model__" for option in field.options):
+                    field.options.append(
+                        UiOption(
+                            value="__custom_model__",
+                            label="Custom Model (provide HuggingFace ID)",
+                        )
+                    )
+            elif field.key == "workload":
+                if not any(option.value == "__custom_workload__" for option in field.options):
+                    field.options.append(
+                        UiOption(value="__custom_workload__", label="Custom")
+                    )
+            elif field.key == "warmup":
+                # Match the legacy RHAIIS form, which starts warmup enabled.
+                field.default = True
+            elif field.key == "benchmark":
+                # The legacy form submits a benchmark run by default.
+                field.default = True
+            elif field.key == "slack":
+                # Single-job notifications are always on in the legacy form.
+                field.default = True
+
+        if mode.id == "single":
+            model_section = next((section for section in mode.sections if section.id == "model"), None)
+            if model_section is not None and not any(field.key == "tp_size" for field in model_section.fields):
+                model_section.fields.append(
+                    UiField(
+                        key="tp_size",
+                        label="TP Size Override",
+                        type="number",
+                        default=1,
+                        min=1,
+                        help=(
+                            "Tensor-parallel size. It defaults to the selected "
+                            "model and updates the GPU count."
+                        ),
+                    )
+                )
+
+
 def _resolve_schema(
     project: str, schema: ProjectUiSchema, strict: bool = False
 ) -> ProjectUiSchema:
@@ -346,6 +522,8 @@ def _resolve_schema(
         for section in mode.sections:
             for field in section.fields:
                 _resolve_field_options_ref(project, field, strict=strict)
+    if project == "rhaiis":
+        _augment_rhaiis_schema(schema)
     return schema
 
 

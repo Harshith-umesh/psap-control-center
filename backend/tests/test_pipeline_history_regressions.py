@@ -8,6 +8,7 @@ from app.services import fournos_watcher as watcher
 from app.api import fournos as fournos_api
 from app.core import database as database_core
 from app.services import fournos_db_service as db_service
+from app.services import project_ui_schema
 
 
 def test_taskrun_condition_specific_terminal_reasons_win_over_false_status():
@@ -194,6 +195,77 @@ def test_rhaiis_build_source_requires_a_pin_or_explicit_latest_main():
                 use_latest_main=True,
             )
         )
+
+
+def test_rhaiis_overrides_normalize_to_forge_keys():
+    assert fournos_api._normalize_rhaiis_overrides(
+        "rhaiis",
+        {
+            "tests.rhaiis.slack_member_id": "U0123456789",
+            "rhaiis.compare_versions.enabled": "true",
+            "tests.rhaiis.workload_key": '["profile1", "custom"]',
+        },
+    ) == {
+        "tests.rhaiis.slack_user": "U0123456789",
+        "tests.rhaiis.workload_keys": '["profile1", "custom"]',
+    }
+
+
+def test_rhaiis_schema_adds_legacy_controls(monkeypatch):
+    def fake_fetch_yaml(path):
+        if path.endswith("presets.d/clusters.yaml"):
+            return {
+                "__multiple": True,
+                "hera": {"rhaiis.cluster_tag": "hera2"},
+                "mi355x": {"rhaiis.gpu_types.amd": "mi355x"},
+            }
+        if path.endswith("config.d/rhaiis.yaml"):
+            return {"engines": {"vllm": {"images": {"nvidia": "vllm:latest"}}}}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(project_ui_schema, "fetch_yaml", fake_fetch_yaml)
+    schema = project_ui_schema.ProjectUiSchema.model_validate(
+        {
+            "project": "rhaiis",
+            "modes": [
+                {
+                    "id": "single",
+                    "sections": [
+                        {
+                            "id": "infra",
+                            "fields": [
+                                {"key": "engine", "type": "select", "maps_to": "rhaiis.engine"},
+                            ],
+                        },
+                        {
+                            "id": "model",
+                            "fields": [
+                                {"key": "model", "type": "select"},
+                                {"key": "workload", "type": "multiselect"},
+                                {"key": "benchmark", "type": "boolean"},
+                                {"key": "warmup", "type": "boolean"},
+                                {"key": "slack", "type": "boolean"},
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+
+    resolved = project_ui_schema._resolve_schema("rhaiis", schema, strict=True)
+    mode = resolved.modes[0]
+    fields = {field.key: field for section in mode.sections for field in section.fields}
+    assert fields["cluster_profile"].required is True
+    assert {option.value for option in fields["cluster_profile"].options} == {"hera", "mi355x"}
+    assert fields["gpu_count"].default == 1
+    assert fields["model"].options[-1].value == "__custom_model__"
+    assert fields["workload"].options[-1].value == "__custom_workload__"
+    assert fields["warmup"].default is True
+    assert fields["benchmark"].default is True
+    assert fields["slack"].default is True
+    assert fields["prefix_caching"].default is False
+    assert fields["engine"].options == []
 
 
 @pytest.mark.parametrize(

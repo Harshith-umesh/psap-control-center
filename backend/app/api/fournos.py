@@ -764,6 +764,34 @@ def _resolve_build_source(req: SubmitJobRequest | SubmitMatrixRequest) -> str:
     return "main" if req.use_latest_main else pull_sha
 
 
+def _normalize_rhaiis_overrides(
+    project: str, overrides: dict[str, Any]
+) -> dict[str, Any]:
+    """Translate schema-facing RHAIIS keys to Forge's real config keys."""
+    if project != "rhaiis":
+        return overrides
+
+    normalized = dict(overrides)
+    slack_member = normalized.pop("tests.rhaiis.slack_member_id", None)
+    if slack_member and "tests.rhaiis.slack_user" not in normalized:
+        normalized["tests.rhaiis.slack_user"] = slack_member
+
+    # This is a UI-only toggle in the Forge schema. The orchestration code
+    # reads compare_version, not a nonexistent compare_versions.enabled key.
+    normalized.pop("rhaiis.compare_versions.enabled", None)
+
+    workload_key = normalized.pop("tests.rhaiis.workload_key", None)
+    if workload_key is not None and "tests.rhaiis.workload_keys" not in normalized:
+        try:
+            parsed = json.loads(workload_key) if isinstance(workload_key, str) else workload_key
+        except (TypeError, ValueError):
+            parsed = workload_key
+        normalized["tests.rhaiis.workload_keys"] = (
+            json.dumps(parsed) if isinstance(parsed, list) else parsed
+        )
+    return normalized
+
+
 # ─── routes: submit ──────────────────────────────────────────────────────
 
 def _apply_scheduling(spec: dict, schedule: str, scheduled_start_time: Optional[str]) -> None:
@@ -784,7 +812,9 @@ def _apply_scheduling(spec: dict, schedule: str, scheduled_start_time: Optional[
 
 @router.post("/submit", response_model=SubmitJobResponse)
 async def submit_job(req: SubmitJobRequest, _=Depends(require_auth)):
-    config_overrides = dict(req.config_overrides)
+    config_overrides = _normalize_rhaiis_overrides(
+        req.project, dict(req.config_overrides)
+    )
 
     if req.version:
         version_key = _VERSION_KEYS.get(
@@ -911,6 +941,11 @@ async def submit_matrix(req: SubmitMatrixRequest, _=Depends(require_auth)):
 
         job_overrides: dict[str, Any] = dict(req.config_overrides)
         job_overrides.update({k: v for k, v in model_item.overrides.items()})
+        job_overrides = _normalize_rhaiis_overrides(req.project, job_overrides)
+        if req.project == "rhaiis" and req.workloads:
+            job_overrides.setdefault(
+                "tests.rhaiis.workload_keys", json.dumps(req.workloads)
+            )
 
         display_name = "{}-{}-{}".format(req.project, model_item.key, req.cluster)
         generate_name = re.sub(

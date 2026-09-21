@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowLeftIcon, ArrowPathIcon, ClockIcon, PlayIcon } from '@heroicons/react/24/outline'
 import clsx from 'clsx'
 import ReviewRow, { ReviewSection } from './ReviewRow'
@@ -28,6 +28,7 @@ import type { JobScheduling, ProjectUiSchema, UiField, UiMode, UiOption, UiPipel
 
 export interface SubmitBasics {
   cluster: string
+  clusterGpuType?: string
   pipeline: string
   owner: string
   priority: string
@@ -142,6 +143,36 @@ function formatFieldValueForReview(field: UiField, value: unknown): string | nul
   return String(value)
 }
 
+function rawOptionValue(field: UiField, value: unknown): unknown {
+  const option = field.options.find((item) => item.value === value)
+  if (option && field.maps_to && Object.prototype.hasOwnProperty.call(option.overrides, field.maps_to)) {
+    return option.overrides[field.maps_to]
+  }
+  return value
+}
+
+function modelTpSize(field: UiField | undefined, value: unknown): number | null {
+  if (!field || typeof value !== 'string') return null
+  const option = field.options.find((item) => item.value === value)
+  const extra = option?.extra || {}
+  const vllmArgs = extra.vllm_args as Record<string, unknown> | undefined
+  const sglangArgs = extra.sglang_args as Record<string, unknown> | undefined
+  const raw = vllmArgs?.['tensor-parallel-size'] ?? sglangArgs?.['tp-size'] ?? extra.tensor_parallel ?? extra.tp_size ?? extra.tp
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null
+}
+
+function parseOverrideLines(raw: string): Record<string, string> {
+  const overrides: Record<string, string> = {}
+  raw.split('\n').forEach((line) => {
+    const index = line.indexOf(':')
+    if (index > 0) {
+      overrides[line.slice(0, index).trim()] = line.slice(index + 1).trim()
+    }
+  })
+  return overrides
+}
+
 export default function DynamicSubmitForm({
   project,
   schema,
@@ -178,9 +209,26 @@ export default function DynamicSubmitForm({
     [allModes, activeModeId]
   )
   const isMatrix = activeMode?.kind === 'matrix'
+  const isRhaiis = project === 'rhaiis'
 
   const [values, setValues] = useState<Record<string, unknown>>({})
   const [quickPresetKey, setQuickPresetKey] = useState('')
+  const activeFields = useMemo(() => (activeMode ? fieldsOf(activeMode) : []), [activeMode])
+  const modelField = activeFields.find((field) => field.key === 'model')
+  const workloadField = activeFields.find((field) => field.key === 'workload')
+  const engineField = activeFields.find((field) => field.key === 'engine')
+  const clusterProfileField = activeFields.find((field) => field.key === 'cluster_profile')
+  const selectedClusterProfile = clusterProfileField?.options.find(
+    (option) => option.value === values.cluster_profile
+  )
+  const profileGpuType = typeof selectedClusterProfile?.extra?.gpu_type === 'string'
+    ? selectedClusterProfile.extra.gpu_type
+    : ''
+  const gpuType = basics.clusterGpuType || profileGpuType
+  const selectedModelTp = modelTpSize(modelField, values.model) || 1
+  const tpSize = isRhaiis ? Math.max(Number(values.tp_size) || selectedModelTp, 1) : 1
+  const gpuCount = isRhaiis ? Math.max(Number(values.gpu_count) || 1, tpSize) : 1
+  const autoEngineVersionRef = useRef('')
 
   // Matrix-mode-only selection state
   const [pipelineKey, setPipelineKey] = useState('')
@@ -196,11 +244,21 @@ export default function DynamicSubmitForm({
     const initial: Record<string, unknown> = {}
     for (const field of fieldsOf(activeMode)) {
       initial[field.key] = defaultValueFor(field)
+      if (isRhaiis && field.key === 'warmup') initial[field.key] = true
+      if (isRhaiis && field.key === 'slack') initial[field.key] = true
+    }
+    if (isRhaiis) {
+      initial.advanced_overrides = ''
+      initial.custom_model_tp = 1
+      initial.custom_workload_data = 'prompt_tokens=1000,output_tokens=1000'
+      initial.custom_workload_concurrencies = '1'
+      initial.custom_workload_max_seconds = 450
+      initial.custom_workload_samples = ''
     }
     setValues(initial)
     setQuickPresetKey('')
     setPipelineKey(activeMode.pipelines[0]?.key || '')
-  }, [activeMode])
+  }, [activeMode, isRhaiis, project])
 
   useEffect(() => {
     if (!selectedPipeline) {
@@ -214,6 +272,44 @@ export default function DynamicSubmitForm({
 
   const setFieldValue = (key: string, value: unknown) => {
     setValues((prev) => ({ ...prev, [key]: value }))
+  }
+
+  const handleFieldChange = (field: UiField, value: unknown) => {
+    setFieldValue(field.key, value)
+    if (!isRhaiis) return
+
+    if (field.key === 'model') {
+      const nextTp = value === '__custom_model__' ? 1 : modelTpSize(modelField, value) || 1
+      setValues((prev) => ({
+        ...prev,
+        model: value,
+        tp_size: nextTp,
+        gpu_count: nextTp,
+      }))
+    } else if (field.key === 'tp_size') {
+      const nextTp = Math.max(Number(value) || 1, 1)
+      setValues((prev) => ({
+        ...prev,
+        tp_size: nextTp,
+        gpu_count: Math.max(Number(prev.gpu_count) || 1, nextTp),
+      }))
+    } else if (field.key === 'engine' || field.key === 'accelerator') {
+      const nextEngine = field.key === 'engine' ? value : values.engine
+      const nextAccelerator = field.key === 'accelerator' ? value : values.accelerator
+      const engineOption = engineField?.options.find((option) => option.value === nextEngine)
+      const images = engineOption?.extra?.images as Record<string, unknown> | undefined
+      const defaultImage = typeof images?.[String(nextAccelerator)] === 'string'
+        ? String(images[String(nextAccelerator)])
+        : ''
+      if (defaultImage && (!values.engine_version || values.engine_version === autoEngineVersionRef.current)) {
+        autoEngineVersionRef.current = defaultImage
+        setFieldValue('engine_version', defaultImage)
+      }
+    } else if (field.key === 'engine_version') {
+      autoEngineVersionRef.current = ''
+    } else if (field.key === 'agent_analysis' && value === true) {
+      setFieldValue('compare_versions', true)
+    }
   }
 
   // If a `restrict_if` rule now excludes a field's currently-selected
@@ -279,16 +375,98 @@ export default function DynamicSubmitForm({
       if (!isFieldVisible(field, values)) continue
       const value = values[field.key]
 
+      // RHAIIS has a plural workload override and a few custom controls
+      // whose keys are not part of Forge's declarative schema yet. Handle
+      // those below so the ordinary schema renderer remains generic.
+      if (isRhaiis && (field.key === 'model' || field.key === 'workload')) continue
+
       if (field.maps_to) {
         if (value === undefined || value === '' || value === null) continue
         const key = resolveMapsTo(field.maps_to, values)
         if (!key) continue
-        overrides[key] = stringifyValue(value)
+        if (key === 'rhaiis.compare_versions.enabled') continue
+        overrides[key] = stringifyValue(
+          field.type === 'multiselect' && Array.isArray(value)
+            ? value.map((item) => rawOptionValue(field, item))
+            : rawOptionValue(field, value)
+        )
       } else if (field.type === 'select' || field.type === 'radio') {
         if (typeof value === 'string' && value) args.push(value)
       } else if (field.type === 'multiselect' && Array.isArray(value)) {
         for (const v of value) if (typeof v === 'string' && v) args.push(v)
       }
+    }
+
+    if (isRhaiis) {
+      const selectedModel = values.model
+      if (selectedModel === '__custom_model__') {
+        overrides['tests.rhaiis.model_key'] = 'custom'
+        const customName = String(values.custom_model_name || '').trim()
+        const customId = String(values.custom_model_id || '').trim()
+        if (customName) overrides['models.custom.name'] = customName
+        if (customId) overrides['models.custom.hf_model_id'] = customId
+        overrides['rhaiis.engines.vllm.args.tensor-parallel-size'] = stringifyValue(tpSize)
+      } else if (selectedModel) {
+        overrides['tests.rhaiis.model_key'] = stringifyValue(rawOptionValue(modelField!, selectedModel))
+        if (Number(values.tp_size) && Number(values.tp_size) !== selectedModelTp) {
+          overrides['rhaiis.engines.vllm.args.tensor-parallel-size'] = stringifyValue(tpSize)
+        }
+      }
+
+      const selectedWorkloads = Array.isArray(values.workload) ? values.workload as string[] : []
+      if (selectedWorkloads.length > 0) {
+        const workloadKeys = selectedWorkloads.map((item) =>
+          item === '__custom_workload__' ? 'custom' : rawOptionValue(workloadField!, item)
+        )
+        overrides['tests.rhaiis.workload_keys'] = stringifyValue(workloadKeys)
+        if (selectedWorkloads.includes('__custom_workload__')) {
+          const customData = String(values.custom_workload_data || '').trim()
+          const customConcurrencies = String(values.custom_workload_concurrencies || '').trim()
+          if (customData) overrides['workloads.custom.data'] = customData
+          if (customConcurrencies) {
+            overrides['workloads.custom.concurrencies'] = stringifyValue(
+              customConcurrencies.split(',').map((item) => Number(item.trim()) || 0)
+            )
+          }
+          if (values.custom_workload_max_seconds !== '' && values.custom_workload_max_seconds != null) {
+            overrides['workloads.custom.max_seconds'] = stringifyValue(Number(values.custom_workload_max_seconds) || 450)
+          }
+          if (values.custom_workload_samples !== '' && values.custom_workload_samples != null) {
+            overrides['workloads.custom.samples'] = stringifyValue(Number(values.custom_workload_samples))
+          }
+        }
+      }
+
+      const slackMember = String(values.slack_member_id || '').trim()
+      if (slackMember) overrides['tests.rhaiis.slack_user'] = slackMember
+      const compareVersion = String(values.compare_version || '').trim()
+      if (compareVersion) overrides['tests.rhaiis.compare_version'] = compareVersion
+
+      const engineVersion = String(values.engine_version || '').trim()
+      const engine = String(values.engine || '').trim()
+      const accelerator = String(values.accelerator || '').trim()
+      if (engineVersion && engine && accelerator) {
+        overrides[`rhaiis.engines.${engine}.images.${accelerator}`] = engineVersion
+      }
+
+      if (values.prefix_caching !== undefined && engine) {
+        delete overrides['rhaiis.engines.vllm.args.enable-prefix-caching']
+        delete overrides['rhaiis.engines.vllm.args.no-enable-prefix-caching']
+        delete overrides['rhaiis.engines.sglang.args.disable-radix-cache']
+        delete overrides['rhaiis.engines.trtllm.trtllm_config.kv_cache_config.enable_block_reuse']
+        const prefixCaching = values.prefix_caching === true
+        if (engine === 'sglang') {
+          overrides['rhaiis.engines.sglang.args.disable-radix-cache'] = stringifyValue(!prefixCaching)
+        } else if (engine === 'trtllm') {
+          overrides['rhaiis.engines.trtllm.trtllm_config.kv_cache_config.enable_block_reuse'] = stringifyValue(prefixCaching)
+        } else {
+          overrides[prefixCaching
+            ? 'rhaiis.engines.vllm.args.enable-prefix-caching'
+            : 'rhaiis.engines.vllm.args.no-enable-prefix-caching'] = 'true'
+        }
+      }
+
+      Object.assign(overrides, parseOverrideLines(String(values.advanced_overrides || '')))
     }
 
     return { args, overrides }
@@ -314,7 +492,7 @@ export default function DynamicSubmitForm({
             return {
               key,
               overrides: m?.overrides || {},
-              gpu_count: m?.tp ?? null,
+              gpu_count: m?.tp ?? gpuCount,
             }
           }),
           workloads: selectedWorkloads,
@@ -323,7 +501,7 @@ export default function DynamicSubmitForm({
           exclusive: basics.exclusive,
           pull_sha: basics.pullSha,
           use_latest_main: basics.useLatestMain,
-          gpu_type: '',
+          gpu_type: gpuType,
           ...schedulingRequestFields(basics.scheduling),
         })
         onSubmitted?.(result.jobs?.[0]?.job_name || '')
@@ -348,6 +526,8 @@ export default function DynamicSubmitForm({
         pull_sha: basics.pullSha,
         use_latest_main: basics.useLatestMain,
         priority: basics.priority,
+        gpu_type: gpuType,
+        gpu_count: gpuCount,
         ...schedulingRequestFields(basics.scheduling),
       })
       onSubmitted?.(result.job_name)
@@ -365,9 +545,26 @@ export default function DynamicSubmitForm({
   if (step !== 2 && step !== 3) return null
 
   const buildSourceValid = project !== 'rhaiis' || basics.useLatestMain || !!basics.pullSha.trim()
+  const requiredFieldsValid = activeFields
+    .filter((field) => field.required && isFieldVisible(field, values))
+    .every((field) => {
+      const value = values[field.key]
+      return field.type === 'multiselect'
+        ? Array.isArray(value) && value.length > 0
+        : value !== undefined && value !== null && value !== ''
+    })
+  const customModelValid = !isRhaiis || values.model !== '__custom_model__' || !!String(values.custom_model_id || '').trim()
+  const customWorkloadSelected = isRhaiis && Array.isArray(values.workload) && values.workload.includes('__custom_workload__')
+  const customWorkloadValid = !customWorkloadSelected || (
+    !!String(values.custom_workload_data || '').trim() &&
+    !!String(values.custom_workload_concurrencies || '').trim()
+  )
+  const sizingValid = !isRhaiis || gpuCount >= tpSize
+  const slackValid = !isRhaiis || activeMode.id !== 'single' || values.slack !== true || !!String(values.slack_member_id || '').trim()
+  const formValid = requiredFieldsValid && customModelValid && customWorkloadValid && sizingValid && slackValid
   const canSubmit = isMatrix
-    ? !submitMatrix.isPending && !!basics.cluster && !!basics.owner.trim() && buildSourceValid && !!selectedPipeline && selectedModels.length > 0 && selectedWorkloads.length > 0
-    : !submitJob.isPending && !!basics.cluster && !!basics.owner.trim() && buildSourceValid
+    ? !submitMatrix.isPending && !!basics.cluster && !!basics.owner.trim() && buildSourceValid && formValid && !!selectedPipeline && selectedModels.length > 0 && selectedWorkloads.length > 0
+    : !submitJob.isPending && !!basics.cluster && !!basics.owner.trim() && buildSourceValid && formValid
 
   return (
     <form onSubmit={handleSubmit} className="space-y-6">
@@ -425,25 +622,149 @@ export default function DynamicSubmitForm({
               <div className="grid grid-cols-1 gap-x-6 gap-y-4 sm:grid-cols-2">
                 {section.fields.map((field) => {
                   if (field.type === 'hidden' || !isFieldVisible(field, values)) return null
+                  if (isRhaiis && field.key === 'tp_size' && (!values.model || values.model === '__custom_model__')) return null
+                  const fieldLabel = isRhaiis && field.key === 'slack'
+                    ? 'Slack Notifications (always on)'
+                    : field.label || field.key
+                  const isSlackAlwaysOn = isRhaiis && field.key === 'slack' && activeMode.id === 'single'
                   return (
-                    <div key={field.key} className={field.type === 'textarea' ? 'sm:col-span-2' : ''}>
+                    <div key={field.key} className={clsx(field.type === 'textarea' ? 'sm:col-span-2' : '', field.key === 'model' || field.key === 'workload' ? 'sm:col-span-2' : '')}>
                       <label className="block text-sm font-medium text-gray-700">
-                        {field.label || field.key}
+                        {fieldLabel}
                         {field.required && <span className="text-red-500 ml-0.5">*</span>}
                       </label>
                       <FieldControl
                         field={field}
                         value={values[field.key]}
-                        onChange={(v) => setFieldValue(field.key, v)}
+                        onChange={(v) => handleFieldChange(field, v)}
                         options={visibleOptions(field, values)}
+                        disabled={isSlackAlwaysOn}
                       />
                       {field.help && <p className="mt-1 text-xs text-gray-400">{field.help}</p>}
+
+                      {isRhaiis && field.key === 'model' && values.model === '__custom_model__' && (
+                        <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
+                          <label className="text-xs text-gray-600">
+                            Model Name
+                            <input
+                              type="text"
+                              value={String(values.custom_model_name || '')}
+                              onChange={(e) => setFieldValue('custom_model_name', e.target.value)}
+                              className="input mt-1"
+                              placeholder="e.g. Llama-3.3-70B-Instruct-FP8"
+                            />
+                          </label>
+                          <label className="text-xs text-gray-600 sm:col-span-2">
+                            HuggingFace Model ID <span className="text-red-500">*</span>
+                            <input
+                              type="text"
+                              value={String(values.custom_model_id || '')}
+                              onChange={(e) => setFieldValue('custom_model_id', e.target.value)}
+                              className="input mt-1"
+                              placeholder="org/model"
+                            />
+                          </label>
+                          <label className="text-xs text-gray-600">
+                            TP Size
+                            <input
+                              type="number"
+                              min={1}
+                              value={Number(values.custom_model_tp) || 1}
+                              onChange={(e) => {
+                                const next = e.target.value === '' ? '' : Number(e.target.value)
+                                setValues((prev) => ({
+                                  ...prev,
+                                  custom_model_tp: next,
+                                  tp_size: next,
+                                  gpu_count: Math.max(Number(prev.gpu_count) || 1, Number(next) || 1),
+                                }))
+                              }}
+                              className="input mt-1"
+                            />
+                          </label>
+                        </div>
+                      )}
+
+                      {isRhaiis && field.key === 'workload' && customWorkloadSelected && (
+                        <div className="mt-3 space-y-3 rounded-md border border-gray-200 bg-gray-50 p-3">
+                          <label className="block text-xs text-gray-600">
+                            Data <span className="text-red-500">*</span>
+                            <input
+                              type="text"
+                              value={String(values.custom_workload_data || '')}
+                              onChange={(e) => setFieldValue('custom_workload_data', e.target.value)}
+                              className="input mt-1"
+                              placeholder="prompt_tokens=1000,output_tokens=1000"
+                            />
+                          </label>
+                          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                            <label className="text-xs text-gray-600">
+                              Concurrencies <span className="text-red-500">*</span>
+                              <input
+                                type="text"
+                                value={String(values.custom_workload_concurrencies || '')}
+                                onChange={(e) => setFieldValue('custom_workload_concurrencies', e.target.value)}
+                                className="input mt-1"
+                                placeholder="1,50,100"
+                              />
+                            </label>
+                            <label className="text-xs text-gray-600">
+                              Max Seconds
+                              <input
+                                type="number"
+                                min={1}
+                                value={Number(values.custom_workload_max_seconds) || 450}
+                                onChange={(e) => setFieldValue('custom_workload_max_seconds', e.target.value === '' ? '' : Number(e.target.value))}
+                                className="input mt-1"
+                              />
+                            </label>
+                            <label className="text-xs text-gray-600">
+                              Samples (optional)
+                              <input
+                                type="number"
+                                min={1}
+                                value={values.custom_workload_samples === '' ? '' : Number(values.custom_workload_samples) || ''}
+                                onChange={(e) => setFieldValue('custom_workload_samples', e.target.value === '' ? '' : Number(e.target.value))}
+                                className="input mt-1"
+                              />
+                            </label>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )
                 })}
+                {isRhaiis && section.id === 'infra' && (
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700">GPU Type</label>
+                    <input
+                      type="text"
+                      value={gpuType || 'Select a registered cluster or profile'}
+                      readOnly
+                      className="input mt-1 bg-gray-50 text-gray-500"
+                    />
+                    <p className="mt-1 text-xs text-gray-400">Derived from the selected Control Center cluster, with the RHAIIS profile as fallback.</p>
+                  </div>
+                )}
               </div>
             </div>
           ))}
+
+          {isRhaiis && (
+            <div className="rounded-lg border border-gray-200 p-4">
+              <label className="block text-sm font-medium text-gray-700">Advanced Config Overrides</label>
+              <textarea
+                value={String(values.advanced_overrides || '')}
+                onChange={(e) => setFieldValue('advanced_overrides', e.target.value)}
+                rows={4}
+                className="input mt-1 font-mono"
+                placeholder="key: value (one per line)\ne.g. experiment.concurrency: [32]"
+              />
+              <p className="mt-1 text-xs text-gray-400">
+                Optional Forge overrides. Use one <code>key: value</code> per line; these are applied last.
+              </p>
+            </div>
+          )}
 
           {isMatrix && (
             <div className="space-y-4 rounded-lg border border-gray-200 p-4">
@@ -562,7 +883,9 @@ export default function DynamicSubmitForm({
             <button
               type="button"
               onClick={onNext}
-              className="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500"
+              disabled={!formValid}
+              title={!formValid ? 'Complete the required project fields before continuing' : undefined}
+              className="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:opacity-50"
             >
               Next: Review
             </button>
@@ -580,6 +903,8 @@ export default function DynamicSubmitForm({
           priority: basics.priority,
           exclusive: basics.exclusive,
           pullSha: basics.useLatestMain ? 'main' : basics.pullSha,
+          gpuType,
+          gpuCount,
           args,
           configOverrides: overrides,
           schedule: basics.scheduling.mode === 'recurring' ? basics.scheduling.scheduleUtc : '',
@@ -595,7 +920,7 @@ export default function DynamicSubmitForm({
                     return {
                       key,
                       overrides: stringifyOverrides(m?.overrides || {}),
-                      gpuCount: m?.tp ?? null,
+                      gpuCount: m?.tp ?? gpuCount,
                     }
                   }),
                   workloads: selectedWorkloads,
@@ -611,6 +936,7 @@ export default function DynamicSubmitForm({
                 <ReviewRow label="Project" value={project} />
                 <ReviewRow label="Cluster" value={basics.cluster} missing={!basics.cluster} />
                 <ReviewRow label="Pipeline" value={basics.pipeline} />
+                {isRhaiis && <ReviewRow label="GPU type / count" value={`${gpuType || 'auto'} / ${gpuCount}`} />}
                 {basics.owner && <ReviewRow label="Owner" value={basics.owner} />}
                 <ReviewRow label="Priority" value={basics.priority} />
                 {basics.exclusive && <ReviewRow label="Exclusive" value="Yes" />}
@@ -669,6 +995,29 @@ export default function DynamicSubmitForm({
                   </ReviewSection>
                 )
               })}
+
+              {isRhaiis && (values.model === '__custom_model__' || customWorkloadSelected || String(values.advanced_overrides || '').trim()) && (
+                <ReviewSection title="Additional RHAIIS Settings">
+                  {values.model === '__custom_model__' && (
+                    <>
+                      <ReviewRow label="Custom model name" value={String(values.custom_model_name || '') || '-'} />
+                      <ReviewRow label="HuggingFace model ID" value={String(values.custom_model_id || '')} missing={!String(values.custom_model_id || '').trim()} />
+                      <ReviewRow label="TP size" value={String(tpSize)} />
+                    </>
+                  )}
+                  {customWorkloadSelected && (
+                    <>
+                      <ReviewRow label="Custom workload data" value={String(values.custom_workload_data || '')} missing={!String(values.custom_workload_data || '').trim()} />
+                      <ReviewRow label="Custom concurrencies" value={String(values.custom_workload_concurrencies || '')} missing={!String(values.custom_workload_concurrencies || '').trim()} />
+                      <ReviewRow label="Custom max seconds" value={String(values.custom_workload_max_seconds || '')} />
+                      {values.custom_workload_samples !== '' && <ReviewRow label="Custom samples" value={String(values.custom_workload_samples)} />}
+                    </>
+                  )}
+                  {String(values.advanced_overrides || '').trim() && (
+                    <ReviewRow label="Advanced overrides" value={String(values.advanced_overrides)} mono />
+                  )}
+                </ReviewSection>
+              )}
 
               {isMatrix && (
                 <ReviewSection title="Matrix Selection">
@@ -750,12 +1099,14 @@ function FieldControl({
   value,
   onChange,
   options,
+  disabled = false,
 }: {
   field: UiField
   value: unknown
   onChange: (value: unknown) => void
   /** Defaults to `field.options` — pass a `visibleOptions(field, values)` result to apply `restrict_if`. */
   options?: UiOption[]
+  disabled?: boolean
 }) {
   const opts = options ?? field.options
   switch (field.type) {
@@ -767,6 +1118,7 @@ function FieldControl({
               type="checkbox"
               checked={!!value}
               onChange={(e) => onChange(e.target.checked)}
+              disabled={disabled}
               className="rounded border-gray-300 text-indigo-600"
             />
             {field.placeholder || 'Enabled'}
@@ -782,6 +1134,7 @@ function FieldControl({
           min={field.min ?? undefined}
           max={field.max ?? undefined}
           onChange={(e) => onChange(e.target.value === '' ? '' : Number(e.target.value))}
+          disabled={disabled}
           className="input mt-1"
           placeholder={field.placeholder}
         />
@@ -792,6 +1145,7 @@ function FieldControl({
         <textarea
           value={(value as string) || ''}
           onChange={(e) => onChange(e.target.value)}
+          disabled={disabled}
           rows={3}
           className="input mt-1 font-mono"
           placeholder={field.placeholder}
@@ -803,6 +1157,7 @@ function FieldControl({
         <select
           value={(value as string) || ''}
           onChange={(e) => onChange(e.target.value)}
+          disabled={disabled}
           className="input mt-1"
         >
           <option value="">{field.required ? 'Select...' : 'None'}</option>
@@ -822,6 +1177,7 @@ function FieldControl({
               key={opt.value}
               type="button"
               title={formatOverridesTooltip(opt.overrides)}
+              disabled={disabled}
               onClick={() => onChange(value === opt.value ? '' : opt.value)}
               className={clsx(
                 'px-3 py-1.5 rounded-md text-xs font-medium border transition-colors',
@@ -859,6 +1215,7 @@ function FieldControl({
                 className="h-3 w-3 rounded border-gray-300 text-indigo-600"
                 checked={selected.includes(opt.value)}
                 onChange={() => toggle(opt.value)}
+                disabled={disabled}
               />
               {opt.label || opt.value}
             </label>
@@ -875,6 +1232,7 @@ function FieldControl({
           type="text"
           value={(value as string) || ''}
           onChange={(e) => onChange(e.target.value)}
+          disabled={disabled}
           className="input mt-1"
           placeholder={field.placeholder}
         />

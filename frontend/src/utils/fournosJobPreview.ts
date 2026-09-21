@@ -39,6 +39,7 @@ interface SharedInput {
   args: string[]
   configOverrides: Record<string, string>
   gpuType?: string
+  gpuCount?: number
   /** Cron expression, UTC — mutually exclusive with scheduledStartTime. */
   schedule?: string
   /** ISO 8601 UTC — mutually exclusive with schedule. */
@@ -71,7 +72,7 @@ export function buildSingleJobPreview(input: SharedInput): Record<string, unknow
     },
   }
   if (input.gpuType?.trim()) {
-    spec.hardware = { gpuType: input.gpuType.trim(), gpuCount: 1 }
+    spec.hardware = { gpuType: input.gpuType.trim(), gpuCount: input.gpuCount || 1 }
   }
   if (input.pullSha.trim()) {
     spec.env = { PULL_PULL_SHA: input.pullSha.trim() }

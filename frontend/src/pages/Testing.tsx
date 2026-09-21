@@ -376,6 +376,7 @@ const VERSION_PROJECTS = ['mcp_gateway']
 
 function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
   const { data: projects } = useForgeProjects()
+  const { data: registeredClusters } = useClusters()
   const { data: pipelines } = usePipelines()
   const { data: githubPRs } = useGithubPRs()
   const { data: githubSyncStatus } = useGithubSyncStatus()
@@ -434,6 +435,10 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
     () => projects?.find((p: ForgeProject) => p.name === project),
     [projects, project]
   )
+  const selectedCluster = useMemo(
+    () => registeredClusters?.clusters.find((item: Cluster) => item.name === cluster),
+    [registeredClusters, cluster]
+  )
 
   // Any project that publishes a projects/<name>/ui/submit.yaml in Forge
   // gets a fully dynamic form for free — see docs/ui-schema-spec.md. This
@@ -466,6 +471,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
 
   const handleProjectChange = (name: string) => {
     setProject(name)
+    setPipeline(name === 'rhaiis' ? 'forge-full' : 'forge-test-only')
     setPreset('')
     setVersion('')
     setPullSha('')
@@ -997,7 +1003,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
         <DynamicSubmitForm
           project={project}
           schema={dynamicSchema}
-          basics={{ cluster, pipeline, owner, priority, exclusive, pullSha, useLatestMain, prLabel: prSearch || pullSha, scheduling }}
+          basics={{ cluster, clusterGpuType: selectedCluster?.gpu_type || '', pipeline, owner, priority, exclusive, pullSha, useLatestMain, prLabel: prSearch || pullSha, scheduling }}
           step={step - 1}
           onBack={() => setStep(step - 1)}
           onNext={() => setStep(step + 1)}
