@@ -41,7 +41,7 @@ It provides:
                                ▼
 ┌──────────────────────────────────────────────────────────────┐
 │                     OpenShift Route (TLS)                    │
-│     control-center.apps.psap-automation.ibm.rhperfscale.org  │
+│                  control-center.<apps-domain>                 │
 └──────────────────────────────┬───────────────────────────────┘
                                │
                                ▼
@@ -100,7 +100,7 @@ It provides:
 | Database    | SQLite (dev) / PostgreSQL (prod)      |
 | K8s Client  | kubernetes-python 29.0                |
 | HTTP Client | httpx 0.26 (for OCP OAuth flows)      |
-| Auth        | HTTP Basic Auth                       |
+| Auth        | HttpOnly JWT session cookies (admin/user roles) |
 | Logging     | Custom structured logger              |
 
 ### Project Structure
@@ -111,7 +111,7 @@ backend/app/
 ├── core/
 │   ├── config.py            # Settings (env vars / .env)
 │   ├── database.py          # Async engine, session factory, init_db
-│   └── auth.py              # require_auth dependency (Basic Auth)
+│   └── auth.py              # Session token handling and role dependencies
 ├── models/
 │   ├── cluster.py           # Cluster ORM model
 │   ├── reservation.py       # Reservation ORM model + status enum
@@ -129,7 +129,7 @@ backend/app/
 ├── api/
 │   ├── __init__.py          # Router aggregation
 │   ├── health.py            # GET /health
-│   ├── auth.py              # GET /auth/check
+│   ├── auth.py              # Login, logout, and current-session endpoints
 │   ├── clusters.py          # Cluster endpoints
 │   ├── reservations.py      # Reservation endpoints
 │   └── hearth.py            # Hearth endpoints
@@ -141,7 +141,10 @@ backend/app/
 
 All endpoints live under `/api/v1`. OpenAPI docs available at `/docs`.
 
-**Authentication model**: GET endpoints are public (view-only). Most POST, PUT, DELETE endpoints require HTTP Basic Auth (exception: `POST /clusters/{id}/refresh` is public).
+**Authentication model**: Read-only endpoints are generally public. Login
+creates an HttpOnly JWT session cookie. Reservation mutations require a signed-in
+user, while cluster management, approvals, Hearth configuration, settings,
+billing, and cost-management operations require the `admin` role.
 
 #### Cluster Endpoints (`/api/v1/clusters`)
 
@@ -356,7 +359,7 @@ frontend/src/
 ├── services/
 │   └── api.ts               # Axios instance + API functions
 ├── stores/
-│   └── authStore.ts         # Credential management (sessionStorage)
+│   └── authStore.ts         # In-memory session identity and role
 ├── types/
 │   └── index.ts             # Shared TypeScript interfaces
 └── utils/
@@ -375,16 +378,15 @@ User clicks "Sign In"
 User enters username/password
         │
         ▼
-GET /api/v1/auth/check (with Basic Auth header)
+POST /api/v1/auth/login
         │
    ┌────┴────┐
    │         │
  200 OK    401 Unauthorized
    │         │
    ▼         ▼
-Credentials  Toast error
-stored in    "Invalid credentials"
-sessionStorage
+HttpOnly JWT Toast error
+cookie set   "Invalid credentials"
    │
    ▼
 auth-change event dispatched
@@ -392,11 +394,12 @@ auth-change event dispatched
    ▼
 Layout re-renders:
   - Header shows username + "Sign Out"
-  - Axios interceptor attaches Basic Auth
-    header on all non-GET requests
+  - Browser sends the session cookie on API requests
 ```
 
-Credentials persist for the browser session only (sessionStorage). Closing the tab clears them.
+The browser never stores the password. On page load, `/api/v1/auth/me`
+reconstructs the in-memory UI session from the signed cookie. The default
+session lifetime is eight hours.
 
 ### Data Flow
 
@@ -452,31 +455,40 @@ Hearth data is surfaced in:
 
 | Property  | Value                                                          |
 | --------- | -------------------------------------------------------------- |
-| Cluster   | `psap-automation.ibm.rhperfscale.org`                          |
+| Cluster   | Environment-specific production OpenShift cluster              |
 | Namespace | `psap-control-center`                                          |
-| URL       | `https://control-center.apps.psap-automation.ibm.rhperfscale.org` |
+| URL       | `https://control-center.<apps-domain>`                          |
 
 ### Resource Inventory
 
-| Kind        | Name                               | Purpose                         |
-| ----------- | ---------------------------------- | ------------------------------- |
-| Secret      | `psap-control-center-admin`        | ADMIN_USERNAME, ADMIN_PASSWORD  |
-| Secret      | `psap-control-center-config`       | SECRET_KEY, DATABASE_URL, LOG_LEVEL |
-| PVC         | `psap-control-center-data`         | SQLite database (1Gi)           |
-| PVC         | `psap-control-center-kubeconfigs`  | Kubeconfig files (100Mi)        |
-| BuildConfig | `psap-control-center-backend`      | Binary build from ./backend     |
-| BuildConfig | `psap-control-center-frontend`     | Binary build from ./frontend    |
-| Deployment  | `psap-control-center-backend`      | FastAPI (port 8000), 1 replica  |
-| Deployment  | `psap-control-center-frontend`     | Nginx (port 8080), 1 replica    |
-| Service     | `psap-control-center-backend`      | ClusterIP, port 8000            |
-| Service     | `psap-control-center-frontend`     | ClusterIP, port 8080            |
-| Route       | `psap-control-center`              | Edge TLS termination            |
+| Kind       | Name                               | Purpose |
+| ---------- | ---------------------------------- | ------- |
+| Secret     | `psap-control-center-admin`        | Admin and user account credentials |
+| Secret     | `psap-control-center-config`       | Signing key, database URL, and runtime configuration |
+| PVC        | `postgresql`                       | PostgreSQL data (5Gi) |
+| PVC        | `psap-control-center-data`         | Application and billing data (2Gi) |
+| PVC        | `psap-control-center-kubeconfigs`  | Managed-cluster kubeconfigs (1Gi) |
+| Deployment | `postgresql`                       | Production database |
+| Deployment | `psap-control-center-backend`      | FastAPI on port 8000, one replica |
+| Deployment | `psap-control-center-frontend`     | Nginx on port 8080, one replica |
+| Service    | `postgresql`                       | ClusterIP on port 5432 |
+| Service    | `psap-control-center-backend`      | ClusterIP on port 8000 |
+| Service    | `psap-control-center-frontend`     | ClusterIP on port 8080 |
+| Route      | `psap-control-center`              | Edge TLS termination |
+| CronJob    | `image-updater`                    | Poll Quay digests and restart changed deployments |
 
 ### Container Images
 
-**Backend**: `python:3.11-slim` with FastAPI/Uvicorn. Built via `oc start-build --from-dir=./backend`. Image stored in the OCP internal registry.
+**Backend**: `python:3.11-slim` with FastAPI/Uvicorn, published to
+`quay.io/redhat-performance/psap-control-center-backend:latest`.
 
-**Frontend**: Multi-stage build — `node:20-alpine` compiles the React app, then `nginxinc/nginx-unprivileged:alpine` serves static files and proxies `/api` to the backend service. Runs as non-root (OCP security requirement).
+**Frontend**: GitHub Actions compiles the React app with Node.js 20, then
+packages it in `nginxinc/nginx-unprivileged:alpine` and publishes
+`quay.io/redhat-performance/psap-control-center-frontend:latest`.
+
+Pushes to `main` publish both images. The in-cluster image updater checks Quay
+every two minutes and restarts a deployment when its tag resolves to a new
+digest.
 
 ### Traffic Flow
 
@@ -493,21 +505,17 @@ psap-control-center-frontend (nginx:8080)
       │
       └── /api/* → psap-control-center-backend:8000 (reverse proxy)
                       │
-                      ├── SQLite DB (PVC: psap-control-center-data)
+                      ├── PostgreSQL service (PVC: postgresql)
+                      ├── App/billing data (PVC: psap-control-center-data)
                       ├── Kubeconfigs (PVC: psap-control-center-kubeconfigs)
-                      └── K8s API calls → managed clusters
+                      ├── K8s API calls → managed clusters
+                      └── CRD/job calls → Hearth/Fournos management cluster
 ```
 
 ### Rebuilding
 
-After code changes, rebuild and deploy without downtime:
-
-```bash
-oc start-build psap-control-center-backend --from-dir=./backend --follow
-oc start-build psap-control-center-frontend --from-dir=./frontend --follow
-```
-
-Pods restart automatically when new images are pushed to the internal registry.
+Merges to `main` trigger `.github/workflows/prod-deploy.yml`. For manual image
+build and rollout instructions, see [deploy/README.md](../deploy/README.md).
 
 ---
 
@@ -515,19 +523,21 @@ Pods restart automatically when new images are pushed to the internal registry.
 
 All configuration is via environment variables, loaded by Pydantic Settings:
 
-| Variable                 | Default                           | Description                        |
-| ------------------------ | --------------------------------- | ---------------------------------- |
-| `SECRET_KEY`             | (change in production)            | Application secret key             |
-| `DATABASE_URL`           | `sqlite+aiosqlite:///./psap...db` | Async database URL                 |
-| `KUBECONFIG_STORAGE_PATH`| `./kubeconfigs`                   | Directory for kubeconfig files     |
-| `ADMIN_USERNAME`         | `admin`                           | Basic Auth username for writes     |
-| `ADMIN_PASSWORD`         | `admin`                           | Basic Auth password for writes     |
-| `LOG_LEVEL`              | `INFO`                            | Logging level (ERROR/WARN/INFO/DEBUG) |
-| `MLFLOW_BASE_URL`        | (optional)                        | MLFlow server for results page     |
-| `HEARTH_ENABLED`         | (optional)                        | Enable Hearth integration          |
-| `HEARTH_NAMESPACE`       | `hearth`                          | Namespace for FournosCluster CRDs  |
-| `HEARTH_KUBECONFIG_PATH` | (optional)                        | Path to management cluster kubeconfig |
-| `VITE_LOG_LEVEL`         | `INFO`                            | Frontend log level                 |
+| Variable | Default | Description |
+| -------- | ------- | ----------- |
+| `SECRET_KEY` | Development placeholder | JWT signing key; replace in production |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | `480` | Session lifetime in minutes |
+| `DATABASE_URL` | Local SQLite URL | Async database URL |
+| `KUBECONFIG_STORAGE_PATH` | `./kubeconfigs` | Kubeconfig directory |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | Required | Administrator account |
+| `USER_USERNAME` / `USER_PASSWORD` | Required | Standard user account |
+| `LOG_LEVEL` | `INFO` | Logging level: ERROR, WARN, INFO, or DEBUG |
+| `MLFLOW_BASE_URL` | Optional | Reserved for the Results integration |
+| `HEARTH_ENABLED` | `true` | Enable Hearth integration |
+| `HEARTH_NAMESPACE` | `hearth` | Namespace for `FournosCluster` resources |
+| `HEARTH_KUBECONFIG_PATH` | Optional | Externally managed management-cluster kubeconfig |
+| `BILLING_CSV_STORAGE_PATH` | `./billing_csvs` | Billing report storage |
+| `VITE_LOG_LEVEL` | `INFO` | Frontend build-time log level |
 
 On OCP, sensitive values are stored in Kubernetes Secrets and injected as environment variables via `envFrom`.
 
@@ -537,7 +547,7 @@ On OCP, sensitive values are stored in Kubernetes Secrets and injected as enviro
 
 ### Prerequisites
 
-- Python 3.9+ with virtualenv
+- Python 3.11 with virtualenv
 - Node.js 20+
 - npm
 
@@ -548,6 +558,7 @@ On OCP, sensitive values are stored in Kubernetes Secrets and injected as enviro
 cd backend
 source venv/bin/activate
 LOG_LEVEL=INFO ADMIN_USERNAME=admin ADMIN_PASSWORD=admin \
+  USER_USERNAME=user USER_PASSWORD=user \
   python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 # Frontend (separate terminal)
@@ -561,17 +572,15 @@ npm run dev
 ### Docker Compose
 
 ```bash
-docker-compose up          # Production build
-docker-compose -f docker-compose.dev.yml up  # Dev with hot reload
+docker compose up          # Production-style local build
+docker compose -f docker-compose.dev.yml up  # Dev with hot reload
 ```
 
 ---
 
 ## Future / Planned
 
-- **Per-user RBAC**: Fine-grained access control for namespaces and reservations
 - **Testing page**: Automated test execution (TOPSAIL, vLLM benchmarks, MLPerf)
 - **Results page**: MLFlow integration for test results visualization
-- **User model**: Per-user accounts with JWT auth (model and deps exist but are not wired up)
-- **PostgreSQL**: Supported by the codebase for multi-replica production deployments
+- **Fine-grained RBAC**: More granular permissions beyond the current admin/user roles
 - **Alembic migrations**: Currently using manual ALTER TABLE; planned migration to Alembic for production

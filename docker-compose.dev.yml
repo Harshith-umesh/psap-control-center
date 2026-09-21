@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   backend:
     build:
@@ -15,7 +13,16 @@ services:
     environment:
       - DATABASE_URL=sqlite+aiosqlite:///./data/pasp_control_center.db
       - KUBECONFIG_STORAGE_PATH=/app/kubeconfigs
-      - SECRET_KEY=dev-secret-key
+      - SECRET_KEY=${SECRET_KEY:-dev-secret-key}
+      - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-480}
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-change-admin-password}
+      - USER_USERNAME=${USER_USERNAME:-user}
+      - USER_PASSWORD=${USER_PASSWORD:-change-user-password}
+      - HEARTH_ENABLED=${HEARTH_ENABLED:-true}
+      - HEARTH_NAMESPACE=${HEARTH_NAMESPACE:-hearth}
+      - BILLING_CSV_STORAGE_PATH=/app/data/billing_csvs
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
   frontend:
@@ -29,6 +36,6 @@ services:
       - ./frontend:/app
       - /app/node_modules
     environment:
-      - VITE_API_URL=http://localhost:8000
+      - VITE_API_PROXY_TARGET=http://backend:8000
     depends_on:
       - backend
