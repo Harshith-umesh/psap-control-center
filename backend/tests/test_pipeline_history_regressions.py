@@ -213,12 +213,6 @@ def test_rhaiis_overrides_normalize_to_forge_keys():
 
 def test_rhaiis_schema_adds_legacy_controls(monkeypatch):
     def fake_fetch_yaml(path):
-        if path.endswith("presets.d/clusters.yaml"):
-            return {
-                "__multiple": True,
-                "hera": {"rhaiis.cluster_tag": "hera2"},
-                "mi355x": {"rhaiis.gpu_types.amd": "mi355x"},
-            }
         if path.endswith("config.d/rhaiis.yaml"):
             return {"engines": {"vllm": {"images": {"nvidia": "vllm:latest"}}}}
         raise AssertionError(path)
@@ -245,6 +239,12 @@ def test_rhaiis_schema_adds_legacy_controls(monkeypatch):
                                 {"key": "benchmark", "type": "boolean"},
                                 {"key": "warmup", "type": "boolean"},
                                 {"key": "slack", "type": "boolean"},
+                                {"key": "slack_member_id", "type": "text"},
+                                {
+                                    "key": "compare_version",
+                                    "type": "text",
+                                    "visible_if": {"field": "compare_versions", "equals": True},
+                                },
                             ],
                         },
                     ],
@@ -256,16 +256,84 @@ def test_rhaiis_schema_adds_legacy_controls(monkeypatch):
     resolved = project_ui_schema._resolve_schema("rhaiis", schema, strict=True)
     mode = resolved.modes[0]
     fields = {field.key: field for section in mode.sections for field in section.fields}
-    assert fields["cluster_profile"].required is True
-    assert {option.value for option in fields["cluster_profile"].options} == {"hera", "mi355x"}
+    assert "cluster_profile" not in fields
     assert fields["gpu_count"].default == 1
     assert fields["model"].options[-1].value == "__custom_model__"
     assert fields["workload"].options[-1].value == "__custom_workload__"
     assert fields["warmup"].default is True
     assert fields["benchmark"].default is True
     assert fields["slack"].default is True
+    assert fields["slack_member_id"].required is True
+    assert fields["compare_version"].required is True
     assert fields["prefix_caching"].default is False
     assert fields["engine"].options == []
+
+
+def test_rhaiis_workload_presets_are_quick_presets(monkeypatch):
+    def fake_fetch_yaml(path):
+        if path.endswith("presets.d/workloads.yaml"):
+            return {
+                "__multiple": True,
+                "sglang": {"rhaiis.engine": "sglang"},
+                "profile1-balanced": {"tests.rhaiis.workload_key": "profile1"},
+                "profile4-long-context": {"tests.rhaiis.workload_key": "profile4"},
+                "benchmark-standard": {
+                    "extends": ["benchmark"],
+                    "tests.rhaiis.workload_key": ["profile1", "profile4"],
+                },
+                "sglang-ci-quick": {
+                    "extends": ["sglang"],
+                    "tests.rhaiis.workload_key": "profile1",
+                },
+            }
+        if path.endswith("config.d/rhaiis.yaml"):
+            return {"engines": {}}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(project_ui_schema, "fetch_yaml", fake_fetch_yaml)
+    schema = project_ui_schema.ProjectUiSchema.model_validate(
+        {
+            "project": "rhaiis",
+            "modes": [
+                {
+                    "id": "single",
+                    "presets_ref": {"path": "presets.d/workloads.yaml"},
+                    "sections": [
+                        {
+                            "id": "model",
+                            "fields": [
+                                {
+                                    "key": "engine",
+                                    "type": "radio",
+                                    "maps_to": "rhaiis.engine",
+                                },
+                                {
+                                    "key": "workload",
+                                    "type": "multiselect",
+                                    "maps_to": "tests.rhaiis.workload_key",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    mode = project_ui_schema._resolve_schema("rhaiis", schema, strict=True).modes[0]
+    workload = next(field for section in mode.sections for field in section.fields if field.key == "workload")
+    quick = {preset.key: preset for preset in mode.quick_presets}
+
+    assert {option.value for option in workload.options if option.value != "__custom_workload__"} == {
+        "profile1-balanced",
+        "profile4-long-context",
+    }
+    assert quick["benchmark-standard"].fills["workload"] == [
+        "profile1-balanced",
+        "profile4-long-context",
+    ]
+    assert quick["benchmark-standard"].overrides == {}
+    assert quick["sglang-ci-quick"].fills["engine"] == "sglang"
 
 
 @pytest.mark.parametrize(

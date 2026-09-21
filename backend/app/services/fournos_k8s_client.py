@@ -45,6 +45,8 @@ def _saved_hearth_kubeconfig() -> Optional[str]:
 def _ensure_loaded() -> None:
     """Load kubeconfig once (thread-safe)."""
     global _api_client, _custom_api, _core_api
+    if not settings.HEARTH_ENABLED:
+        return
     if _custom_api is not None:
         return
     with _lock:
@@ -82,6 +84,8 @@ def reset() -> None:
 
 
 def is_connected() -> bool:
+    if not settings.HEARTH_ENABLED:
+        return False
     _ensure_loaded()
     return _custom_api is not None
 

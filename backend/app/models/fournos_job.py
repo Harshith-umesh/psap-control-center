@@ -6,13 +6,19 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from sqlalchemy import (
-    Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text, Index,
-    func,
+    Boolean, Column, DateTime, Float, ForeignKey, Integer, JSON, String, Text,
+    Index, func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
+
+
+# Keep the PostgreSQL storage types used in production while allowing the
+# documented SQLite local-development database to initialize as well.
+_JSON = JSON().with_variant(JSONB(), "postgresql")
+_STRING_LIST = JSON().with_variant(ARRAY(String), "postgresql")
 
 
 class FournosJob(Base):
@@ -35,17 +41,17 @@ class FournosJob(Base):
     duration_seconds = Column(Float, nullable=True)
     mlflow_url = Column(String(1024), default="")
     ci_artifacts_url = Column(String(1024), default="")
-    config_overrides = Column(JSONB, default=dict)
-    tags = Column(ARRAY(String), default=list)
-    fjob_spec = Column(JSONB, default=dict)
-    fjob_status = Column(JSONB, default=dict)
+    config_overrides = Column(_JSON, default=dict)
+    tags = Column(_STRING_LIST, default=list)
+    fjob_spec = Column(_JSON, default=dict)
+    fjob_status = Column(_JSON, default=dict)
     # Snapshot of the merged pipeline stage list (same shape the live
     # job-detail endpoint builds via pipeline_definitions.merge_pipeline_
     # stages) taken when the job reaches a terminal phase (with a small retry
     # window for transient K8s failures). The PipelineRun/TaskRuns themselves
     # may be gone by the time a job is opened from History, so this is the
     # durable copy used to render the timeline and failed step.
-    stages = Column(JSONB, default=list)
+    stages = Column(_JSON, default=list)
     # Failed/missing PipelineRun snapshots are retried a small, bounded number
     # of times. Keeping this state in the DB prevents every watcher restart or
     # full-sync pass from creating another Kubernetes API storm.

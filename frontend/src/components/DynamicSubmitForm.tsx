@@ -127,6 +127,14 @@ function optionLabel(field: UiField, raw: string): string {
   return field.options.find((o) => o.value === raw)?.label || raw
 }
 
+const RHAIIS_CLUSTER_GPU_TYPES: Record<string, string> = {
+  hera: 'h200',
+  zeus: 'h200',
+  'old-zeus': 'h200',
+  b200: 'b200',
+  mi355x: 'amd',
+}
+
 /** Human-readable rendering of a field's current value for the review step. */
 function formatFieldValueForReview(field: UiField, value: unknown): string | null {
   if (field.type === 'boolean') return value ? 'Yes' : 'No'
@@ -217,14 +225,8 @@ export default function DynamicSubmitForm({
   const modelField = activeFields.find((field) => field.key === 'model')
   const workloadField = activeFields.find((field) => field.key === 'workload')
   const engineField = activeFields.find((field) => field.key === 'engine')
-  const clusterProfileField = activeFields.find((field) => field.key === 'cluster_profile')
-  const selectedClusterProfile = clusterProfileField?.options.find(
-    (option) => option.value === values.cluster_profile
-  )
-  const profileGpuType = typeof selectedClusterProfile?.extra?.gpu_type === 'string'
-    ? selectedClusterProfile.extra.gpu_type
-    : ''
-  const gpuType = basics.clusterGpuType || profileGpuType
+  const clusterName = basics.cluster.trim().toLowerCase()
+  const gpuType = basics.clusterGpuType || (isRhaiis ? RHAIIS_CLUSTER_GPU_TYPES[clusterName] || '' : '')
   const selectedModelTp = modelTpSize(modelField, values.model) || 1
   const tpSize = isRhaiis ? Math.max(Number(values.tp_size) || selectedModelTp, 1) : 1
   const gpuCount = isRhaiis ? Math.max(Number(values.gpu_count) || 1, tpSize) : 1
@@ -345,7 +347,10 @@ export default function DynamicSubmitForm({
         if (!field) continue
         if (field.type === 'multiselect') {
           const arr = Array.isArray(next[fieldKey]) ? [...(next[fieldKey] as string[])] : []
-          if (typeof fillValue === 'string' && !arr.includes(fillValue)) arr.push(fillValue)
+          const incoming = Array.isArray(fillValue) ? fillValue : [fillValue]
+          for (const item of incoming) {
+            if (typeof item === 'string' && !arr.includes(item)) arr.push(item)
+          }
           next[fieldKey] = arr
         } else {
           next[fieldKey] = fillValue
@@ -370,6 +375,11 @@ export default function DynamicSubmitForm({
         for (const [k, v] of Object.entries(qp.overrides)) overrides[k] = stringifyValue(v)
       }
     }
+
+    // The shared Basics cluster is also the RHAIIS cluster/profile argument.
+    // Keeping it here avoids a duplicate Project Details selector and keeps
+    // the submitted job aligned with the legacy FourNos dashboard.
+    if (isRhaiis && basics.cluster.trim()) args.push(basics.cluster.trim())
 
     for (const field of fieldsOf(activeMode)) {
       if (!isFieldVisible(field, values)) continue
@@ -563,8 +573,8 @@ export default function DynamicSubmitForm({
   const slackValid = !isRhaiis || activeMode.id !== 'single' || values.slack !== true || !!String(values.slack_member_id || '').trim()
   const formValid = requiredFieldsValid && customModelValid && customWorkloadValid && sizingValid && slackValid
   const canSubmit = isMatrix
-    ? !submitMatrix.isPending && !!basics.cluster && !!basics.owner.trim() && buildSourceValid && formValid && !!selectedPipeline && selectedModels.length > 0 && selectedWorkloads.length > 0
-    : !submitJob.isPending && !!basics.cluster && !!basics.owner.trim() && buildSourceValid && formValid
+    ? !submitMatrix.isPending && !!basics.cluster.trim() && !!basics.owner.trim() && buildSourceValid && formValid && !!selectedPipeline && selectedModels.length > 0 && selectedWorkloads.length > 0
+    : !submitJob.isPending && !!basics.cluster.trim() && !!basics.owner.trim() && buildSourceValid && formValid
 
   return (
     <form onSubmit={handleSubmit} className="space-y-6">
@@ -617,7 +627,9 @@ export default function DynamicSubmitForm({
           {activeMode.sections.map((section) => (
             <div key={section.id} className="rounded-lg border border-gray-200 p-4 space-y-4">
               {section.label && (
-                <h3 className="text-sm font-semibold text-gray-900">{section.label}</h3>
+                <h3 className="text-sm font-semibold text-gray-900">
+                  {isRhaiis && section.id === 'model' ? 'Workload' : section.label}
+                </h3>
               )}
               <div className="grid grid-cols-1 gap-x-6 gap-y-4 sm:grid-cols-2">
                 {section.fields.map((field) => {
@@ -934,7 +946,7 @@ export default function DynamicSubmitForm({
             <div className="space-y-4 min-w-0">
               <ReviewSection title="Basics">
                 <ReviewRow label="Project" value={project} />
-                <ReviewRow label="Cluster" value={basics.cluster} missing={!basics.cluster} />
+                <ReviewRow label="Cluster" value={basics.cluster} missing={!basics.cluster.trim()} />
                 <ReviewRow label="Pipeline" value={basics.pipeline} />
                 {isRhaiis && <ReviewRow label="GPU type / count" value={`${gpuType || 'auto'} / ${gpuCount}`} />}
                 {basics.owner && <ReviewRow label="Owner" value={basics.owner} />}
@@ -1059,9 +1071,9 @@ export default function DynamicSubmitForm({
                   <button
                     type="button"
                     onClick={onOpenScheduleModal}
-                    disabled={!basics.cluster}
+                    disabled={!basics.cluster.trim()}
                     className="inline-flex items-center gap-1.5 rounded-md border border-gray-300 bg-white px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-                    title={!basics.cluster ? 'Pick a cluster first' : undefined}
+                    title={!basics.cluster.trim() ? 'Pick a cluster first' : undefined}
                   >
                     <ClockIcon className="h-4 w-4" />
                     Defer / Set Recurring…

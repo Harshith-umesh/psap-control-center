@@ -422,10 +422,10 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
   const autoPromptedClusterRef = useRef<string | null>(null)
   useEffect(() => {
     setClusterActivityModalOpen(false)
-    if (!cluster) autoPromptedClusterRef.current = null
+    if (!cluster.trim()) autoPromptedClusterRef.current = null
   }, [cluster])
   useEffect(() => {
-    if (!cluster || !clusterOverview) return
+    if (!cluster.trim() || !clusterOverview) return
     if (autoPromptedClusterRef.current === cluster) return
     autoPromptedClusterRef.current = cluster
     if (hasUpcomingClusterActivity(clusterOverview, 4)) setClusterActivityModalOpen(true)
@@ -635,10 +635,13 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
 
             <div className="grid grid-cols-1 gap-5 px-5 py-5 sm:grid-cols-3">
               <div>
-                <label className="block text-sm font-medium text-gray-900">Cluster</label>
+                <label className="block text-sm font-medium text-gray-900">
+                  Cluster<span className="ml-0.5 text-red-500">*</span>
+                </label>
                 <ClusterCombobox
                   value={lockCluster}
                   onChange={setLockCluster}
+                  required
                   inputClassName="mt-1.5 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm"
                 />
               </div>
@@ -754,7 +757,9 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
 
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
-              <label className="block text-sm font-medium text-gray-700">Cluster</label>
+              <label className="block text-sm font-medium text-gray-700">
+                Cluster<span className="text-red-500 ml-0.5">*</span>
+              </label>
               <ClusterCombobox
                 value={cluster}
                 onChange={setCluster}
@@ -973,7 +978,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
             </button>
             <button
               type="button"
-              disabled={!project || !cluster || !owner.trim() || !buildSourceValid}
+              disabled={!project || !cluster.trim() || !owner.trim() || !buildSourceValid}
               onClick={() => setStep(3)}
               title={!owner.trim() ? 'Owner is required' : !buildSourceValid ? 'RHAIIS build source is required' : undefined}
               className="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:opacity-50"
@@ -1068,7 +1073,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
           <div className="space-y-4 min-w-0">
             <ReviewSection title="Basics">
               <ReviewRow label="Project" value={project} missing={!project} />
-              <ReviewRow label="Cluster" value={cluster} missing={!cluster} />
+              <ReviewRow label="Cluster" value={cluster} missing={!cluster.trim()} />
               <ReviewRow label="Pipeline" value={pipeline} />
               {owner && <ReviewRow label="Owner" value={owner} />}
               <ReviewRow label="Priority" value={priority} />
@@ -1113,14 +1118,14 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
                 <button
                   type="button"
                   onClick={() => setScheduleModalOpen(true)}
-                  disabled={!cluster}
+                  disabled={!cluster.trim()}
                   className="inline-flex items-center gap-1.5 rounded-md border border-gray-300 bg-white px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-                  title={!cluster ? 'Pick a cluster first' : undefined}
+                  title={!cluster.trim() ? 'Pick a cluster first' : undefined}
                 >
                   <ClockIcon className="h-4 w-4" />
                   Defer / Set Recurring…
                 </button>
-                <button type="submit" disabled={submitJob.isPending || !project || !cluster || !owner.trim() || !buildSourceValid} className="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:opacity-50">
+                <button type="submit" disabled={submitJob.isPending || !project || !cluster.trim() || !owner.trim() || !buildSourceValid} className="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:opacity-50">
                   {submitJob.isPending ? <ArrowPathIcon className="h-4 w-4 animate-spin" /> : <PlayIcon className="h-4 w-4" />}
                   Submit Job
                 </button>
