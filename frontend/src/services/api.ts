@@ -551,6 +551,11 @@ export const fournosApi = {
     return data
   },
 
+  getGithubReleases: async () => {
+    const { data } = await api.get('/fournos/github/releases')
+    return data
+  },
+
   refreshGithubPRs: async () => {
     const { data } = await api.post('/fournos/github/open-prs/refresh')
     return data

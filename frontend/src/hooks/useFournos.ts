@@ -12,6 +12,7 @@ import type {
   CreateClusterLockRequest,
   ForgeProject,
   GitHubPR,
+  GitHubRelease,
   GithubSyncStatus,
   SlotHold,
   SubmitJobRequest,
@@ -267,6 +268,16 @@ export function useGithubPRs() {
     // Use useRefreshGithubPRs() to force a real refresh from GitHub.
     staleTime: Infinity,
     refetchOnMount: false,
+    refetchOnWindowFocus: false,
+  })
+}
+
+export function useGithubReleases(enabled = true) {
+  return useQuery<GitHubRelease[]>({
+    queryKey: ['github-releases'],
+    queryFn: () => fournosApi.getGithubReleases(),
+    enabled,
+    staleTime: 30 * 60 * 1000,
     refetchOnWindowFocus: false,
   })
 }

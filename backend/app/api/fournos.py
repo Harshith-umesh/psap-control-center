@@ -10,11 +10,12 @@ import json
 import logging
 import re
 import urllib.request
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 from app.core.auth import require_admin, require_auth
 from app.core.config import settings
@@ -25,6 +26,7 @@ from app.schemas.fournos import (
     CreateClusterLockRequest,
     FournosJobSummary,
     GitHubPR,
+    GitHubRelease,
     GithubSyncStatusResponse,
     HoldSlotRequest,
     JobEventResponse,
@@ -52,6 +54,30 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/fournos", tags=["fournos"])
 
 _COMPLETED_GRACE_SECONDS = 180
+_LOG_ISSUE_RE = re.compile(r"\b(?:error|warning|warn)\b", re.IGNORECASE)
+_LOG_DECORATION_RE = re.compile(
+    r"^\s*(?:error|warning|warn)?\s*:?\s*[-=*_]{3,}\s*$",
+    re.IGNORECASE,
+)
+_LOG_CONTEXT_LINES = 300
+_LOG_CONTEXT_HISTORY = _LOG_CONTEXT_LINES - 1
+_LOG_CONTEXT_AFTER = (_LOG_CONTEXT_LINES - 1) // 2
+
+
+def _is_log_issue(line: str) -> bool:
+    """Return whether a log line contains a meaningful error/warning marker."""
+    stripped = line.strip()
+    if not stripped or not _LOG_ISSUE_RE.search(stripped):
+        return False
+    if _LOG_DECORATION_RE.fullmatch(stripped):
+        return False
+    issue_text = re.sub(
+        r"^\s*(?:error|warning|warn)\s*:?\s*",
+        "",
+        stripped,
+        flags=re.IGNORECASE,
+    ).strip()
+    return bool(issue_text) and not re.fullmatch(r"[-=*_]{3,}", issue_text)
 
 _VERSION_KEYS = {"mcp_gateway": "infrastructure.mcp_gateway_version"}
 
@@ -586,39 +612,156 @@ async def delete_history_job(job_name: str, _=Depends(require_admin)):
 
 @router.get("/jobs/{job_name}/logs/{pod_name}")
 async def stream_logs(job_name: str, pod_name: str):
+    """Stream the latest warning/error context for a pod.
+
+    The browser needs the end of a failed log, not an unbounded stream from
+    the beginning. Keep the latest issue and up to 299 surrounding lines in
+    memory; the complete log remains available from the download endpoint.
+    """
+    job_pods = await asyncio.to_thread(k8s.list_pods_for_job, job_name)
+    pod_map = {p["name"]: p for p in job_pods}
+    if pod_name not in pod_map:
+        raise HTTPException(404, "Pod not found for this job")
+
+    is_running = pod_map[pod_name].get("phase") in ("Running", "Pending")
+
+    async def generate():
+        stop = asyncio.Event()
+        queue: asyncio.Queue[tuple[list[str], int] | None] = asyncio.Queue(maxsize=2)
+        loop = asyncio.get_event_loop()
+
+        def _publish_latest(context: tuple[list[str], int]) -> None:
+            # Only the newest issue is useful. Drop stale intermediate
+            # contexts if a noisy live pod produces several quickly.
+            while True:
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            queue.put_nowait(context)
+
+        def _finish() -> None:
+            queue.put_nowait(None)
+
+        def _reader():
+            recent_lines: deque[str] = deque(maxlen=_LOG_CONTEXT_HISTORY)
+            current_issue: str | None = None
+            current_before: list[str] = []
+            current_after: list[str] = []
+
+            def _build_context() -> tuple[list[str], int] | None:
+                if current_issue is None:
+                    return None
+                after = current_after[:_LOG_CONTEXT_AFTER]
+                before_limit = _LOG_CONTEXT_LINES - 1 - len(after)
+                before = current_before[-before_limit:] if before_limit else []
+                return before + [current_issue] + after, len(before)
+
+            def _publish_context() -> None:
+                context = _build_context()
+                if context is not None:
+                    loop.call_soon_threadsafe(_publish_latest, context)
+
+            try:
+                for line in k8s.read_pod_log(pod_name, follow=is_running):
+                    if stop.is_set():
+                        break
+                    if _is_log_issue(line):
+                        current_issue = line
+                        current_before = list(recent_lines)
+                        current_after = []
+                        if is_running:
+                            _publish_context()
+                    elif current_issue is not None:
+                        if len(current_after) < _LOG_CONTEXT_AFTER:
+                            current_after.append(line)
+                            if is_running and (
+                                len(current_after) % 25 == 0
+                                or len(current_after) == _LOG_CONTEXT_AFTER
+                            ):
+                                _publish_context()
+                    recent_lines.append(line)
+            finally:
+                _publish_context()
+                loop.call_soon_threadsafe(_finish)
+
+        loop.run_in_executor(None, _reader)
+        latest_context = None
+        try:
+            while True:
+                context = await queue.get()
+                if context is None:
+                    break
+                latest_context = context
+                if is_running:
+                    lines, issue_index = context
+                    payload = json.dumps(
+                        {"lines": lines, "issue_index": issue_index},
+                        ensure_ascii=False,
+                    )
+                    yield "event: context\ndata: {}\n\n".format(payload)
+
+            if not is_running and latest_context is not None:
+                lines, issue_index = latest_context
+                payload = json.dumps(
+                    {"lines": lines, "issue_index": issue_index},
+                    ensure_ascii=False,
+                )
+                yield "event: context\ndata: {}\n\n".format(payload)
+
+            yield "event: complete\ndata: {}\n\n".format(
+                "found" if latest_context else "none"
+            )
+        finally:
+            stop.set()
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/jobs/{job_name}/logs/{pod_name}/download")
+async def download_logs(job_name: str, pod_name: str):
+    """Download the complete current log for a job pod."""
     job_pods = await asyncio.to_thread(k8s.list_pods_for_job, job_name)
     pod_names = {p["name"] for p in job_pods}
     if pod_name not in pod_names:
         raise HTTPException(404, "Pod not found for this job")
 
-    async def generate():
-        stop = asyncio.Event()
-        queue: asyncio.Queue = asyncio.Queue(maxsize=64)
-        loop = asyncio.get_event_loop()
+    log_text = await asyncio.to_thread(
+        lambda: "\n".join(k8s.read_pod_log(pod_name, follow=False))
+    )
+    safe_job = re.sub(r"[^A-Za-z0-9._-]", "-", job_name)
+    safe_pod = re.sub(r"[^A-Za-z0-9._-]", "-", pod_name)
+    return Response(
+        content=log_text,
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Disposition": (
+                'attachment; filename="{}-{}.log"'.format(safe_job, safe_pod)
+            ),
+        },
+    )
 
-        def _reader():
-            try:
-                for line in k8s.read_pod_log(pod_name, follow=True):
-                    if stop.is_set():
-                        break
-                    try:
-                        loop.call_soon_threadsafe(queue.put_nowait, line)
-                    except asyncio.QueueFull:
-                        pass
-            finally:
-                loop.call_soon_threadsafe(queue.put_nowait, None)
 
-        asyncio.get_event_loop().run_in_executor(None, _reader)
-        try:
-            while True:
-                line = await queue.get()
-                if line is None:
-                    break
-                yield "data: {}\n\n".format(line)
-        finally:
-            stop.set()
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
+def _resolve_build_source(req: SubmitJobRequest | SubmitMatrixRequest) -> str:
+    """Return the Forge build source and enforce RHAIIS source safety."""
+    pull_sha = req.pull_sha.strip()
+    if req.project != "rhaiis":
+        return pull_sha
+    if req.use_latest_main and pull_sha:
+        raise HTTPException(
+            400, "Choose either a pinned build source or latest main, not both."
+        )
+    if not req.use_latest_main and not pull_sha:
+        raise HTTPException(
+            400,
+            "RHAIIS build source is required: choose a PR, commit SHA, release tag, or latest main.",
+        )
+    return "main" if req.use_latest_main else pull_sha
 
 
 # ─── routes: submit ──────────────────────────────────────────────────────
@@ -662,9 +805,10 @@ async def submit_job(req: SubmitJobRequest, _=Depends(require_auth)):
         args = [req.preset] if req.preset else []
         job_name = k8s.sanitize_job_name("forge-{}".format(req.project))
 
+    pull_sha = _resolve_build_source(req)
     env = {}
-    if req.pull_sha.strip():
-        env["PULL_PULL_SHA"] = req.pull_sha.strip()
+    if pull_sha:
+        env["PULL_PULL_SHA"] = pull_sha
 
     spec: dict[str, Any] = {
         "cluster": req.cluster,
@@ -760,6 +904,7 @@ async def submit_matrix(req: SubmitMatrixRequest, _=Depends(require_auth)):
     if not req.models or not req.workloads:
         raise HTTPException(400, "models and workloads are required")
 
+    pull_sha = _resolve_build_source(req)
     results = []
     for model_item in req.models:
         args = list(req.args) + [model_item.key] + list(req.workloads)
@@ -773,8 +918,8 @@ async def submit_matrix(req: SubmitMatrixRequest, _=Depends(require_auth)):
         )
 
         env: dict[str, str] = {}
-        if req.pull_sha.strip():
-            env["PULL_PULL_SHA"] = req.pull_sha.strip()
+        if pull_sha:
+            env["PULL_PULL_SHA"] = pull_sha
 
         spec: dict[str, Any] = {
             "cluster": req.cluster,
@@ -932,6 +1077,8 @@ async def list_pipelines():
 
 _open_prs_cache: Optional[list] = None
 _open_prs_inflight: Optional["asyncio.Future[list]"] = None
+_releases_cache: Optional[list] = None
+_releases_inflight: Optional["asyncio.Future[list]"] = None
 
 
 def _fetch_github_open_prs_sync() -> list:
@@ -1023,6 +1170,59 @@ async def github_open_prs_refresh(_=Depends(require_auth)):
         raise HTTPException(502, "GitHub sync failed: {}".format(exc))
     except Exception as exc:
         logger.error("Failed to refresh open PRs from GitHub: %s", exc)
+        raise HTTPException(502, "GitHub API error: {}".format(exc))
+
+
+def _fetch_github_releases_sync() -> list:
+    url = "https://api.github.com/repos/{}/releases?per_page=100".format(
+        settings.FORGE_GITHUB_REPO
+    )
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "psap-control-center",
+    }
+    if settings.GITHUB_TOKEN:
+        headers["Authorization"] = "Bearer {}".format(settings.GITHUB_TOKEN)
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        releases = json.loads(resp.read())
+    return [
+        {
+            "tag_name": release["tag_name"],
+            "name": release.get("name") or release["tag_name"],
+            "prerelease": bool(release.get("prerelease")),
+            "published_at": release.get("published_at"),
+            "html_url": release.get("html_url", ""),
+        }
+        for release in releases
+        if isinstance(release, dict) and release.get("tag_name")
+    ]
+
+
+async def _fetch_releases_coalesced() -> list:
+    global _releases_cache, _releases_inflight
+    if _releases_cache is not None:
+        return _releases_cache
+    if _releases_inflight is not None:
+        return await _releases_inflight
+    future: "asyncio.Future[list]" = asyncio.ensure_future(
+        asyncio.to_thread(_fetch_github_releases_sync)
+    )
+    _releases_inflight = future
+    try:
+        _releases_cache = await future
+        return _releases_cache
+    finally:
+        _releases_inflight = None
+
+
+@router.get("/github/releases", response_model=List[GitHubRelease])
+async def github_releases():
+    """Return published Forge release tags for the build-source picker."""
+    try:
+        return await _fetch_releases_coalesced()
+    except Exception as exc:
+        logger.error("Failed to fetch GitHub releases: %s", exc)
         raise HTTPException(502, "GitHub API error: {}".format(exc))
 
 

@@ -33,6 +33,7 @@ export interface SubmitBasics {
   priority: string
   exclusive: boolean
   pullSha: string
+  useLatestMain: boolean
   /** Human-readable label for the review step, e.g. "#123 — title (author)". */
   prLabel: string
   /** When this job (or recurring template) should run — see ClusterScheduleModal. */
@@ -234,7 +235,6 @@ export default function DynamicSubmitForm({
         setFieldValue(field.key, '')
       }
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeMode, values])
 
   const applyQuickPreset = (qp: UiQuickPreset) => {
@@ -322,6 +322,7 @@ export default function DynamicSubmitForm({
           priority: basics.priority,
           exclusive: basics.exclusive,
           pull_sha: basics.pullSha,
+          use_latest_main: basics.useLatestMain,
           gpu_type: '',
           ...schedulingRequestFields(basics.scheduling),
         })
@@ -345,6 +346,7 @@ export default function DynamicSubmitForm({
         exclusive: basics.exclusive,
         config_overrides: configOverrides,
         pull_sha: basics.pullSha,
+        use_latest_main: basics.useLatestMain,
         priority: basics.priority,
         ...schedulingRequestFields(basics.scheduling),
       })
@@ -362,9 +364,10 @@ export default function DynamicSubmitForm({
 
   if (step !== 2 && step !== 3) return null
 
+  const buildSourceValid = project !== 'rhaiis' || basics.useLatestMain || !!basics.pullSha.trim()
   const canSubmit = isMatrix
-    ? !submitMatrix.isPending && !!basics.cluster && !!basics.owner.trim() && !!selectedPipeline && selectedModels.length > 0 && selectedWorkloads.length > 0
-    : !submitJob.isPending && !!basics.cluster && !!basics.owner.trim()
+    ? !submitMatrix.isPending && !!basics.cluster && !!basics.owner.trim() && buildSourceValid && !!selectedPipeline && selectedModels.length > 0 && selectedWorkloads.length > 0
+    : !submitJob.isPending && !!basics.cluster && !!basics.owner.trim() && buildSourceValid
 
   return (
     <form onSubmit={handleSubmit} className="space-y-6">
@@ -576,7 +579,7 @@ export default function DynamicSubmitForm({
           owner: basics.owner,
           priority: basics.priority,
           exclusive: basics.exclusive,
-          pullSha: basics.pullSha,
+          pullSha: basics.useLatestMain ? 'main' : basics.pullSha,
           args,
           configOverrides: overrides,
           schedule: basics.scheduling.mode === 'recurring' ? basics.scheduling.scheduleUtc : '',
@@ -611,8 +614,11 @@ export default function DynamicSubmitForm({
                 {basics.owner && <ReviewRow label="Owner" value={basics.owner} />}
                 <ReviewRow label="Priority" value={basics.priority} />
                 {basics.exclusive && <ReviewRow label="Exclusive" value="Yes" />}
+                {project === 'rhaiis' && basics.useLatestMain && (
+                  <ReviewRow label="Build source" value="Latest main (un-pinned)" />
+                )}
                 {basics.pullSha && (
-                  <ReviewRow label="Pull Request" value={basics.prLabel} mono={!basics.prLabel || basics.prLabel === basics.pullSha} />
+                  <ReviewRow label={project === 'rhaiis' ? 'Build source' : 'Pull Request'} value={basics.prLabel} mono={!basics.prLabel || basics.prLabel === basics.pullSha} />
                 )}
                 <ReviewRow
                   label="Schedule"

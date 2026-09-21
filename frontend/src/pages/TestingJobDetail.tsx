@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, Fragment } from 'react'
+import { useState, useEffect, useRef, useMemo, Fragment } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import {
   ArrowLeftIcon,
@@ -222,17 +222,35 @@ function PodsPanel({
 function LogViewer({ jobName, podName }: { jobName: string; podName: string }) {
   const [lines, setLines] = useState<string[]>([])
   const [connected, setConnected] = useState(false)
-  const logEndRef = useRef<HTMLDivElement>(null)
+  const [complete, setComplete] = useState(false)
+  const [issueIndex, setIssueIndex] = useState<number | null>(null)
   const [autoScroll, setAutoScroll] = useState(true)
+  const autoScrollRef = useRef(true)
 
   useEffect(() => {
     setLines([])
     setConnected(false)
-    const evtSource = new EventSource(`/api/v1/fournos/jobs/${jobName}/logs/${podName}`)
+    setComplete(false)
+    setIssueIndex(null)
+    const encodedJob = encodeURIComponent(jobName)
+    const encodedPod = encodeURIComponent(podName)
+    const evtSource = new EventSource(`/api/v1/fournos/jobs/${encodedJob}/logs/${encodedPod}`)
     evtSource.onopen = () => setConnected(true)
-    evtSource.onmessage = (event) => {
-      setLines((prev) => [...prev, event.data])
-    }
+    evtSource.addEventListener('context', (event) => {
+      const payload = JSON.parse((event as MessageEvent).data) as { lines: string[]; issue_index: number }
+      setLines(payload.lines)
+      setIssueIndex(payload.issue_index)
+      setComplete(false)
+      if (autoScrollRef.current) {
+        window.requestAnimationFrame(() => {
+          document.getElementById('latest-log-issue')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        })
+      }
+    })
+    evtSource.addEventListener('complete', () => {
+      setConnected(false)
+      setComplete(true)
+    })
     evtSource.onerror = () => {
       setConnected(false)
       evtSource.close()
@@ -240,35 +258,41 @@ function LogViewer({ jobName, podName }: { jobName: string; podName: string }) {
     return () => evtSource.close()
   }, [jobName, podName])
 
-  useEffect(() => {
-    if (autoScroll) logEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [lines, autoScroll])
-
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between">
         <h3 className="flex items-center gap-2 text-sm font-semibold text-gray-900">
           <DocumentTextIcon className="h-4 w-4" />
-          Logs <span className="text-gray-300">—</span> <span className="rounded bg-gray-100 px-1.5 py-0.5 font-mono text-xs text-gray-600">{podName}</span>
+          Latest log issue <span className="text-gray-300">—</span> <span className="rounded bg-gray-100 px-1.5 py-0.5 font-mono text-xs text-gray-600">{podName}</span>
         </h3>
         <div className="flex items-center gap-3 text-xs">
-          <span className={clsx('flex items-center gap-1 font-medium', connected ? 'text-green-600' : 'text-gray-400')}>
-            <span className={clsx('h-1.5 w-1.5 rounded-full', connected ? 'bg-green-500 animate-pulse' : 'bg-gray-300')} />
-            {connected ? 'Live' : 'Disconnected'}
+          <span className={clsx('flex items-center gap-1 font-medium', connected ? 'text-green-600' : complete ? 'text-gray-500' : 'text-gray-400')}>
+            <span className={clsx('h-1.5 w-1.5 rounded-full', connected ? 'bg-green-500 animate-pulse' : complete ? 'bg-gray-400' : 'bg-gray-300')} />
+            {connected ? 'Live' : complete ? 'Complete' : 'Disconnected'}
           </span>
           <label className="flex items-center gap-1.5 text-gray-500">
-            <input type="checkbox" checked={autoScroll} onChange={(e) => setAutoScroll(e.target.checked)} className="h-3 w-3 rounded border-gray-300 text-indigo-600" />
+            <input type="checkbox" checked={autoScroll} onChange={(e) => { autoScrollRef.current = e.target.checked; setAutoScroll(e.target.checked) }} className="h-3 w-3 rounded border-gray-300 text-indigo-600" />
             Auto-scroll
           </label>
+          <a
+            href={`/api/v1/fournos/jobs/${encodeURIComponent(jobName)}/logs/${encodeURIComponent(podName)}/download`}
+            download
+            className="rounded-md border border-gray-300 bg-white px-2.5 py-1.5 font-medium text-gray-700 hover:bg-gray-50"
+          >
+            Download full logs
+          </a>
         </div>
       </div>
       <div className="h-96 overflow-y-auto rounded-lg bg-gray-950 p-4 font-mono text-xs leading-relaxed text-gray-300 shadow-inner">
-        {lines.length === 0 && !connected && <span className="text-gray-500">Waiting for logs...</span>}
+        {lines.length === 0 && connected && <span className="text-gray-500">Waiting for the latest error or warning…</span>}
+        {lines.length === 0 && complete && <span className="text-gray-500">No errors or warnings found in this pod log.</span>}
         {lines.map((line, i) => (
-          <div key={i} className="hover:bg-gray-800/50">{line}</div>
+          <div id={i === issueIndex ? 'latest-log-issue' : undefined} key={i} className={clsx('whitespace-pre-wrap hover:bg-gray-800/50', i === issueIndex && 'border-l-2 border-red-400 bg-red-950/40 pl-2 text-red-200')}>
+            {line}
+          </div>
         ))}
-        <div ref={logEndRef} />
       </div>
+      <p className="text-xs text-gray-500">Showing up to 300 lines around the latest error or warning. Download the full log for complete output.</p>
     </div>
   )
 }
@@ -284,7 +308,7 @@ export default function TestingJobDetail() {
   const [autoSelected, setAutoSelected] = useState(false)
   const [activeTab, setActiveTab] = useState<'timeline' | 'pods' | 'spec'>('timeline')
 
-  const pods = data?.pods ?? []
+  const pods = useMemo(() => data?.pods ?? [], [data?.pods])
   const phase = (data?.job.status as Record<string, unknown> | undefined)?.phase as string | undefined
   // Once a job is archived to history its pods are long gone from the
   // cluster — no point offering a tab that can only ever say "no pods".

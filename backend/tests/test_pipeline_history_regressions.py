@@ -1,5 +1,8 @@
 from datetime import datetime, timedelta, timezone
 
+import pytest
+from fastapi import HTTPException
+
 from app.services import fournos_k8s_client as k8s
 from app.services import fournos_watcher as watcher
 from app.api import fournos as fournos_api
@@ -165,3 +168,43 @@ def test_history_effective_date_index_is_created_for_existing_databases():
     assert indexes["ix_fournos_jobs_effective_date"] == (
         "COALESCE(completed_at, created_at)"
     )
+
+
+def test_rhaiis_build_source_requires_a_pin_or_explicit_latest_main():
+    from app.schemas.fournos import SubmitJobRequest
+
+    with pytest.raises(HTTPException, match="build source is required"):
+        fournos_api._resolve_build_source(
+            SubmitJobRequest(project="rhaiis", cluster="hera")
+        )
+
+    assert fournos_api._resolve_build_source(
+        SubmitJobRequest(project="rhaiis", cluster="hera", pull_sha="  abc123  ")
+    ) == "abc123"
+    assert fournos_api._resolve_build_source(
+        SubmitJobRequest(project="rhaiis", cluster="hera", use_latest_main=True)
+    ) == "main"
+
+    with pytest.raises(HTTPException, match="either a pinned build source"):
+        fournos_api._resolve_build_source(
+            SubmitJobRequest(
+                project="rhaiis",
+                cluster="hera",
+                pull_sha="abc123",
+                use_latest_main=True,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("ERROR: failed to resolve the image", True),
+        ("warning: retrying request", True),
+        ("ERROR: ----------------", False),
+        ("normal output", False),
+        ("", False),
+    ],
+)
+def test_log_issue_detection_ignores_decoration_only_markers(line, expected):
+    assert fournos_api._is_log_issue(line) is expected

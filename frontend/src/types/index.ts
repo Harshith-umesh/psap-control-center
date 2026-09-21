@@ -622,6 +622,14 @@ export interface GitHubPR {
   draft: boolean
 }
 
+export interface GitHubRelease {
+  tag_name: string
+  name: string
+  prerelease: boolean
+  published_at: string | null
+  html_url: string
+}
+
 export interface GithubSyncStatus {
   in_progress: boolean
   last_synced_at: string | null
@@ -640,6 +648,7 @@ export interface SubmitJobRequest {
   exclusive: boolean
   config_overrides: Record<string, string>
   pull_sha: string
+  use_latest_main?: boolean
   priority?: string
   gpu_type?: string
   gpu_count?: number
@@ -677,6 +686,7 @@ export interface SubmitMatrixRequest {
   priority: string
   exclusive: boolean
   pull_sha: string
+  use_latest_main?: boolean
   gpu_type: string
   scheduled_start_time?: string | null
   schedule?: string
@@ -793,4 +803,3 @@ export interface ProjectUiSchemaResponse {
   project: string
   ui_schema: ProjectUiSchema | null
 }
-

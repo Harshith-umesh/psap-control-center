@@ -132,6 +132,10 @@ class SubmitJobRequest(BaseModel):
     exclusive: bool = False
     config_overrides: Dict[str, str] = Field(default_factory=dict)
     pull_sha: str = ""
+    # RHAIIS requires either a pinned commit/release/PR SHA or an explicit
+    # opt-in to the moving main branch. The backend validates this rather
+    # than relying only on the browser form.
+    use_latest_main: bool = False
     priority: str = "manual"
     gpu_type: str = ""
     gpu_count: int = 1
@@ -175,6 +179,7 @@ class SubmitMatrixRequest(BaseModel):
     priority: str = "manual"
     exclusive: bool = False
     pull_sha: str = ""
+    use_latest_main: bool = False
     gpu_type: str = ""
     scheduled_start_time: Optional[str] = None
     schedule: str = ""
@@ -302,6 +307,14 @@ class GitHubPR(BaseModel):
     head_sha: str
     branch: str
     draft: bool = False
+
+
+class GitHubRelease(BaseModel):
+    tag_name: str
+    name: str
+    prerelease: bool = False
+    published_at: Optional[str] = None
+    html_url: str = ""
 
 
 # -- GitHub sync status --

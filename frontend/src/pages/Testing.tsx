@@ -50,6 +50,7 @@ import {
   useDeleteClusterLock,
   useCreateClusterLock,
   useGithubPRs,
+  useGithubReleases,
   useGithubSyncStatus,
   useRefreshGithubSync,
   useProjectUiSchema,
@@ -394,6 +395,8 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
   const [exclusive, setExclusive] = useState(false)
   const [configRaw, setConfigRaw] = useState('')
   const [pullSha, setPullSha] = useState('')
+  const [buildSourceInput, setBuildSourceInput] = useState('')
+  const [useLatestMain, setUseLatestMain] = useState(false)
   const [prSearch, setPrSearch] = useState('')
   const [prDropdownOpen, setPrDropdownOpen] = useState(false)
   // step 1 = "what do you want to do" (Lock / Forge Job / Custom Job).
@@ -439,6 +442,9 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
   const { data: uiSchemaResp, isFetching: isFetchingUiSchema } = useProjectUiSchema(project || undefined)
   const dynamicSchema = uiSchemaResp?.found ? uiSchemaResp.ui_schema : null
   const refreshUiSchema = useRefreshProjectUiSchema()
+  const isRhaiis = project === 'rhaiis'
+  const { data: githubReleases } = useGithubReleases(isRhaiis)
+  const buildSourceValid = !isRhaiis || useLatestMain || !!pullSha.trim()
 
   useEffect(() => {
     if (jobType === 'forge') setStep(2)
@@ -462,6 +468,9 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
     setProject(name)
     setPreset('')
     setVersion('')
+    setPullSha('')
+    setBuildSourceInput('')
+    setUseLatestMain(false)
     const proj = projects?.find((p: ForgeProject) => p.name === name)
     if (proj?.cluster) setCluster(proj.cluster)
   }
@@ -470,9 +479,12 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
     if (pr) {
       setPrSearch(`#${pr.number} — ${pr.title} (${pr.author})`)
       setPullSha(pr.head_sha)
+      setBuildSourceInput('')
+      setUseLatestMain(false)
     } else {
       setPrSearch('')
       setPullSha('')
+      setBuildSourceInput('')
     }
     setPrDropdownOpen(false)
   }
@@ -504,6 +516,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
         exclusive,
         config_overrides: overrides,
         pull_sha: pullSha,
+        use_latest_main: useLatestMain,
         schedule: scheduling.mode === 'recurring' ? scheduling.scheduleUtc : '',
         scheduled_start_time: scheduling.mode === 'defer' ? scheduling.scheduledStartTimeUtc : null,
       })
@@ -808,7 +821,11 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
           {/* Pull Request picker */}
           <div className="relative">
             <div className="flex items-center justify-between">
-              <label className="block text-sm font-medium text-gray-700">Pull Request (optional)</label>
+              <label className="block text-sm font-medium text-gray-700">
+                {isRhaiis ? 'Build Source' : 'Pull Request'}
+                {isRhaiis && <span className="text-red-500 ml-0.5">*</span>}
+                {!isRhaiis && <span className="text-gray-400 font-normal ml-1">(optional)</span>}
+              </label>
               <div className="flex items-center gap-2">
                 {githubSyncStatus?.last_synced_at && (
                   <span
@@ -833,9 +850,10 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
             <input
               type="text"
               value={prSearch}
-              onChange={(e) => { setPrSearch(e.target.value); setPrDropdownOpen(true); setPullSha('') }}
+              onChange={(e) => { setPrSearch(e.target.value); setPrDropdownOpen(true); setPullSha(''); setBuildSourceInput('') }}
               onFocus={() => setPrDropdownOpen(true)}
-              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm"
+              disabled={isRhaiis && useLatestMain}
+              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm disabled:bg-gray-100 disabled:text-gray-400"
               placeholder="Search PRs by number, title, or author..."
             />
             {pullSha && (
@@ -843,11 +861,79 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
                 HEAD SHA: <code className="text-indigo-600 font-mono">{pullSha}</code>
               </p>
             )}
-            {!pullSha && (
+            {!pullSha && !isRhaiis && (
               <p className="mt-1 text-xs text-gray-400">
                 {githubPRs ? `${githubPRs.length} open PR(s) loaded from Forge repo.` : 'Loading PRs...'}
                 {' '}Forge will build from this commit instead of the default image.
               </p>
+            )}
+            {isRhaiis && (
+              <>
+                <div className="mt-3">
+                  <label className="block text-sm font-medium text-gray-700">Commit SHA or Release Tag</label>
+                  <input
+                    type="text"
+                    value={buildSourceInput}
+                    onChange={(e) => {
+                      setBuildSourceInput(e.target.value)
+                      setPullSha(e.target.value.trim())
+                      setPrSearch('')
+                      setUseLatestMain(false)
+                    }}
+                    disabled={useLatestMain}
+                    required={!useLatestMain && !pullSha}
+                    className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm disabled:bg-gray-100 disabled:text-gray-400"
+                    placeholder="e.g. 711b5b24... or v0.24.0"
+                  />
+                  <p className="mt-1 text-xs text-gray-400">Pin a commit, PR HEAD SHA, or published Forge release for reproducible runs.</p>
+                </div>
+                <div className="mt-3">
+                  <label className="block text-sm font-medium text-gray-700">Published Forge releases</label>
+                  <select
+                    value={buildSourceInput}
+                    onChange={(e) => {
+                      const value = e.target.value
+                      setBuildSourceInput(value)
+                      setPullSha(value)
+                      setPrSearch('')
+                      setUseLatestMain(false)
+                    }}
+                    disabled={useLatestMain}
+                    className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm disabled:bg-gray-100 disabled:text-gray-400"
+                  >
+                    <option value="">Select a release tag (optional)</option>
+                    {(githubReleases || []).map((release) => (
+                      <option key={release.tag_name} value={release.tag_name}>
+                        {release.name || release.tag_name}{release.prerelease ? ' (pre-release)' : ''}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="mt-3">
+                  <label className="flex items-center gap-2 text-sm text-gray-700">
+                    <input
+                      type="checkbox"
+                      checked={useLatestMain}
+                      onChange={(e) => {
+                        const checked = e.target.checked
+                        setUseLatestMain(checked)
+                        if (checked) {
+                          setPullSha('')
+                          setBuildSourceInput('')
+                          setPrSearch('')
+                        }
+                      }}
+                      className="rounded border-gray-300 text-indigo-600"
+                    />
+                    Use latest <code>main</code>
+                  </label>
+                  {useLatestMain && (
+                    <div className="mt-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
+                      <strong>Warning:</strong> <code>main</code> changes frequently and may contain untested code or configuration changes. It can be incompatible with this pipeline and makes failures harder to reproduce. Use a pinned commit or release tag for stable runs.
+                    </div>
+                  )}
+                </div>
+              </>
             )}
             {prDropdownOpen && filteredPRs.length > 0 && (
               <div className="absolute z-20 mt-1 w-full max-h-60 overflow-y-auto rounded-md bg-white shadow-lg border border-gray-200">
@@ -881,9 +967,9 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
             </button>
             <button
               type="button"
-              disabled={!project || !cluster || !owner.trim()}
+              disabled={!project || !cluster || !owner.trim() || !buildSourceValid}
               onClick={() => setStep(3)}
-              title={!owner.trim() ? 'Owner is required' : undefined}
+              title={!owner.trim() ? 'Owner is required' : !buildSourceValid ? 'RHAIIS build source is required' : undefined}
               className="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:opacity-50"
             >
               Next: Project Details
@@ -911,7 +997,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
         <DynamicSubmitForm
           project={project}
           schema={dynamicSchema}
-          basics={{ cluster, pipeline, owner, priority, exclusive, pullSha, prLabel: prSearch || pullSha, scheduling }}
+          basics={{ cluster, pipeline, owner, priority, exclusive, pullSha, useLatestMain, prLabel: prSearch || pullSha, scheduling }}
           step={step - 1}
           onBack={() => setStep(step - 1)}
           onNext={() => setStep(step + 1)}
@@ -981,7 +1067,8 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
               {owner && <ReviewRow label="Owner" value={owner} />}
               <ReviewRow label="Priority" value={priority} />
               {exclusive && <ReviewRow label="Exclusive" value="Yes" />}
-              {pullSha && <ReviewRow label="Pull Request" value={prSearch || pullSha} mono={!prSearch} />}
+              {isRhaiis && useLatestMain && <ReviewRow label="Build source" value="Latest main (un-pinned)" />}
+              {pullSha && <ReviewRow label={isRhaiis ? 'Build source' : 'Pull Request'} value={prSearch || pullSha} mono={!prSearch} />}
               <ReviewRow
                 label="Schedule"
                 value={
@@ -1027,7 +1114,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
                   <ClockIcon className="h-4 w-4" />
                   Defer / Set Recurring…
                 </button>
-                <button type="submit" disabled={submitJob.isPending || !project || !cluster || !owner.trim()} className="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:opacity-50">
+                <button type="submit" disabled={submitJob.isPending || !project || !cluster || !owner.trim() || !buildSourceValid} className="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:opacity-50">
                   {submitJob.isPending ? <ArrowPathIcon className="h-4 w-4 animate-spin" /> : <PlayIcon className="h-4 w-4" />}
                   Submit Job
                 </button>
@@ -1045,7 +1132,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
                   owner,
                   priority,
                   exclusive,
-                  pullSha,
+                  pullSha: useLatestMain ? 'main' : pullSha,
                   args: preset ? [preset] : [],
                   configOverrides: withVersionOverride(project, showVersion ? version : '', configOverrides),
                   schedule: scheduling.mode === 'recurring' ? scheduling.scheduleUtc : '',
