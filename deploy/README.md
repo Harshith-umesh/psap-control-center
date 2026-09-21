@@ -312,7 +312,7 @@ are configured via environment variables:
 
 All GET endpoints remain open (no authentication required).
 
-Sessions expire after 24 hours (configurable via `ACCESS_TOKEN_EXPIRE_MINUTES`).
+Sessions expire after eight hours by default (configurable via `ACCESS_TOKEN_EXPIRE_MINUTES`).
 
 ## Updating Credentials
 
