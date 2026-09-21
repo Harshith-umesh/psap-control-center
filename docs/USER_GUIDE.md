@@ -4,7 +4,8 @@
 
 Open the Control Center in your browser:
 
-**Production (OCP)**: https://control-center.apps.psap-automation.ibm.rhperfscale.org
+**Production (OCP)**: Obtain the environment-specific route from your
+administrator or with `oc get route psap-control-center -n <namespace>`.
 
 **Local development**: http://localhost:3000
 
