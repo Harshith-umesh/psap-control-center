@@ -34,6 +34,7 @@ import WizardSteps from '../components/WizardSteps'
 import ReviewRow, { ReviewSection } from '../components/ReviewRow'
 import YamlPreview from '../components/YamlPreview'
 import SearchableSelect from '../components/SearchableSelect'
+import { getForgeProjectUiSettings } from '../projects/rhaiis'
 import { buildSingleJobPreview, toYamlPreview, withVersionOverride } from '../utils/fournosJobPreview'
 import {
   useFournosJobs,
@@ -441,15 +442,13 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
   )
 
   // Any project that publishes a projects/<name>/ui/submit.yaml in Forge
-  // gets a fully dynamic form for free — see docs/ui-schema-spec.md. This
-  // is the same mechanism for every project, RHAIIS included; there is no
-  // project-specific form or backend code path.
+  // gets a fully dynamic form for free — see docs/ui-schema-spec.md.
   const { data: uiSchemaResp, isFetching: isFetchingUiSchema } = useProjectUiSchema(project || undefined)
   const dynamicSchema = uiSchemaResp?.found ? uiSchemaResp.ui_schema : null
   const refreshUiSchema = useRefreshProjectUiSchema()
-  const isRhaiis = project === 'rhaiis'
-  const { data: githubReleases } = useGithubReleases(isRhaiis)
-  const buildSourceValid = !isRhaiis || useLatestMain || !!pullSha.trim()
+  const projectUiSettings = getForgeProjectUiSettings(project)
+  const { data: githubReleases } = useGithubReleases(projectUiSettings.loadsPublishedReleases)
+  const buildSourceValid = !projectUiSettings.requiresBuildSource || useLatestMain || !!pullSha.trim()
 
   useEffect(() => {
     if (jobType === 'forge') setStep(2)
@@ -471,7 +470,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
 
   const handleProjectChange = (name: string) => {
     setProject(name)
-    setPipeline(name === 'rhaiis' ? 'forge-full' : 'forge-test-only')
+    setPipeline(getForgeProjectUiSettings(name).defaultPipeline)
     setPreset('')
     setVersion('')
     setPullSha('')
@@ -833,9 +832,9 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
           <div className="relative">
             <div className="flex items-center justify-between">
               <label className="block text-sm font-medium text-gray-700">
-                {isRhaiis ? 'Build Source' : 'Pull Request'}
-                {isRhaiis && <span className="text-red-500 ml-0.5">*</span>}
-                {!isRhaiis && <span className="text-gray-400 font-normal ml-1">(optional)</span>}
+                {projectUiSettings.buildSourceLabel}
+                {projectUiSettings.requiresBuildSource && <span className="text-red-500 ml-0.5">*</span>}
+                {!projectUiSettings.requiresBuildSource && <span className="text-gray-400 font-normal ml-1">(optional)</span>}
               </label>
               <div className="flex items-center gap-2">
                 {githubSyncStatus?.last_synced_at && (
@@ -863,7 +862,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
               value={prSearch}
               onChange={(e) => { setPrSearch(e.target.value); setPrDropdownOpen(true); setPullSha(''); setBuildSourceInput('') }}
               onFocus={() => setPrDropdownOpen(true)}
-              disabled={isRhaiis && useLatestMain}
+              disabled={projectUiSettings.requiresBuildSource && useLatestMain}
               className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm disabled:bg-gray-100 disabled:text-gray-400"
               placeholder="Search PRs by number, title, or author..."
             />
@@ -872,13 +871,13 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
                 HEAD SHA: <code className="text-indigo-600 font-mono">{pullSha}</code>
               </p>
             )}
-            {!pullSha && !isRhaiis && (
+            {!pullSha && !projectUiSettings.requiresBuildSource && (
               <p className="mt-1 text-xs text-gray-400">
                 {githubPRs ? `${githubPRs.length} open PR(s) loaded from Forge repo.` : 'Loading PRs...'}
                 {' '}Forge will build from this commit instead of the default image.
               </p>
             )}
-            {isRhaiis && (
+            {projectUiSettings.requiresBuildSource && (
               <>
                 <div className="mt-3">
                   <label className="block text-sm font-medium text-gray-700">Commit SHA or Release Tag</label>
@@ -980,7 +979,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
               type="button"
               disabled={!project || !cluster.trim() || !owner.trim() || !buildSourceValid}
               onClick={() => setStep(3)}
-              title={!owner.trim() ? 'Owner is required' : !buildSourceValid ? 'RHAIIS build source is required' : undefined}
+              title={!owner.trim() ? 'Owner is required' : !buildSourceValid ? `${projectUiSettings.buildSourceLabel} is required` : undefined}
               className="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:opacity-50"
             >
               Next: Project Details
@@ -1078,8 +1077,8 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
               {owner && <ReviewRow label="Owner" value={owner} />}
               <ReviewRow label="Priority" value={priority} />
               {exclusive && <ReviewRow label="Exclusive" value="Yes" />}
-              {isRhaiis && useLatestMain && <ReviewRow label="Build source" value="Latest main (un-pinned)" />}
-              {pullSha && <ReviewRow label={isRhaiis ? 'Build source' : 'Pull Request'} value={prSearch || pullSha} mono={!prSearch} />}
+              {projectUiSettings.requiresBuildSource && useLatestMain && <ReviewRow label={projectUiSettings.buildSourceLabel} value="Latest main (un-pinned)" />}
+              {pullSha && <ReviewRow label={projectUiSettings.buildSourceLabel} value={prSearch || pullSha} mono={!prSearch} />}
               <ReviewRow
                 label="Schedule"
                 value={

@@ -46,6 +46,7 @@ from app.schemas.ui_schema import ProjectUiSchemaResponse
 from app.services import fournos_db_service as db_svc
 from app.services import fournos_k8s_client as k8s
 from app.services import pipeline_definitions
+from app.services import project_adapters
 from app.services import project_ui_schema
 from app.services.forge_discovery import discover_projects, get_project
 
@@ -80,6 +81,20 @@ def _is_log_issue(line: str) -> bool:
     return bool(issue_text) and not re.fullmatch(r"[-=*_]{3,}", issue_text)
 
 _VERSION_KEYS = {"mcp_gateway": "infrastructure.mcp_gateway_version"}
+
+
+# Compatibility shims for callers that imported these helpers from the API
+# module before the RHAIIS adapter was split into its own service.
+def _resolve_build_source(req: SubmitJobRequest | SubmitMatrixRequest) -> str:
+    return project_adapters.resolve_build_source(
+        req.project, req.pull_sha, req.use_latest_main
+    )
+
+
+def _normalize_rhaiis_overrides(
+    project: str, overrides: dict[str, Any]
+) -> dict[str, Any]:
+    return project_adapters.normalize_overrides(project, overrides)
 
 
 # ─── helper functions ────────────────────────────────────────────────────
@@ -747,51 +762,6 @@ async def download_logs(job_name: str, pod_name: str):
     )
 
 
-def _resolve_build_source(req: SubmitJobRequest | SubmitMatrixRequest) -> str:
-    """Return the Forge build source and enforce RHAIIS source safety."""
-    pull_sha = req.pull_sha.strip()
-    if req.project != "rhaiis":
-        return pull_sha
-    if req.use_latest_main and pull_sha:
-        raise HTTPException(
-            400, "Choose either a pinned build source or latest main, not both."
-        )
-    if not req.use_latest_main and not pull_sha:
-        raise HTTPException(
-            400,
-            "RHAIIS build source is required: choose a PR, commit SHA, release tag, or latest main.",
-        )
-    return "main" if req.use_latest_main else pull_sha
-
-
-def _normalize_rhaiis_overrides(
-    project: str, overrides: dict[str, Any]
-) -> dict[str, Any]:
-    """Translate schema-facing RHAIIS keys to Forge's real config keys."""
-    if project != "rhaiis":
-        return overrides
-
-    normalized = dict(overrides)
-    slack_member = normalized.pop("tests.rhaiis.slack_member_id", None)
-    if slack_member and "tests.rhaiis.slack_user" not in normalized:
-        normalized["tests.rhaiis.slack_user"] = slack_member
-
-    # This is a UI-only toggle in the Forge schema. The orchestration code
-    # reads compare_version, not a nonexistent compare_versions.enabled key.
-    normalized.pop("rhaiis.compare_versions.enabled", None)
-
-    workload_key = normalized.pop("tests.rhaiis.workload_key", None)
-    if workload_key is not None and "tests.rhaiis.workload_keys" not in normalized:
-        try:
-            parsed = json.loads(workload_key) if isinstance(workload_key, str) else workload_key
-        except (TypeError, ValueError):
-            parsed = workload_key
-        normalized["tests.rhaiis.workload_keys"] = (
-            json.dumps(parsed) if isinstance(parsed, list) else parsed
-        )
-    return normalized
-
-
 # ─── routes: submit ──────────────────────────────────────────────────────
 
 def _apply_scheduling(spec: dict, schedule: str, scheduled_start_time: Optional[str]) -> None:
@@ -812,7 +782,7 @@ def _apply_scheduling(spec: dict, schedule: str, scheduled_start_time: Optional[
 
 @router.post("/submit", response_model=SubmitJobResponse)
 async def submit_job(req: SubmitJobRequest, _=Depends(require_auth)):
-    config_overrides = _normalize_rhaiis_overrides(
+    config_overrides = project_adapters.normalize_overrides(
         req.project, dict(req.config_overrides)
     )
 
@@ -835,7 +805,9 @@ async def submit_job(req: SubmitJobRequest, _=Depends(require_auth)):
         args = [req.preset] if req.preset else []
         job_name = k8s.sanitize_job_name("forge-{}".format(req.project))
 
-    pull_sha = _resolve_build_source(req)
+    pull_sha = project_adapters.resolve_build_source(
+        req.project, req.pull_sha, req.use_latest_main
+    )
     env = {}
     if pull_sha:
         env["PULL_PULL_SHA"] = pull_sha
@@ -934,18 +906,21 @@ async def submit_matrix(req: SubmitMatrixRequest, _=Depends(require_auth)):
     if not req.models or not req.workloads:
         raise HTTPException(400, "models and workloads are required")
 
-    pull_sha = _resolve_build_source(req)
+    pull_sha = project_adapters.resolve_build_source(
+        req.project, req.pull_sha, req.use_latest_main
+    )
     results = []
     for model_item in req.models:
         args = list(req.args) + [model_item.key] + list(req.workloads)
 
         job_overrides: dict[str, Any] = dict(req.config_overrides)
         job_overrides.update({k: v for k, v in model_item.overrides.items()})
-        job_overrides = _normalize_rhaiis_overrides(req.project, job_overrides)
-        if req.project == "rhaiis" and req.workloads:
-            job_overrides.setdefault(
-                "tests.rhaiis.workload_keys", json.dumps(req.workloads)
-            )
+        job_overrides = project_adapters.normalize_overrides(
+            req.project, job_overrides
+        )
+        project_adapters.add_matrix_workload_override(
+            req.project, job_overrides, req.workloads
+        )
 
         display_name = "{}-{}-{}".format(req.project, model_item.key, req.cluster)
         generate_name = re.sub(

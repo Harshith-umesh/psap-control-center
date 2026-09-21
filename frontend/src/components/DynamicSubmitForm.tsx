@@ -3,6 +3,7 @@ import { ArrowLeftIcon, ArrowPathIcon, ClockIcon, PlayIcon } from '@heroicons/re
 import clsx from 'clsx'
 import ReviewRow, { ReviewSection } from './ReviewRow'
 import YamlPreview from './YamlPreview'
+import { getProjectSubmitAdapter } from './rhaiis/rhaiisSubmitAdapter'
 import { useSubmitJob, useSubmitMatrix } from '../hooks/useFournos'
 import { buildMatrixJobPreviews, buildSingleJobPreview, toYamlPreview } from '../utils/fournosJobPreview'
 import type { JobScheduling, ProjectUiSchema, UiField, UiMode, UiOption, UiPipeline, UiQuickPreset, UiVisibleIf } from '../types'
@@ -61,7 +62,9 @@ function fieldsOf(mode: UiMode): UiField[] {
 
 function matchesCondition(cond: UiVisibleIf, values: Record<string, unknown>): boolean {
   const current = values[cond.field]
-  if (cond.equals !== undefined) return current === cond.equals
+  // Pydantic serializes an omitted optional `equals` as null. Treat that as
+  // absent so a condition such as `{one_of: [...]}` is evaluated correctly.
+  if (cond.equals !== undefined && cond.equals !== null) return current === cond.equals
   if (cond.one_of) return cond.one_of.includes(current)
   return true
 }
@@ -127,14 +130,6 @@ function optionLabel(field: UiField, raw: string): string {
   return field.options.find((o) => o.value === raw)?.label || raw
 }
 
-const RHAIIS_CLUSTER_GPU_TYPES: Record<string, string> = {
-  hera: 'h200',
-  zeus: 'h200',
-  'old-zeus': 'h200',
-  b200: 'b200',
-  mi355x: 'amd',
-}
-
 /** Human-readable rendering of a field's current value for the review step. */
 function formatFieldValueForReview(field: UiField, value: unknown): string | null {
   if (field.type === 'boolean') return value ? 'Yes' : 'No'
@@ -157,28 +152,6 @@ function rawOptionValue(field: UiField, value: unknown): unknown {
     return option.overrides[field.maps_to]
   }
   return value
-}
-
-function modelTpSize(field: UiField | undefined, value: unknown): number | null {
-  if (!field || typeof value !== 'string') return null
-  const option = field.options.find((item) => item.value === value)
-  const extra = option?.extra || {}
-  const vllmArgs = extra.vllm_args as Record<string, unknown> | undefined
-  const sglangArgs = extra.sglang_args as Record<string, unknown> | undefined
-  const raw = vllmArgs?.['tensor-parallel-size'] ?? sglangArgs?.['tp-size'] ?? extra.tensor_parallel ?? extra.tp_size ?? extra.tp
-  const parsed = Number(raw)
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : null
-}
-
-function parseOverrideLines(raw: string): Record<string, string> {
-  const overrides: Record<string, string> = {}
-  raw.split('\n').forEach((line) => {
-    const index = line.indexOf(':')
-    if (index > 0) {
-      overrides[line.slice(0, index).trim()] = line.slice(index + 1).trim()
-    }
-  })
-  return overrides
 }
 
 export default function DynamicSubmitForm({
@@ -217,7 +190,7 @@ export default function DynamicSubmitForm({
     [allModes, activeModeId]
   )
   const isMatrix = activeMode?.kind === 'matrix'
-  const isRhaiis = project === 'rhaiis'
+  const projectAdapter = useMemo(() => getProjectSubmitAdapter(project), [project])
 
   const [values, setValues] = useState<Record<string, unknown>>({})
   const [quickPresetKey, setQuickPresetKey] = useState('')
@@ -225,11 +198,12 @@ export default function DynamicSubmitForm({
   const modelField = activeFields.find((field) => field.key === 'model')
   const workloadField = activeFields.find((field) => field.key === 'workload')
   const engineField = activeFields.find((field) => field.key === 'engine')
-  const clusterName = basics.cluster.trim().toLowerCase()
-  const gpuType = basics.clusterGpuType || (isRhaiis ? RHAIIS_CLUSTER_GPU_TYPES[clusterName] || '' : '')
-  const selectedModelTp = modelTpSize(modelField, values.model) || 1
-  const tpSize = isRhaiis ? Math.max(Number(values.tp_size) || selectedModelTp, 1) : 1
-  const gpuCount = isRhaiis ? Math.max(Number(values.gpu_count) || 1, tpSize) : 1
+  const derived = projectAdapter?.getDerivedState(basics, activeFields, values) || {
+    gpuType: basics.clusterGpuType || '',
+    selectedModelTp: 1,
+    tpSize: 1,
+    gpuCount: 1,
+  }
   const autoEngineVersionRef = useRef('')
 
   // Matrix-mode-only selection state
@@ -246,21 +220,12 @@ export default function DynamicSubmitForm({
     const initial: Record<string, unknown> = {}
     for (const field of fieldsOf(activeMode)) {
       initial[field.key] = defaultValueFor(field)
-      if (isRhaiis && field.key === 'warmup') initial[field.key] = true
-      if (isRhaiis && field.key === 'slack') initial[field.key] = true
     }
-    if (isRhaiis) {
-      initial.advanced_overrides = ''
-      initial.custom_model_tp = 1
-      initial.custom_workload_data = 'prompt_tokens=1000,output_tokens=1000'
-      initial.custom_workload_concurrencies = '1'
-      initial.custom_workload_max_seconds = 450
-      initial.custom_workload_samples = ''
-    }
+    Object.assign(initial, projectAdapter?.getInitialValues(activeMode) || {})
     setValues(initial)
     setQuickPresetKey('')
     setPipelineKey(activeMode.pipelines[0]?.key || '')
-  }, [activeMode, isRhaiis, project])
+  }, [activeMode, projectAdapter])
 
   useEffect(() => {
     if (!selectedPipeline) {
@@ -278,39 +243,21 @@ export default function DynamicSubmitForm({
 
   const handleFieldChange = (field: UiField, value: unknown) => {
     setFieldValue(field.key, value)
-    if (!isRhaiis) return
-
-    if (field.key === 'model') {
-      const nextTp = value === '__custom_model__' ? 1 : modelTpSize(modelField, value) || 1
-      setValues((prev) => ({
-        ...prev,
-        model: value,
-        tp_size: nextTp,
-        gpu_count: nextTp,
-      }))
-    } else if (field.key === 'tp_size') {
-      const nextTp = Math.max(Number(value) || 1, 1)
-      setValues((prev) => ({
-        ...prev,
-        tp_size: nextTp,
-        gpu_count: Math.max(Number(prev.gpu_count) || 1, nextTp),
-      }))
-    } else if (field.key === 'engine' || field.key === 'accelerator') {
-      const nextEngine = field.key === 'engine' ? value : values.engine
-      const nextAccelerator = field.key === 'accelerator' ? value : values.accelerator
-      const engineOption = engineField?.options.find((option) => option.value === nextEngine)
-      const images = engineOption?.extra?.images as Record<string, unknown> | undefined
-      const defaultImage = typeof images?.[String(nextAccelerator)] === 'string'
-        ? String(images[String(nextAccelerator)])
-        : ''
-      if (defaultImage && (!values.engine_version || values.engine_version === autoEngineVersionRef.current)) {
-        autoEngineVersionRef.current = defaultImage
-        setFieldValue('engine_version', defaultImage)
+    if (projectAdapter) {
+      const result = projectAdapter.handleFieldChange({
+        field,
+        value,
+        values,
+        modelField,
+        engineField,
+        autoEngineVersion: autoEngineVersionRef.current,
+      })
+      if (result.autoEngineVersion !== undefined) {
+        autoEngineVersionRef.current = result.autoEngineVersion
       }
-    } else if (field.key === 'engine_version') {
-      autoEngineVersionRef.current = ''
-    } else if (field.key === 'agent_analysis' && value === true) {
-      setFieldValue('compare_versions', true)
+      if (Object.keys(result.updates).length > 0) {
+        setValues((prev) => ({ ...prev, ...result.updates }))
+      }
     }
   }
 
@@ -376,25 +323,18 @@ export default function DynamicSubmitForm({
       }
     }
 
-    // The shared Basics cluster is also the RHAIIS cluster/profile argument.
-    // Keeping it here avoids a duplicate Project Details selector and keeps
-    // the submitted job aligned with the legacy FourNos dashboard.
-    if (isRhaiis && basics.cluster.trim()) args.push(basics.cluster.trim())
+    projectAdapter?.appendBasicsArgs(args, basics)
 
     for (const field of fieldsOf(activeMode)) {
       if (!isFieldVisible(field, values)) continue
       const value = values[field.key]
 
-      // RHAIIS has a plural workload override and a few custom controls
-      // whose keys are not part of Forge's declarative schema yet. Handle
-      // those below so the ordinary schema renderer remains generic.
-      if (isRhaiis && (field.key === 'model' || field.key === 'workload')) continue
+      if (projectAdapter?.skipField(field)) continue
 
       if (field.maps_to) {
         if (value === undefined || value === '' || value === null) continue
         const key = resolveMapsTo(field.maps_to, values)
         if (!key) continue
-        if (key === 'rhaiis.compare_versions.enabled') continue
         overrides[key] = stringifyValue(
           field.type === 'multiselect' && Array.isArray(value)
             ? value.map((item) => rawOptionValue(field, item))
@@ -407,77 +347,13 @@ export default function DynamicSubmitForm({
       }
     }
 
-    if (isRhaiis) {
-      const selectedModel = values.model
-      if (selectedModel === '__custom_model__') {
-        overrides['tests.rhaiis.model_key'] = 'custom'
-        const customName = String(values.custom_model_name || '').trim()
-        const customId = String(values.custom_model_id || '').trim()
-        if (customName) overrides['models.custom.name'] = customName
-        if (customId) overrides['models.custom.hf_model_id'] = customId
-        overrides['rhaiis.engines.vllm.args.tensor-parallel-size'] = stringifyValue(tpSize)
-      } else if (selectedModel) {
-        overrides['tests.rhaiis.model_key'] = stringifyValue(rawOptionValue(modelField!, selectedModel))
-        if (Number(values.tp_size) && Number(values.tp_size) !== selectedModelTp) {
-          overrides['rhaiis.engines.vllm.args.tensor-parallel-size'] = stringifyValue(tpSize)
-        }
-      }
-
-      const selectedWorkloads = Array.isArray(values.workload) ? values.workload as string[] : []
-      if (selectedWorkloads.length > 0) {
-        const workloadKeys = selectedWorkloads.map((item) =>
-          item === '__custom_workload__' ? 'custom' : rawOptionValue(workloadField!, item)
-        )
-        overrides['tests.rhaiis.workload_keys'] = stringifyValue(workloadKeys)
-        if (selectedWorkloads.includes('__custom_workload__')) {
-          const customData = String(values.custom_workload_data || '').trim()
-          const customConcurrencies = String(values.custom_workload_concurrencies || '').trim()
-          if (customData) overrides['workloads.custom.data'] = customData
-          if (customConcurrencies) {
-            overrides['workloads.custom.concurrencies'] = stringifyValue(
-              customConcurrencies.split(',').map((item) => Number(item.trim()) || 0)
-            )
-          }
-          if (values.custom_workload_max_seconds !== '' && values.custom_workload_max_seconds != null) {
-            overrides['workloads.custom.max_seconds'] = stringifyValue(Number(values.custom_workload_max_seconds) || 450)
-          }
-          if (values.custom_workload_samples !== '' && values.custom_workload_samples != null) {
-            overrides['workloads.custom.samples'] = stringifyValue(Number(values.custom_workload_samples))
-          }
-        }
-      }
-
-      const slackMember = String(values.slack_member_id || '').trim()
-      if (slackMember) overrides['tests.rhaiis.slack_user'] = slackMember
-      const compareVersion = String(values.compare_version || '').trim()
-      if (compareVersion) overrides['tests.rhaiis.compare_version'] = compareVersion
-
-      const engineVersion = String(values.engine_version || '').trim()
-      const engine = String(values.engine || '').trim()
-      const accelerator = String(values.accelerator || '').trim()
-      if (engineVersion && engine && accelerator) {
-        overrides[`rhaiis.engines.${engine}.images.${accelerator}`] = engineVersion
-      }
-
-      if (values.prefix_caching !== undefined && engine) {
-        delete overrides['rhaiis.engines.vllm.args.enable-prefix-caching']
-        delete overrides['rhaiis.engines.vllm.args.no-enable-prefix-caching']
-        delete overrides['rhaiis.engines.sglang.args.disable-radix-cache']
-        delete overrides['rhaiis.engines.trtllm.trtllm_config.kv_cache_config.enable_block_reuse']
-        const prefixCaching = values.prefix_caching === true
-        if (engine === 'sglang') {
-          overrides['rhaiis.engines.sglang.args.disable-radix-cache'] = stringifyValue(!prefixCaching)
-        } else if (engine === 'trtllm') {
-          overrides['rhaiis.engines.trtllm.trtllm_config.kv_cache_config.enable_block_reuse'] = stringifyValue(prefixCaching)
-        } else {
-          overrides[prefixCaching
-            ? 'rhaiis.engines.vllm.args.enable-prefix-caching'
-            : 'rhaiis.engines.vllm.args.no-enable-prefix-caching'] = 'true'
-        }
-      }
-
-      Object.assign(overrides, parseOverrideLines(String(values.advanced_overrides || '')))
-    }
+    projectAdapter?.augmentSubmission({
+      values,
+      modelField,
+      workloadField,
+      derived,
+      overrides,
+    })
 
     return { args, overrides }
   }
@@ -502,7 +378,7 @@ export default function DynamicSubmitForm({
             return {
               key,
               overrides: m?.overrides || {},
-              gpu_count: m?.tp ?? gpuCount,
+              gpu_count: m?.tp ?? derived.gpuCount,
             }
           }),
           workloads: selectedWorkloads,
@@ -511,7 +387,7 @@ export default function DynamicSubmitForm({
           exclusive: basics.exclusive,
           pull_sha: basics.pullSha,
           use_latest_main: basics.useLatestMain,
-          gpu_type: gpuType,
+          gpu_type: derived.gpuType,
           ...schedulingRequestFields(basics.scheduling),
         })
         onSubmitted?.(result.jobs?.[0]?.job_name || '')
@@ -536,8 +412,8 @@ export default function DynamicSubmitForm({
         pull_sha: basics.pullSha,
         use_latest_main: basics.useLatestMain,
         priority: basics.priority,
-        gpu_type: gpuType,
-        gpu_count: gpuCount,
+        gpu_type: derived.gpuType,
+        gpu_count: derived.gpuCount,
         ...schedulingRequestFields(basics.scheduling),
       })
       onSubmitted?.(result.job_name)
@@ -554,7 +430,7 @@ export default function DynamicSubmitForm({
 
   if (step !== 2 && step !== 3) return null
 
-  const buildSourceValid = project !== 'rhaiis' || basics.useLatestMain || !!basics.pullSha.trim()
+  const buildSourceValid = !projectAdapter?.requiresBuildSource || basics.useLatestMain || !!basics.pullSha.trim()
   const requiredFieldsValid = activeFields
     .filter((field) => field.required && isFieldVisible(field, values))
     .every((field) => {
@@ -563,15 +439,8 @@ export default function DynamicSubmitForm({
         ? Array.isArray(value) && value.length > 0
         : value !== undefined && value !== null && value !== ''
     })
-  const customModelValid = !isRhaiis || values.model !== '__custom_model__' || !!String(values.custom_model_id || '').trim()
-  const customWorkloadSelected = isRhaiis && Array.isArray(values.workload) && values.workload.includes('__custom_workload__')
-  const customWorkloadValid = !customWorkloadSelected || (
-    !!String(values.custom_workload_data || '').trim() &&
-    !!String(values.custom_workload_concurrencies || '').trim()
-  )
-  const sizingValid = !isRhaiis || gpuCount >= tpSize
-  const slackValid = !isRhaiis || activeMode.id !== 'single' || values.slack !== true || !!String(values.slack_member_id || '').trim()
-  const formValid = requiredFieldsValid && customModelValid && customWorkloadValid && sizingValid && slackValid
+  const projectFieldsValid = projectAdapter?.validate(activeMode, values, derived) ?? true
+  const formValid = requiredFieldsValid && projectFieldsValid
   const canSubmit = isMatrix
     ? !submitMatrix.isPending && !!basics.cluster.trim() && !!basics.owner.trim() && buildSourceValid && formValid && !!selectedPipeline && selectedModels.length > 0 && selectedWorkloads.length > 0
     : !submitJob.isPending && !!basics.cluster.trim() && !!basics.owner.trim() && buildSourceValid && formValid
@@ -624,25 +493,28 @@ export default function DynamicSubmitForm({
             </div>
           )}
 
-          {activeMode.sections.map((section) => (
+              {activeMode.sections.map((section) => (
             <div key={section.id} className="rounded-lg border border-gray-200 p-4 space-y-4">
               {section.label && (
                 <h3 className="text-sm font-semibold text-gray-900">
-                  {isRhaiis && section.id === 'model' ? 'Workload' : section.label}
+                  {projectAdapter?.sectionLabel(section) || section.label}
                 </h3>
               )}
               <div className="grid grid-cols-1 gap-x-6 gap-y-4 sm:grid-cols-2">
                 {section.fields.map((field) => {
-                  if (field.type === 'hidden' || !isFieldVisible(field, values)) return null
-                  if (isRhaiis && field.key === 'tp_size' && (!values.model || values.model === '__custom_model__')) return null
-                  const fieldLabel = isRhaiis && field.key === 'slack'
-                    ? 'Slack Notifications (always on)'
-                    : field.label || field.key
-                  const isSlackAlwaysOn = isRhaiis && field.key === 'slack' && activeMode.id === 'single'
+                  const presentation = projectAdapter?.fieldPresentation(field, values, activeMode) || {
+                    hidden: false,
+                    label: field.label || field.key,
+                    disabled: false,
+                  }
+                  if (field.type === 'hidden' || presentation.hidden || !isFieldVisible(field, values)) return null
                   return (
                     <div key={field.key} className={clsx(field.type === 'textarea' ? 'sm:col-span-2' : '', field.key === 'model' || field.key === 'workload' ? 'sm:col-span-2' : '')}>
-                      <label className="block text-sm font-medium text-gray-700">
-                        {fieldLabel}
+                      <label
+                        className="block text-sm font-medium text-gray-700"
+                        title={field.help || undefined}
+                      >
+                        {presentation.label}
                         {field.required && <span className="text-red-500 ml-0.5">*</span>}
                       </label>
                       <FieldControl
@@ -650,133 +522,35 @@ export default function DynamicSubmitForm({
                         value={values[field.key]}
                         onChange={(v) => handleFieldChange(field, v)}
                         options={visibleOptions(field, values)}
-                        disabled={isSlackAlwaysOn}
+                        disabled={presentation.disabled}
                       />
                       {field.help && <p className="mt-1 text-xs text-gray-400">{field.help}</p>}
-
-                      {isRhaiis && field.key === 'model' && values.model === '__custom_model__' && (
-                        <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
-                          <label className="text-xs text-gray-600">
-                            Model Name
-                            <input
-                              type="text"
-                              value={String(values.custom_model_name || '')}
-                              onChange={(e) => setFieldValue('custom_model_name', e.target.value)}
-                              className="input mt-1"
-                              placeholder="e.g. Llama-3.3-70B-Instruct-FP8"
-                            />
-                          </label>
-                          <label className="text-xs text-gray-600 sm:col-span-2">
-                            HuggingFace Model ID <span className="text-red-500">*</span>
-                            <input
-                              type="text"
-                              value={String(values.custom_model_id || '')}
-                              onChange={(e) => setFieldValue('custom_model_id', e.target.value)}
-                              className="input mt-1"
-                              placeholder="org/model"
-                            />
-                          </label>
-                          <label className="text-xs text-gray-600">
-                            TP Size
-                            <input
-                              type="number"
-                              min={1}
-                              value={Number(values.custom_model_tp) || 1}
-                              onChange={(e) => {
-                                const next = e.target.value === '' ? '' : Number(e.target.value)
-                                setValues((prev) => ({
-                                  ...prev,
-                                  custom_model_tp: next,
-                                  tp_size: next,
-                                  gpu_count: Math.max(Number(prev.gpu_count) || 1, Number(next) || 1),
-                                }))
-                              }}
-                              className="input mt-1"
-                            />
-                          </label>
-                        </div>
-                      )}
-
-                      {isRhaiis && field.key === 'workload' && customWorkloadSelected && (
-                        <div className="mt-3 space-y-3 rounded-md border border-gray-200 bg-gray-50 p-3">
-                          <label className="block text-xs text-gray-600">
-                            Data <span className="text-red-500">*</span>
-                            <input
-                              type="text"
-                              value={String(values.custom_workload_data || '')}
-                              onChange={(e) => setFieldValue('custom_workload_data', e.target.value)}
-                              className="input mt-1"
-                              placeholder="prompt_tokens=1000,output_tokens=1000"
-                            />
-                          </label>
-                          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-                            <label className="text-xs text-gray-600">
-                              Concurrencies <span className="text-red-500">*</span>
-                              <input
-                                type="text"
-                                value={String(values.custom_workload_concurrencies || '')}
-                                onChange={(e) => setFieldValue('custom_workload_concurrencies', e.target.value)}
-                                className="input mt-1"
-                                placeholder="1,50,100"
-                              />
-                            </label>
-                            <label className="text-xs text-gray-600">
-                              Max Seconds
-                              <input
-                                type="number"
-                                min={1}
-                                value={Number(values.custom_workload_max_seconds) || 450}
-                                onChange={(e) => setFieldValue('custom_workload_max_seconds', e.target.value === '' ? '' : Number(e.target.value))}
-                                className="input mt-1"
-                              />
-                            </label>
-                            <label className="text-xs text-gray-600">
-                              Samples (optional)
-                              <input
-                                type="number"
-                                min={1}
-                                value={values.custom_workload_samples === '' ? '' : Number(values.custom_workload_samples) || ''}
-                                onChange={(e) => setFieldValue('custom_workload_samples', e.target.value === '' ? '' : Number(e.target.value))}
-                                className="input mt-1"
-                              />
-                            </label>
-                          </div>
-                        </div>
-                      )}
+                      {projectAdapter?.renderFieldExtras({
+                        field,
+                        values,
+                        derived,
+                        setFieldValue,
+                        setValues,
+                      })}
                     </div>
                   )
                 })}
-                {isRhaiis && section.id === 'infra' && (
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700">GPU Type</label>
-                    <input
-                      type="text"
-                      value={gpuType || 'Select a registered cluster or profile'}
-                      readOnly
-                      className="input mt-1 bg-gray-50 text-gray-500"
-                    />
-                    <p className="mt-1 text-xs text-gray-400">Derived from the selected Control Center cluster, with the RHAIIS profile as fallback.</p>
-                  </div>
-                )}
+                {projectAdapter?.renderSectionExtras(section, {
+                  values,
+                  derived,
+                  setFieldValue,
+                  setValues,
+                })}
               </div>
             </div>
           ))}
 
-          {isRhaiis && (
-            <div className="rounded-lg border border-gray-200 p-4">
-              <label className="block text-sm font-medium text-gray-700">Advanced Config Overrides</label>
-              <textarea
-                value={String(values.advanced_overrides || '')}
-                onChange={(e) => setFieldValue('advanced_overrides', e.target.value)}
-                rows={4}
-                className="input mt-1 font-mono"
-                placeholder="key: value (one per line)\ne.g. experiment.concurrency: [32]"
-              />
-              <p className="mt-1 text-xs text-gray-400">
-                Optional Forge overrides. Use one <code>key: value</code> per line; these are applied last.
-              </p>
-            </div>
-          )}
+          {projectAdapter?.renderAdditionalConfig({
+            values,
+            derived,
+            setFieldValue,
+            setValues,
+          })}
 
           {isMatrix && (
             <div className="space-y-4 rounded-lg border border-gray-200 p-4">
@@ -915,8 +689,8 @@ export default function DynamicSubmitForm({
           priority: basics.priority,
           exclusive: basics.exclusive,
           pullSha: basics.useLatestMain ? 'main' : basics.pullSha,
-          gpuType,
-          gpuCount,
+          gpuType: derived.gpuType,
+          gpuCount: derived.gpuCount,
           args,
           configOverrides: overrides,
           schedule: basics.scheduling.mode === 'recurring' ? basics.scheduling.scheduleUtc : '',
@@ -932,7 +706,7 @@ export default function DynamicSubmitForm({
                     return {
                       key,
                       overrides: stringifyOverrides(m?.overrides || {}),
-                      gpuCount: m?.tp ?? gpuCount,
+                      gpuCount: m?.tp ?? derived.gpuCount,
                     }
                   }),
                   workloads: selectedWorkloads,
@@ -948,15 +722,15 @@ export default function DynamicSubmitForm({
                 <ReviewRow label="Project" value={project} />
                 <ReviewRow label="Cluster" value={basics.cluster} missing={!basics.cluster.trim()} />
                 <ReviewRow label="Pipeline" value={basics.pipeline} />
-                {isRhaiis && <ReviewRow label="GPU type / count" value={`${gpuType || 'auto'} / ${gpuCount}`} />}
+                {projectAdapter?.renderReviewBasics(derived)}
                 {basics.owner && <ReviewRow label="Owner" value={basics.owner} />}
                 <ReviewRow label="Priority" value={basics.priority} />
                 {basics.exclusive && <ReviewRow label="Exclusive" value="Yes" />}
-                {project === 'rhaiis' && basics.useLatestMain && (
-                  <ReviewRow label="Build source" value="Latest main (un-pinned)" />
+                {projectAdapter?.requiresBuildSource && basics.useLatestMain && (
+                  <ReviewRow label={projectAdapter.buildSourceLabel} value="Latest main (un-pinned)" />
                 )}
                 {basics.pullSha && (
-                  <ReviewRow label={project === 'rhaiis' ? 'Build source' : 'Pull Request'} value={basics.prLabel} mono={!basics.prLabel || basics.prLabel === basics.pullSha} />
+                  <ReviewRow label={projectAdapter?.buildSourceLabel || 'Pull Request'} value={basics.prLabel} mono={!basics.prLabel || basics.prLabel === basics.pullSha} />
                 )}
                 <ReviewRow
                   label="Schedule"
@@ -1008,28 +782,7 @@ export default function DynamicSubmitForm({
                 )
               })}
 
-              {isRhaiis && (values.model === '__custom_model__' || customWorkloadSelected || String(values.advanced_overrides || '').trim()) && (
-                <ReviewSection title="Additional RHAIIS Settings">
-                  {values.model === '__custom_model__' && (
-                    <>
-                      <ReviewRow label="Custom model name" value={String(values.custom_model_name || '') || '-'} />
-                      <ReviewRow label="HuggingFace model ID" value={String(values.custom_model_id || '')} missing={!String(values.custom_model_id || '').trim()} />
-                      <ReviewRow label="TP size" value={String(tpSize)} />
-                    </>
-                  )}
-                  {customWorkloadSelected && (
-                    <>
-                      <ReviewRow label="Custom workload data" value={String(values.custom_workload_data || '')} missing={!String(values.custom_workload_data || '').trim()} />
-                      <ReviewRow label="Custom concurrencies" value={String(values.custom_workload_concurrencies || '')} missing={!String(values.custom_workload_concurrencies || '').trim()} />
-                      <ReviewRow label="Custom max seconds" value={String(values.custom_workload_max_seconds || '')} />
-                      {values.custom_workload_samples !== '' && <ReviewRow label="Custom samples" value={String(values.custom_workload_samples)} />}
-                    </>
-                  )}
-                  {String(values.advanced_overrides || '').trim() && (
-                    <ReviewRow label="Advanced overrides" value={String(values.advanced_overrides)} mono />
-                  )}
-                </ReviewSection>
-              )}
+              {projectAdapter?.renderAdditionalReview(values, derived)}
 
               {isMatrix && (
                 <ReviewSection title="Matrix Selection">
