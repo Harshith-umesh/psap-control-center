@@ -14,10 +14,12 @@ You can browse everything without signing in. To make changes (add clusters, cre
 ## Signing In
 
 1. Click the **Sign In** button in the header
-2. Enter the admin username and password
+2. Enter your standard-user or administrator username and password
 3. Click **Sign In**
 
-Once authenticated, the header shows your username and a **Sign Out** button. Your session lasts until you close the browser tab.
+Once authenticated, the header shows your username and a **Sign Out** button.
+Sessions last eight hours by default and are maintained by a secure HttpOnly
+cookie.
 
 ## Dashboard
 
@@ -174,6 +176,61 @@ The mini weekly calendar at the top of the Reservations page shows hourly slots 
 Go to **Calendar** in the sidebar for month, week, or day views. Use the **cluster filter** dropdown to show reservations for specific clusters.
 
 Reservation colors match their cluster's assigned color for easy identification.
+
+## Testing
+
+The development Testing workspace submits and monitors jobs managed by Fournos
+on the connected management cluster. Read-only views are available without
+signing in; submission and scheduling require a signed-in account, while
+destructive actions require an administrator.
+
+### Live Jobs
+
+The **Live Jobs** tab shows active `FournosJob` resources, newest first. Filter
+by project, cluster, or status and use the column headers to change the sort.
+The list refreshes automatically every five seconds.
+
+Select a job to view its pipeline stages, Tekton task state, pods, Kubernetes
+events, and streaming pod logs. Administrators can cancel a live job.
+
+### History
+
+The **History** tab shows completed jobs archived in the Control Center
+database. Filters support project, cluster, status, and a local date/time
+window; results are paginated and newest first by default.
+
+Select an archived job to inspect its saved stage snapshots, events, duration,
+artifact links, and MLflow link when available. Administrators may rerun a job
+or permanently delete its archived record.
+
+### Submitting a Job
+
+1. Open **Testing** and select **Submit Job**.
+2. Choose a Forge project, pipeline, and target cluster.
+3. Complete the project-specific fields loaded from the Forge
+   `ui/submit.yaml` schema. Depending on that schema, the form may include an
+   owner, priority, pull-request SHA, presets, configuration overrides, GPU
+   requirements, or exclusive-lock controls.
+4. Review the generated YAML.
+5. Choose one of the available launch modes:
+   - **Run now** for an immediate standard or matrix submission.
+   - **Defer** to select a future calendar slot.
+   - **Recurring** to provide a cron schedule for repeated runs.
+6. Submit the job.
+
+The custom non-Forge job option is a placeholder and is not yet available.
+
+### Schedules and Cluster Locks
+
+The **Schedules/Locks** tab has two views:
+
+- **Recurring Jobs** lists recurring parents and links to their archived child
+  runs. Administrators can trigger an off-cycle run or delete a schedule.
+- **Cluster Locks** lists immediate and scheduled exclusive locks. A signed-in
+  user can create a finite or indefinite lock; an administrator can release it.
+
+The cluster scheduling overview combines current jobs, recurring jobs, and
+locks so a user can assess availability before submitting or scheduling work.
 
 ## Hearth Integration
 

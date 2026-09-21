@@ -21,6 +21,17 @@ services:
       - USER_PASSWORD=${USER_PASSWORD:-change-user-password}
       - HEARTH_ENABLED=${HEARTH_ENABLED:-true}
       - HEARTH_NAMESPACE=${HEARTH_NAMESPACE:-hearth}
+      - FOURNOS_NAMESPACE=${FOURNOS_NAMESPACE:-psap-automation}
+      - FOURNOS_API_GROUP=${FOURNOS_API_GROUP:-fournos.dev}
+      - FOURNOS_API_VERSION=${FOURNOS_API_VERSION:-v1}
+      - FOURNOS_JOB_PLURAL=${FOURNOS_JOB_PLURAL:-fournosjobs}
+      - FOURNOS_K8S_TIMEOUT=${FOURNOS_K8S_TIMEOUT:-30}
+      - FORGE_GITHUB_REPO=${FORGE_GITHUB_REPO:-openshift-psap/forge}
+      - FORGE_GITHUB_REF=${FORGE_GITHUB_REF:-main}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GITHUB_SYNC_INTERVAL_SECONDS=${GITHUB_SYNC_INTERVAL_SECONDS:-3600}
+      - GITHUB_SYNC_FAILURE_BACKOFF_SECONDS=${GITHUB_SYNC_FAILURE_BACKOFF_SECONDS:-300}
+      - FOURNOS_DEFAULT_PIPELINES=${FOURNOS_DEFAULT_PIPELINES:-forge-full,forge-prepare-test,forge-test-only,forge-prepare-only,forge-replot,nightly}
       - BILLING_CSV_STORAGE_PATH=/app/data/billing_csvs
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload

@@ -18,6 +18,7 @@ oc get route psap-control-center -n <namespace> \
 - **Namespace Enforcement** — GPU reservations automatically provision isolated Kubernetes namespaces with `ResourceQuota` and optional DRA `ResourceClaimTemplate`. Namespaces are cleaned up on completion, cancellation, or deletion.
 - **Calendar Views** — Weekly preview with overlapping reservation display (index-based opacity for distinguishing coexisting reservations), plus full month/week/day calendar.
 - **Hearth Integration** — Connect the shared Hearth/Fournos management cluster with a kubeconfig or a specific OpenShift user's credentials, then discover GPU inventory from `FournosCluster` CRDs.
+- **Fournos Testing (development)** — Monitor live and archived test runs, submit schema-driven Forge jobs, schedule recurring work, and coordinate cluster locks from the Testing tab.
 - **Cost Explorer & Billing** — Compare public, estimated, and actual infrastructure costs using cluster snapshots and uploaded IBM Cloud billing reports.
 - **Slack Notifications** — Configure an incoming webhook for reservation notifications from the admin settings page.
 - **Role-Based Access** — Public read access, signed-in reservation workflows, and administrator-only cluster, integration, billing, and cost management.
@@ -57,7 +58,7 @@ flowchart LR
     end
 
     api -->|Kubernetes API| managed[Managed OpenShift clusters]
-    api -->|FournosCluster CRDs| hearth[Hearth and Fournos management cluster]
+    api -->|FournosCluster and FournosJob CRDs| hearth[Hearth and Fournos management cluster]
     api -. optional notifications .-> slack[Slack webhook]
 
     actions[GitHub Actions on main] --> quay[Quay images tagged latest]
@@ -76,6 +77,29 @@ backend images in GitHub Actions and publishes `:latest` tags to Quay. An
 in-cluster CronJob checks the image digests every two minutes and restarts only
 the deployments whose digest changed. GitHub Actions does not require direct
 access to the OpenShift API.
+
+## Testing Tab (Development)
+
+The development branch includes a Fournos-backed Testing workspace. It uses the
+same saved management-cluster connection as Hearth and keeps Kubernetes
+credentials in the backend; the browser communicates only with Control Center's
+API.
+
+- **Live Jobs** polls active `FournosJob` resources and opens a detail view with
+  pipeline progress, pods, events, and streaming logs.
+- **History** reads completed jobs archived in the Control Center database and
+  supports project, cluster, status, date, sorting, and pagination controls.
+- **Submit Job** discovers Forge projects and pipelines, renders project-owned
+  `ui/submit.yaml` schemas, supports standard or matrix submissions, and can run
+  immediately, defer a run, or create a recurring schedule. Custom non-Forge
+  job definitions remain a planned capability.
+- **Schedules/Locks** manages recurring jobs and immediate or scheduled cluster
+  locks, with cluster activity and child-run views.
+
+Read-only Testing views are public. Submitting work, creating locks, and holding
+calendar slots require a signed-in user. Cancelling or rerunning jobs, deleting
+history, triggering or deleting schedules, and releasing locks require an
+administrator.
 
 ## Quick Start
 
@@ -147,6 +171,13 @@ by default.
 | `HEARTH_ENABLED` | `true` | Enable Hearth/Fournos integration |
 | `HEARTH_NAMESPACE` | `hearth` | Namespace containing `FournosCluster` resources |
 | `HEARTH_KUBECONFIG_PATH` | Optional | Read-only externally managed management-cluster kubeconfig |
+| `FOURNOS_NAMESPACE` | `psap-automation` | Namespace containing `FournosJob` resources |
+| `FOURNOS_K8S_TIMEOUT` | `30` | Kubernetes API timeout for Fournos operations, in seconds |
+| `FORGE_GITHUB_REPO` | `openshift-psap/forge` | Forge repository used for project, schema, pipeline, and pull-request discovery |
+| `FORGE_GITHUB_REF` | `main` | Forge ref used for repository content discovery |
+| `GITHUB_TOKEN` | Optional | Token for authenticated Forge GitHub API requests |
+| `GITHUB_SYNC_INTERVAL_SECONDS` | `3600` | Background Forge metadata refresh interval |
+| `FOURNOS_DEFAULT_PIPELINES` | Built-in list | Fallback comma-separated pipeline names |
 | `BILLING_CSV_STORAGE_PATH` | `./billing_csvs` | Billing report storage directory |
 | `LOG_LEVEL` | `INFO` | Backend log level: ERROR, WARN, INFO, or DEBUG |
 | `MLFLOW_BASE_URL` | Optional | Reserved for the planned Results integration |
@@ -186,6 +217,12 @@ Key endpoints:
 | `/api/v1/hearth/connect` | POST | Admin | Connect with a kubeconfig |
 | `/api/v1/hearth/connect/credentials` | POST | Admin | Connect as a specific OpenShift user |
 | `/api/v1/hearth/clusters` | GET | Public | Hearth GPU inventory |
+| `/api/v1/fournos/runs` | GET | Public | Paginated live or archived Fournos runs |
+| `/api/v1/fournos/jobs/{name}` | GET | Public | Job detail, stages, pods, events, and logs |
+| `/api/v1/fournos/submit` | POST | Signed in | Submit a Fournos job |
+| `/api/v1/fournos/submit-matrix` | POST | Signed in | Submit a matrix of Fournos jobs |
+| `/api/v1/fournos/recurring-jobs` | GET | Public | List recurring jobs; creation uses the submit endpoint |
+| `/api/v1/fournos/cluster-locks` | GET/POST | Public / signed in | List or create cluster locks |
 | `/api/v1/cost-explorer/snapshots` | GET | Admin | Cost snapshots |
 | `/api/v1/billing/upload` | POST | Admin | Upload a billing CSV |
 

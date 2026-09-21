@@ -10,7 +10,8 @@ It provides:
 - A **reservation system** with full-cluster and partial GPU reservations, type-aware conflict detection, and namespace-level enforcement
 - **Dynamic Resource Allocation (DRA)** integration for GPU inventory and allocation tracking
 - **Hearth integration** for GPU discovery via FournosCluster CRDs
-- A **view-only public mode** and **admin-authenticated write mode**
+- A **Fournos Testing workspace** for live monitoring, archived history, Forge job submission, recurring schedules, and cluster locks
+- A **view-only public mode** with signed-in user and administrator write roles
 
 ---
 
@@ -19,6 +20,8 @@ It provides:
 | Concern | **Hearth** | **PSAP Control Center** |
 |---|---|---|
 | GPU cluster discovery | Manages `FournosCluster` CRDs on a central management cluster | Reads CRDs via `/api/v1/hearth/clusters` for parallel GPU inventory (clusters must still be added to Control Center manually) |
+| Test execution | Reconciles `FournosJob` resources and creates Tekton resources | Submits jobs, presents live state and logs, and archives completed runs for history |
+| Test scheduling | Reconciles recurring jobs and cluster locks | Provides scheduling, lock, slot-hold, and child-run workflows |
 | Cluster lifecycle | Provisions and decommissions bare-metal/cloud GPU nodes | No lifecycle control — read-only consumer of cluster metadata |
 | Hardware inventory | Source of truth for node count, GPU model, driver version | Caches the data locally; refreshes on demand or periodic poll |
 | Reservation / scheduling | No concept of reservations | Full ownership: conflict detection, calendar, enforcement |
@@ -68,12 +71,13 @@ It provides:
 │    │  /api/v1/clusters/*     Cluster management         │    │
 │    │  /api/v1/reservations/* Reservation management     │    │
 │    │  /api/v1/hearth/*       Hearth integration         │    │
+│    │  /api/v1/fournos/*      Testing workflows          │    │
 │    └───────┬──────────────────┬────────────────┬────────┘    │
 │            │                  │                │             │
 │            ▼                  ▼                ▼             │
 │     ┌──────────┐    ┌──────────────┐   ┌────────────┐       │
-│     │  SQLite  │    │  Kubeconfigs │   │ Kubernetes │       │
-│     │   (PVC)  │    │    (PVC)     │   │  API calls │       │
+│     │PostgreSQL│    │  Kubeconfigs │   │ Kubernetes │       │
+│     │(prod DB) │    │    (PVC)     │   │  API calls │       │
 │     └──────────┘    └──────────────┘   └─────┬──────┘       │
 └──────────────────────────────────────────────┼───────────────┘
                                                │
@@ -114,25 +118,36 @@ backend/app/
 │   └── auth.py              # Session token handling and role dependencies
 ├── models/
 │   ├── cluster.py           # Cluster ORM model
+│   ├── fournos_job.py       # Archived Fournos run model
 │   ├── reservation.py       # Reservation ORM model + status enum
 │   └── user.py              # User ORM model (reserved for future use)
 ├── schemas/
 │   ├── cluster.py           # Cluster request/response DTOs
+│   ├── fournos.py           # Job, schedule, lock, and run DTOs
 │   ├── reservation.py       # Reservation DTOs with validation
-│   └── hearth.py            # Hearth/FournosCluster DTOs
+│   ├── hearth.py            # Hearth/FournosCluster DTOs
+│   └── ui_schema.py         # Forge submission form schema
 ├── services/
 │   ├── cluster_service.py      # Cluster CRUD, status refresh
 │   ├── reservation_service.py  # Reservations, type-aware conflicts, calendar
 │   ├── enforcement_service.py  # Namespace lifecycle, ResourceQuota, DRA templates
 │   ├── kubernetes_service.py   # K8s/OCP API wrapper (DRA, GPU allocation, namespace mgmt)
-│   └── hearth_service.py       # FournosCluster CRD reader
+│   ├── hearth_service.py       # FournosCluster CRD reader
+│   ├── fournos_k8s_client.py   # Fournos/Tekton management-cluster client
+│   ├── fournos_db_service.py   # Archived run queries and persistence
+│   ├── fournos_watcher.py      # Terminal-job archive reconciler
+│   ├── forge_discovery.py      # Forge project discovery
+│   ├── github_sync_service.py  # Forge metadata background sync
+│   ├── pipeline_definitions.py # Pipeline definitions and stage mapping
+│   └── slot_hold_service.py    # Scheduling slot coordination
 ├── api/
 │   ├── __init__.py          # Router aggregation
 │   ├── health.py            # GET /health
 │   ├── auth.py              # Login, logout, and current-session endpoints
 │   ├── clusters.py          # Cluster endpoints
 │   ├── reservations.py      # Reservation endpoints
-│   └── hearth.py            # Hearth endpoints
+│   ├── hearth.py            # Hearth endpoints
+│   └── fournos.py           # Testing endpoints
 └── utils/
     └── logger.py            # Structured logging utility
 ```
@@ -191,6 +206,26 @@ billing, and cost-management operations require the `admin` role.
 | POST   | `/disconnect`                | Yes  | Remove Hearth connection             |
 | GET    | `/clusters`                  | No   | List FournosCluster CRDs             |
 | GET    | `/clusters/{name}`           | No   | Get specific FournosCluster          |
+
+#### Fournos Testing Endpoints (`/api/v1/fournos`)
+
+| Method | Path | Auth | Description |
+| ------ | ---- | ---- | ----------- |
+| GET | `/runs` | No | Paginated live or archived jobs with filters and sorting |
+| GET | `/jobs/{name}` | No | Job detail, stages, pods, and artifact metadata |
+| GET | `/jobs/{name}/events` | No | Job and pod events |
+| GET | `/jobs/{name}/logs/{pod}` | No | Stream pod logs with server-sent events |
+| POST | `/jobs/{name}/cancel` | Admin | Cancel a live job |
+| POST | `/jobs/{name}/rerun` | Admin | Recreate a completed job |
+| DELETE | `/history/{name}` | Admin | Delete an archived job |
+| POST | `/submit` | User | Submit one job, defer it, or create a recurring parent |
+| POST | `/submit-matrix` | User | Submit a matrix of jobs |
+| GET | `/projects`, `/pipelines` | No | Discover Forge projects, schemas, and pipelines |
+| GET | `/recurring-jobs` | No | List recurring jobs; creation uses `/submit` |
+| GET/POST | `/cluster-locks` | No / User | List or create cluster locks |
+| DELETE | `/cluster-locks/{name}` | Admin | Release a cluster lock |
+| GET | `/clusters/{cluster}/overview` | No | Current jobs, schedules, and locks for a cluster |
+| GET/POST/DELETE | `/clusters/{cluster}/slot-holds` | No / User | Coordinate short-lived scheduling-calendar holds |
 
 ### Data Model
 
@@ -342,20 +377,26 @@ frontend/src/
 ├── components/
 │   ├── Layout.tsx           # App shell: sidebar, header, auth UI
 │   ├── LoginModal.tsx       # Sign-in dialog
-│   └── HearthConnectModal.tsx  # Hearth kubeconfig upload
+│   ├── HearthConnectModal.tsx  # Hearth connection setup/replacement
+│   ├── DynamicSubmitForm.tsx   # Schema-driven Forge fields
+│   ├── SchedulingCalendar.tsx  # Deferred-run slot selection
+│   └── YamlPreview.tsx         # Submission review
 ├── pages/
 │   ├── Dashboard.tsx        # Stats, reservations, Hearth GPUs
 │   ├── Clusters.tsx         # Cluster grid + add modal
 │   ├── ClusterDetail.tsx    # Deep cluster view with tabs
 │   ├── Reservations.tsx     # Reservation management + mini calendar
 │   ├── Calendar.tsx         # Full calendar (month/week/day)
-│   ├── Testing.tsx          # Placeholder
+│   ├── Testing.tsx          # Live, history, submit, schedules, locks
+│   ├── TestingJobDetail.tsx # Pipeline, pod, event, log, artifact detail
+│   ├── ScheduleRuns.tsx     # Recurring parent child-run history
 │   └── Results.tsx          # Placeholder
 ├── hooks/
 │   ├── useClusters.ts       # Cluster queries + mutations
 │   ├── useReservations.ts   # Reservation queries + mutations
 │   ├── useGpuStatus.ts      # Live GPU allocation query (per-cluster)
-│   └── useHearth.ts         # Hearth queries + mutations
+│   ├── useHearth.ts         # Hearth queries + mutations
+│   └── useFournos.ts        # Testing queries, mutations, and polling
 ├── services/
 │   └── api.ts               # Axios instance + API functions
 ├── stores/
@@ -409,8 +450,47 @@ All data fetching uses TanStack Query with automatic caching, refetching, and ca
 - **Cluster occupancy**: polls every 30 seconds
 - **Topology/OCP/operators**: 60-second stale time
 - **Workloads**: 30-second stale time
+- **Live Fournos jobs**: polls every 5 seconds
+- **Recurring jobs and cluster locks**: polls every 30 seconds
 
 Mutations (create, update, delete) automatically invalidate related query caches and show success/error toasts.
+
+---
+
+## Fournos Testing Integration
+
+The Testing workspace uses the management-cluster kubeconfig saved by the
+Hearth connection. All Kubernetes and GitHub access happens in the backend;
+the frontend receives normalized API responses and never receives cluster
+credentials.
+
+```
+React Testing workspace
+        │
+        │ /api/v1/fournos/*
+        ▼
+FastAPI backend
+  ├── live reads/writes ───────────────► FournosJob and Tekton resources
+  ├── terminal-job watcher (60 seconds) ─► archived job rows in the database
+  └── Forge metadata sync ─────────────► project schemas, pipelines, open PRs
+```
+
+- **Live Jobs** reads Kubernetes resources directly and polls every five
+  seconds. Job details combine the `FournosJob`, Tekton `TaskRun` and pod state,
+  Kubernetes events, and server-sent log streams.
+- **History** queries watcher-created database records. The watcher snapshots
+  terminal stages, events, duration, artifact links, and MLflow links so the
+  list remains available after the live resource is removed.
+- **Submit Job** discovers projects and pipeline definitions from Forge. A
+  project's `ui/submit.yaml` controls the form fields; submissions may run now,
+  at a future time, on a cron schedule, or as a parameter matrix.
+- **Schedules/Locks** reads recurring parents and lock-only `FournosJob`
+  resources. Child-run history comes from the archive database, and ephemeral
+  slot holds prevent two users from selecting the same scheduling slot at once.
+
+Public users may view testing data. Authenticated users may submit jobs, create
+locks, and hold slots. Destructive job, history, schedule, and lock operations
+require the administrator role.
 
 ---
 
@@ -536,6 +616,17 @@ All configuration is via environment variables, loaded by Pydantic Settings:
 | `HEARTH_ENABLED` | `true` | Enable Hearth integration |
 | `HEARTH_NAMESPACE` | `hearth` | Namespace for `FournosCluster` resources |
 | `HEARTH_KUBECONFIG_PATH` | Optional | Externally managed management-cluster kubeconfig |
+| `FOURNOS_NAMESPACE` | `psap-automation` | Namespace for `FournosJob` and Tekton resources |
+| `FOURNOS_API_GROUP` / `FOURNOS_API_VERSION` | `fournos.dev` / `v1` | Fournos custom-resource API |
+| `FOURNOS_JOB_PLURAL` | `fournosjobs` | Fournos job resource plural |
+| `FOURNOS_K8S_TIMEOUT` | `30` | Kubernetes API timeout in seconds |
+| `FORGE_REPO_PATH` | Optional | Local Forge checkout; when unset, discovery uses GitHub |
+| `FORGE_PROJECTS_CONFIG_PATH` | `/etc/fournos-dashboard/projects.yaml` | Optional project catalog path |
+| `FORGE_GITHUB_REPO` / `FORGE_GITHUB_REF` | `openshift-psap/forge` / `main` | Forge repository and content ref |
+| `GITHUB_TOKEN` | Optional | Token for authenticated GitHub requests |
+| `GITHUB_SYNC_INTERVAL_SECONDS` | `3600` | Successful metadata sync interval |
+| `GITHUB_SYNC_FAILURE_BACKOFF_SECONDS` | `300` | Failed metadata sync retry delay |
+| `FOURNOS_DEFAULT_PIPELINES` | Built-in list | Fallback comma-separated pipelines |
 | `BILLING_CSV_STORAGE_PATH` | `./billing_csvs` | Billing report storage |
 | `VITE_LOG_LEVEL` | `INFO` | Frontend build-time log level |
 
@@ -580,7 +671,7 @@ docker compose -f docker-compose.dev.yml up  # Dev with hot reload
 
 ## Future / Planned
 
-- **Testing page**: Automated test execution (TOPSAIL, vLLM benchmarks, MLPerf)
+- **Custom Testing job definitions**: Non-Forge submission forms and workflows
 - **Results page**: MLFlow integration for test results visualization
 - **Fine-grained RBAC**: More granular permissions beyond the current admin/user roles
 - **Alembic migrations**: Currently using manual ALTER TABLE; planned migration to Alembic for production
