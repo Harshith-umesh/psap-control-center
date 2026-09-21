@@ -1145,11 +1145,17 @@ class KubernetesService:
         username: str,
         password: str,
         storage_path: str,
-        cluster_name: str
+        cluster_name: str,
+        use_service_account: bool = True,
+        allow_stored_password: bool = True,
     ) -> Dict[str, Any]:
         """
-        Authenticate to OpenShift using username/password (kubeadmin) and generate a kubeconfig.
-        This uses the OAuth token request flow.
+        Authenticate to OpenShift using username/password and generate a kubeconfig.
+
+        By default the existing managed-cluster behavior is preserved: attempt
+        to exchange the user's OAuth token for a long-lived service-account
+        token. Callers that must continue operating as the supplied user can
+        disable that exchange and persist only the user's OAuth token instead.
         """
         api_server = api_server.rstrip('/')
         logger.info("Attempting login to:", api_server, "with user:", username)
@@ -1219,7 +1225,7 @@ class KubernetesService:
                     logger.warn("OAuth authorize failed:", e)
 
                 # Method 2: Request token via oauthaccesstokens API
-                if not access_token:
+                if not access_token and allow_stored_password:
                     try:
                         token_request_url = f"{api_server}/apis/oauth.openshift.io/v1/oauthaccesstokens"
                         headers = {"Content-Type": "application/json"}
@@ -1290,21 +1296,29 @@ class KubernetesService:
                         "error": "Authentication failed. Please check your credentials and ensure the API server URL is correct (should be like https://api.cluster.domain:6443)"
                     }
 
-                # Try to create a service account with a long-lived token
-                logger.info("Creating service account for persistent access to", cluster_name)
-                sa_result = await KubernetesService.create_service_account_token(
-                    api_server, access_token, cluster_name
-                )
-                
-                # Use the SA token if available, otherwise fall back to OAuth token
-                if sa_result.get("success") and sa_result.get("token"):
-                    final_token = sa_result["token"]
-                    auth_type = "service-account"
-                    logger.info("Using service account token for", cluster_name, "(long-lived)")
+                sa_result: Dict[str, Any] = {}
+                if use_service_account:
+                    # Managed clusters historically use a long-lived service
+                    # account so background refreshes survive OAuth expiry.
+                    logger.info("Creating service account for persistent access to", cluster_name)
+                    sa_result = await KubernetesService.create_service_account_token(
+                        api_server, access_token, cluster_name
+                    )
+
+                    if sa_result.get("success") and sa_result.get("token"):
+                        final_token = sa_result["token"]
+                        auth_type = "service-account"
+                        logger.info("Using service account token for", cluster_name, "(long-lived)")
+                    else:
+                        final_token = access_token
+                        auth_type = "oauth-token"
+                        logger.warn("Using OAuth token for", cluster_name, "(will expire)")
                 else:
+                    # Hearth/admin-cluster connections must retain the identity
+                    # and RBAC of the explicitly supplied OpenShift user.
                     final_token = access_token
                     auth_type = "oauth-token"
-                    logger.warn("Using OAuth token for", cluster_name, "(will expire)")
+                    logger.info("Using supplied OpenShift user token for", cluster_name)
 
                 # Generate kubeconfig with the token
                 kubeconfig_content = KubernetesService._generate_kubeconfig_token(
@@ -1320,6 +1334,7 @@ class KubernetesService:
                     "kubeconfig_path": filepath,
                     "api_server": api_server,
                     "auth_type": auth_type,
+                    "username": username,
                     "service_account": sa_result.get("service_account") if sa_result.get("success") else None
                 }
 
