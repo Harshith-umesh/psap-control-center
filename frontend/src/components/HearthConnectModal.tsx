@@ -13,10 +13,15 @@ import { useConnectHearth } from '../hooks/useHearth'
 
 interface HearthConnectModalProps {
   open: boolean
+  configured?: boolean
   onClose: () => void
 }
 
-export default function HearthConnectModal({ open, onClose }: HearthConnectModalProps) {
+export default function HearthConnectModal({
+  open,
+  configured = false,
+  onClose,
+}: HearthConnectModalProps) {
   const [method, setMethod] = useState<'kubeconfig' | 'credentials'>('kubeconfig')
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const [credentials, setCredentials] = useState({
@@ -119,10 +124,12 @@ export default function HearthConnectModal({ open, onClose }: HearthConnectModal
                     <FireIcon className="h-6 w-6 text-orange-600" />
                   </div>
                   <Dialog.Title className="text-lg font-semibold text-gray-900">
-                    Connect Hearth / Admin Cluster
+                    {configured ? 'Change' : 'Connect'} Hearth / Admin Cluster
                   </Dialog.Title>
                   <p className="mt-1 text-sm text-gray-500 text-center">
-                    Connect to the OpenShift management cluster where Hearth and Fournos run
+                    {configured
+                      ? 'Replace the connection to the OpenShift management cluster'
+                      : 'Connect to the OpenShift management cluster where Hearth and Fournos run'}
                   </p>
                 </div>
 
@@ -284,7 +291,9 @@ export default function HearthConnectModal({ open, onClose }: HearthConnectModal
                       disabled={!canSubmit || connectHearth.isPending}
                       className="flex-1 rounded-lg bg-orange-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-orange-500 focus:outline-none focus:ring-2 focus:ring-orange-500 focus:ring-offset-2 disabled:opacity-50 transition-colors"
                     >
-                      {connectHearth.isPending ? 'Connecting...' : 'Connect'}
+                      {connectHearth.isPending
+                        ? (configured ? 'Updating...' : 'Connecting...')
+                        : (configured ? 'Update Connection' : 'Connect')}
                     </button>
                   </div>
                 </form>

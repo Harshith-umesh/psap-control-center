@@ -192,6 +192,11 @@ does not create or switch to a service account. The user must already be able
 to read the required Hearth and Fournos resources, and an expired OAuth token
 requires reconnecting.
 
+To replace an existing management-cluster connection, click **Change** on the
+Hearth sidebar card or click the Hearth status indicator in the top bar. Enter
+the complete replacement login or upload a new kubeconfig; saved passwords are
+never displayed because they are not stored.
+
 ### What Hearth Shows
 
 - **Dashboard** — table of all Hearth-discovered clusters with GPU types and counts

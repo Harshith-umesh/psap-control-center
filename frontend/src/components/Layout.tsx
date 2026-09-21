@@ -102,14 +102,23 @@ function HearthIndicator({
             </p>
           </div>
         </div>
-        <button
-          onClick={() => disconnectHearth.mutate()}
-          disabled={disconnectHearth.isPending}
-          className="text-[10px] text-gray-500 hover:text-orange-400 transition-colors px-1.5 py-0.5 rounded hover:bg-white/10"
-          title="Disconnect Hearth"
-        >
-          {disconnectHearth.isPending ? '...' : 'Disconnect'}
-        </button>
+        <div className="flex items-center gap-1">
+          <button
+            onClick={onConnectClick}
+            className="text-[10px] text-gray-400 hover:text-orange-300 transition-colors px-1.5 py-0.5 rounded hover:bg-white/10"
+            title="Change Hearth / admin cluster connection"
+          >
+            Change
+          </button>
+          <button
+            onClick={() => disconnectHearth.mutate()}
+            disabled={disconnectHearth.isPending}
+            className="text-[10px] text-gray-500 hover:text-orange-400 transition-colors px-1.5 py-0.5 rounded hover:bg-white/10"
+            title="Disconnect Hearth"
+          >
+            {disconnectHearth.isPending ? '...' : 'Disconnect'}
+          </button>
+        </div>
       </div>
     </div>
   )
@@ -303,20 +312,20 @@ export default function Layout() {
             <div className="flex flex-1" />
             <div className="flex items-center gap-x-4 lg:gap-x-6">
               <button
-                onClick={() => !hearthStatus?.configured && setHearthConnectOpen(true)}
+                onClick={() => setHearthConnectOpen(true)}
                 className={clsx(
                   'hidden sm:flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium transition-colors',
                   hearthStatus?.available
-                    ? 'bg-green-500/10 text-green-400 border border-green-500/30'
+                    ? 'bg-green-500/10 text-green-400 border border-green-500/30 hover:border-green-400/60 hover:bg-green-500/20 cursor-pointer'
                     : hearthStatus?.configured
-                    ? 'bg-orange-500/10 text-orange-400 border border-orange-500/30'
+                    ? 'bg-orange-500/10 text-orange-400 border border-orange-500/30 hover:border-orange-400/60 hover:bg-orange-500/20 cursor-pointer'
                     : 'bg-white/5 text-gray-400 border border-white/10 hover:border-orange-500/30 hover:text-orange-400 cursor-pointer'
                 )}
                 title={
                   hearthStatus?.available
-                    ? `Hearth: ${hearthStatus.cluster_count} clusters, ${hearthStatus.total_gpus} GPUs`
+                    ? `Hearth: ${hearthStatus.cluster_count} clusters, ${hearthStatus.total_gpus} GPUs — click to change connection`
                     : hearthStatus?.configured
-                    ? `Hearth: ${hearthStatus?.error || 'Connection error'}`
+                    ? `Hearth: ${hearthStatus?.error || 'Connection error'} — click to change connection`
                     : 'Click to connect Hearth'
                 }
               >
@@ -361,7 +370,11 @@ export default function Layout() {
       </div>
 
       <LoginModal open={loginOpen} onClose={() => setLoginOpen(false)} />
-      <HearthConnectModal open={hearthConnectOpen} onClose={() => setHearthConnectOpen(false)} />
+      <HearthConnectModal
+        open={hearthConnectOpen}
+        configured={hearthStatus?.configured ?? false}
+        onClose={() => setHearthConnectOpen(false)}
+      />
     </div>
   )
 }
