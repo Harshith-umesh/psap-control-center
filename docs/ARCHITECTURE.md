@@ -10,7 +10,8 @@ It provides:
 - A **reservation system** with full-cluster and partial GPU reservations, type-aware conflict detection, and namespace-level enforcement
 - **Dynamic Resource Allocation (DRA)** integration for GPU inventory and allocation tracking
 - **Hearth integration** for GPU discovery via FournosCluster CRDs
-- A **view-only public mode** and **admin-authenticated write mode**
+- A **Fournos Testing workspace** for live monitoring, archived history, Forge job submission, recurring schedules, and cluster locks
+- A **view-only public mode** with signed-in user and administrator write roles
 
 ---
 
@@ -19,6 +20,8 @@ It provides:
 | Concern | **Hearth** | **PSAP Control Center** |
 |---|---|---|
 | GPU cluster discovery | Manages `FournosCluster` CRDs on a central management cluster | Reads CRDs via `/api/v1/hearth/clusters` for parallel GPU inventory (clusters must still be added to Control Center manually) |
+| Test execution | Reconciles `FournosJob` resources and creates Tekton resources | Submits jobs, presents live state and logs, and archives completed runs for history |
+| Test scheduling | Reconciles recurring jobs and cluster locks | Provides scheduling, lock, slot-hold, and child-run workflows |
 | Cluster lifecycle | Provisions and decommissions bare-metal/cloud GPU nodes | No lifecycle control — read-only consumer of cluster metadata |
 | Hardware inventory | Source of truth for node count, GPU model, driver version | Caches the data locally; refreshes on demand or periodic poll |
 | Reservation / scheduling | No concept of reservations | Full ownership: conflict detection, calendar, enforcement |
@@ -41,7 +44,7 @@ It provides:
                                ▼
 ┌──────────────────────────────────────────────────────────────┐
 │                     OpenShift Route (TLS)                    │
-│     control-center.apps.psap-automation.ibm.rhperfscale.org  │
+│                  control-center.<apps-domain>                 │
 └──────────────────────────────┬───────────────────────────────┘
                                │
                                ▼
@@ -68,12 +71,13 @@ It provides:
 │    │  /api/v1/clusters/*     Cluster management         │    │
 │    │  /api/v1/reservations/* Reservation management     │    │
 │    │  /api/v1/hearth/*       Hearth integration         │    │
+│    │  /api/v1/fournos/*      Testing workflows          │    │
 │    └───────┬──────────────────┬────────────────┬────────┘    │
 │            │                  │                │             │
 │            ▼                  ▼                ▼             │
 │     ┌──────────┐    ┌──────────────┐   ┌────────────┐       │
-│     │  SQLite  │    │  Kubeconfigs │   │ Kubernetes │       │
-│     │   (PVC)  │    │    (PVC)     │   │  API calls │       │
+│     │PostgreSQL│    │  Kubeconfigs │   │ Kubernetes │       │
+│     │(prod DB) │    │    (PVC)     │   │  API calls │       │
 │     └──────────┘    └──────────────┘   └─────┬──────┘       │
 └──────────────────────────────────────────────┼───────────────┘
                                                │
@@ -100,7 +104,7 @@ It provides:
 | Database    | SQLite (dev) / PostgreSQL (prod)      |
 | K8s Client  | kubernetes-python 29.0                |
 | HTTP Client | httpx 0.26 (for OCP OAuth flows)      |
-| Auth        | HTTP Basic Auth                       |
+| Auth        | HttpOnly JWT session cookies (admin/user roles) |
 | Logging     | Custom structured logger              |
 
 ### Project Structure
@@ -111,28 +115,39 @@ backend/app/
 ├── core/
 │   ├── config.py            # Settings (env vars / .env)
 │   ├── database.py          # Async engine, session factory, init_db
-│   └── auth.py              # require_auth dependency (Basic Auth)
+│   └── auth.py              # Session token handling and role dependencies
 ├── models/
 │   ├── cluster.py           # Cluster ORM model
+│   ├── fournos_job.py       # Archived Fournos run model
 │   ├── reservation.py       # Reservation ORM model + status enum
 │   └── user.py              # User ORM model (reserved for future use)
 ├── schemas/
 │   ├── cluster.py           # Cluster request/response DTOs
+│   ├── fournos.py           # Job, schedule, lock, and run DTOs
 │   ├── reservation.py       # Reservation DTOs with validation
-│   └── hearth.py            # Hearth/FournosCluster DTOs
+│   ├── hearth.py            # Hearth/FournosCluster DTOs
+│   └── ui_schema.py         # Forge submission form schema
 ├── services/
 │   ├── cluster_service.py      # Cluster CRUD, status refresh
 │   ├── reservation_service.py  # Reservations, type-aware conflicts, calendar
 │   ├── enforcement_service.py  # Namespace lifecycle, ResourceQuota, DRA templates
 │   ├── kubernetes_service.py   # K8s/OCP API wrapper (DRA, GPU allocation, namespace mgmt)
-│   └── hearth_service.py       # FournosCluster CRD reader
+│   ├── hearth_service.py       # FournosCluster CRD reader
+│   ├── fournos_k8s_client.py   # Fournos/Tekton management-cluster client
+│   ├── fournos_db_service.py   # Archived run queries and persistence
+│   ├── fournos_watcher.py      # Terminal-job archive reconciler
+│   ├── forge_discovery.py      # Forge project discovery
+│   ├── github_sync_service.py  # Forge metadata background sync
+│   ├── pipeline_definitions.py # Pipeline definitions and stage mapping
+│   └── slot_hold_service.py    # Scheduling slot coordination
 ├── api/
 │   ├── __init__.py          # Router aggregation
 │   ├── health.py            # GET /health
-│   ├── auth.py              # GET /auth/check
+│   ├── auth.py              # Login, logout, and current-session endpoints
 │   ├── clusters.py          # Cluster endpoints
 │   ├── reservations.py      # Reservation endpoints
-│   └── hearth.py            # Hearth endpoints
+│   ├── hearth.py            # Hearth endpoints
+│   └── fournos.py           # Testing endpoints
 └── utils/
     └── logger.py            # Structured logging utility
 ```
@@ -141,7 +156,10 @@ backend/app/
 
 All endpoints live under `/api/v1`. OpenAPI docs available at `/docs`.
 
-**Authentication model**: GET endpoints are public (view-only). Most POST, PUT, DELETE endpoints require HTTP Basic Auth (exception: `POST /clusters/{id}/refresh` is public).
+**Authentication model**: Read-only endpoints are generally public. Login
+creates an HttpOnly JWT session cookie. Reservation mutations require a signed-in
+user, while cluster management, approvals, Hearth configuration, settings,
+billing, and cost-management operations require the `admin` role.
 
 #### Cluster Endpoints (`/api/v1/clusters`)
 
@@ -188,6 +206,26 @@ All endpoints live under `/api/v1`. OpenAPI docs available at `/docs`.
 | POST   | `/disconnect`                | Yes  | Remove Hearth connection             |
 | GET    | `/clusters`                  | No   | List FournosCluster CRDs             |
 | GET    | `/clusters/{name}`           | No   | Get specific FournosCluster          |
+
+#### Fournos Testing Endpoints (`/api/v1/fournos`)
+
+| Method | Path | Auth | Description |
+| ------ | ---- | ---- | ----------- |
+| GET | `/runs` | No | Paginated live or archived jobs with filters and sorting |
+| GET | `/jobs/{name}` | No | Job detail, stages, pods, and artifact metadata |
+| GET | `/jobs/{name}/events` | No | Job and pod events |
+| GET | `/jobs/{name}/logs/{pod}` | No | Stream pod logs with server-sent events |
+| POST | `/jobs/{name}/cancel` | Admin | Cancel a live job |
+| POST | `/jobs/{name}/rerun` | Admin | Recreate a completed job |
+| DELETE | `/history/{name}` | Admin | Delete an archived job |
+| POST | `/submit` | User | Submit one job, defer it, or create a recurring parent |
+| POST | `/submit-matrix` | User | Submit a matrix of jobs |
+| GET | `/projects`, `/pipelines` | No | Discover Forge projects, schemas, and pipelines |
+| GET | `/recurring-jobs` | No | List recurring jobs; creation uses `/submit` |
+| GET/POST | `/cluster-locks` | No / User | List or create cluster locks |
+| DELETE | `/cluster-locks/{name}` | Admin | Release a cluster lock |
+| GET | `/clusters/{cluster}/overview` | No | Current jobs, schedules, and locks for a cluster |
+| GET/POST/DELETE | `/clusters/{cluster}/slot-holds` | No / User | Coordinate short-lived scheduling-calendar holds |
 
 ### Data Model
 
@@ -339,24 +377,30 @@ frontend/src/
 ├── components/
 │   ├── Layout.tsx           # App shell: sidebar, header, auth UI
 │   ├── LoginModal.tsx       # Sign-in dialog
-│   └── HearthConnectModal.tsx  # Hearth kubeconfig upload
+│   ├── HearthConnectModal.tsx  # Hearth connection setup/replacement
+│   ├── DynamicSubmitForm.tsx   # Schema-driven Forge fields
+│   ├── SchedulingCalendar.tsx  # Deferred-run slot selection
+│   └── YamlPreview.tsx         # Submission review
 ├── pages/
 │   ├── Dashboard.tsx        # Stats, reservations, Hearth GPUs
 │   ├── Clusters.tsx         # Cluster grid + add modal
 │   ├── ClusterDetail.tsx    # Deep cluster view with tabs
 │   ├── Reservations.tsx     # Reservation management + mini calendar
 │   ├── Calendar.tsx         # Full calendar (month/week/day)
-│   ├── Testing.tsx          # Placeholder
+│   ├── Testing.tsx          # Live, history, submit, schedules, locks
+│   ├── TestingJobDetail.tsx # Pipeline, pod, event, log, artifact detail
+│   ├── ScheduleRuns.tsx     # Recurring parent child-run history
 │   └── Results.tsx          # Placeholder
 ├── hooks/
 │   ├── useClusters.ts       # Cluster queries + mutations
 │   ├── useReservations.ts   # Reservation queries + mutations
 │   ├── useGpuStatus.ts      # Live GPU allocation query (per-cluster)
-│   └── useHearth.ts         # Hearth queries + mutations
+│   ├── useHearth.ts         # Hearth queries + mutations
+│   └── useFournos.ts        # Testing queries, mutations, and polling
 ├── services/
 │   └── api.ts               # Axios instance + API functions
 ├── stores/
-│   └── authStore.ts         # Credential management (sessionStorage)
+│   └── authStore.ts         # In-memory session identity and role
 ├── types/
 │   └── index.ts             # Shared TypeScript interfaces
 └── utils/
@@ -375,16 +419,15 @@ User clicks "Sign In"
 User enters username/password
         │
         ▼
-GET /api/v1/auth/check (with Basic Auth header)
+POST /api/v1/auth/login
         │
    ┌────┴────┐
    │         │
  200 OK    401 Unauthorized
    │         │
    ▼         ▼
-Credentials  Toast error
-stored in    "Invalid credentials"
-sessionStorage
+HttpOnly JWT Toast error
+cookie set   "Invalid credentials"
    │
    ▼
 auth-change event dispatched
@@ -392,11 +435,12 @@ auth-change event dispatched
    ▼
 Layout re-renders:
   - Header shows username + "Sign Out"
-  - Axios interceptor attaches Basic Auth
-    header on all non-GET requests
+  - Browser sends the session cookie on API requests
 ```
 
-Credentials persist for the browser session only (sessionStorage). Closing the tab clears them.
+The browser never stores the password. On page load, `/api/v1/auth/me`
+reconstructs the in-memory UI session from the signed cookie. The default
+session lifetime is eight hours.
 
 ### Data Flow
 
@@ -406,8 +450,47 @@ All data fetching uses TanStack Query with automatic caching, refetching, and ca
 - **Cluster occupancy**: polls every 30 seconds
 - **Topology/OCP/operators**: 60-second stale time
 - **Workloads**: 30-second stale time
+- **Live Fournos jobs**: polls every 5 seconds
+- **Recurring jobs and cluster locks**: polls every 30 seconds
 
 Mutations (create, update, delete) automatically invalidate related query caches and show success/error toasts.
+
+---
+
+## Fournos Testing Integration
+
+The Testing workspace uses the management-cluster kubeconfig saved by the
+Hearth connection. All Kubernetes and GitHub access happens in the backend;
+the frontend receives normalized API responses and never receives cluster
+credentials.
+
+```
+React Testing workspace
+        │
+        │ /api/v1/fournos/*
+        ▼
+FastAPI backend
+  ├── live reads/writes ───────────────► FournosJob and Tekton resources
+  ├── terminal-job watcher (60 seconds) ─► archived job rows in the database
+  └── Forge metadata sync ─────────────► project schemas, pipelines, open PRs
+```
+
+- **Live Jobs** reads Kubernetes resources directly and polls every five
+  seconds. Job details combine the `FournosJob`, Tekton `TaskRun` and pod state,
+  Kubernetes events, and server-sent log streams.
+- **History** queries watcher-created database records. The watcher snapshots
+  terminal stages, events, duration, artifact links, and MLflow links so the
+  list remains available after the live resource is removed.
+- **Submit Job** discovers projects and pipeline definitions from Forge. A
+  project's `ui/submit.yaml` controls the form fields; submissions may run now,
+  at a future time, on a cron schedule, or as a parameter matrix.
+- **Schedules/Locks** reads recurring parents and lock-only `FournosJob`
+  resources. Child-run history comes from the archive database, and ephemeral
+  slot holds prevent two users from selecting the same scheduling slot at once.
+
+Public users may view testing data. Authenticated users may submit jobs, create
+locks, and hold slots. Destructive job, history, schedule, and lock operations
+require the administrator role.
 
 ---
 
@@ -452,31 +535,40 @@ Hearth data is surfaced in:
 
 | Property  | Value                                                          |
 | --------- | -------------------------------------------------------------- |
-| Cluster   | `psap-automation.ibm.rhperfscale.org`                          |
+| Cluster   | Environment-specific production OpenShift cluster              |
 | Namespace | `psap-control-center`                                          |
-| URL       | `https://control-center.apps.psap-automation.ibm.rhperfscale.org` |
+| URL       | `https://control-center.<apps-domain>`                          |
 
 ### Resource Inventory
 
-| Kind        | Name                               | Purpose                         |
-| ----------- | ---------------------------------- | ------------------------------- |
-| Secret      | `psap-control-center-admin`        | ADMIN_USERNAME, ADMIN_PASSWORD  |
-| Secret      | `psap-control-center-config`       | SECRET_KEY, DATABASE_URL, LOG_LEVEL |
-| PVC         | `psap-control-center-data`         | SQLite database (1Gi)           |
-| PVC         | `psap-control-center-kubeconfigs`  | Kubeconfig files (100Mi)        |
-| BuildConfig | `psap-control-center-backend`      | Binary build from ./backend     |
-| BuildConfig | `psap-control-center-frontend`     | Binary build from ./frontend    |
-| Deployment  | `psap-control-center-backend`      | FastAPI (port 8000), 1 replica  |
-| Deployment  | `psap-control-center-frontend`     | Nginx (port 8080), 1 replica    |
-| Service     | `psap-control-center-backend`      | ClusterIP, port 8000            |
-| Service     | `psap-control-center-frontend`     | ClusterIP, port 8080            |
-| Route       | `psap-control-center`              | Edge TLS termination            |
+| Kind       | Name                               | Purpose |
+| ---------- | ---------------------------------- | ------- |
+| Secret     | `psap-control-center-admin`        | Admin and user account credentials |
+| Secret     | `psap-control-center-config`       | Signing key, database URL, and runtime configuration |
+| PVC        | `postgresql`                       | PostgreSQL data (5Gi) |
+| PVC        | `psap-control-center-data`         | Application and billing data (2Gi) |
+| PVC        | `psap-control-center-kubeconfigs`  | Managed-cluster kubeconfigs (1Gi) |
+| Deployment | `postgresql`                       | Production database |
+| Deployment | `psap-control-center-backend`      | FastAPI on port 8000, one replica |
+| Deployment | `psap-control-center-frontend`     | Nginx on port 8080, one replica |
+| Service    | `postgresql`                       | ClusterIP on port 5432 |
+| Service    | `psap-control-center-backend`      | ClusterIP on port 8000 |
+| Service    | `psap-control-center-frontend`     | ClusterIP on port 8080 |
+| Route      | `psap-control-center`              | Edge TLS termination |
+| CronJob    | `image-updater`                    | Poll Quay digests and restart changed deployments |
 
 ### Container Images
 
-**Backend**: `python:3.11-slim` with FastAPI/Uvicorn. Built via `oc start-build --from-dir=./backend`. Image stored in the OCP internal registry.
+**Backend**: `python:3.11-slim` with FastAPI/Uvicorn, published to
+`quay.io/redhat-performance/psap-control-center-backend:latest`.
 
-**Frontend**: Multi-stage build — `node:20-alpine` compiles the React app, then `nginxinc/nginx-unprivileged:alpine` serves static files and proxies `/api` to the backend service. Runs as non-root (OCP security requirement).
+**Frontend**: GitHub Actions compiles the React app with Node.js 20, then
+packages it in `nginxinc/nginx-unprivileged:alpine` and publishes
+`quay.io/redhat-performance/psap-control-center-frontend:latest`.
+
+Pushes to `main` publish both images. The in-cluster image updater checks Quay
+every two minutes and restarts a deployment when its tag resolves to a new
+digest.
 
 ### Traffic Flow
 
@@ -493,21 +585,17 @@ psap-control-center-frontend (nginx:8080)
       │
       └── /api/* → psap-control-center-backend:8000 (reverse proxy)
                       │
-                      ├── SQLite DB (PVC: psap-control-center-data)
+                      ├── PostgreSQL service (PVC: postgresql)
+                      ├── App/billing data (PVC: psap-control-center-data)
                       ├── Kubeconfigs (PVC: psap-control-center-kubeconfigs)
-                      └── K8s API calls → managed clusters
+                      ├── K8s API calls → managed clusters
+                      └── CRD/job calls → Hearth/Fournos management cluster
 ```
 
 ### Rebuilding
 
-After code changes, rebuild and deploy without downtime:
-
-```bash
-oc start-build psap-control-center-backend --from-dir=./backend --follow
-oc start-build psap-control-center-frontend --from-dir=./frontend --follow
-```
-
-Pods restart automatically when new images are pushed to the internal registry.
+Merges to `main` trigger `.github/workflows/prod-deploy.yml`. For manual image
+build and rollout instructions, see [deploy/README.md](../deploy/README.md).
 
 ---
 
@@ -515,19 +603,32 @@ Pods restart automatically when new images are pushed to the internal registry.
 
 All configuration is via environment variables, loaded by Pydantic Settings:
 
-| Variable                 | Default                           | Description                        |
-| ------------------------ | --------------------------------- | ---------------------------------- |
-| `SECRET_KEY`             | (change in production)            | Application secret key             |
-| `DATABASE_URL`           | `sqlite+aiosqlite:///./psap...db` | Async database URL                 |
-| `KUBECONFIG_STORAGE_PATH`| `./kubeconfigs`                   | Directory for kubeconfig files     |
-| `ADMIN_USERNAME`         | `admin`                           | Basic Auth username for writes     |
-| `ADMIN_PASSWORD`         | `admin`                           | Basic Auth password for writes     |
-| `LOG_LEVEL`              | `INFO`                            | Logging level (ERROR/WARN/INFO/DEBUG) |
-| `MLFLOW_BASE_URL`        | (optional)                        | MLFlow server for results page     |
-| `HEARTH_ENABLED`         | (optional)                        | Enable Hearth integration          |
-| `HEARTH_NAMESPACE`       | `hearth`                          | Namespace for FournosCluster CRDs  |
-| `HEARTH_KUBECONFIG_PATH` | (optional)                        | Path to management cluster kubeconfig |
-| `VITE_LOG_LEVEL`         | `INFO`                            | Frontend log level                 |
+| Variable | Default | Description |
+| -------- | ------- | ----------- |
+| `SECRET_KEY` | Development placeholder | JWT signing key; replace in production |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | `480` | Session lifetime in minutes |
+| `DATABASE_URL` | Local SQLite URL | Async database URL |
+| `KUBECONFIG_STORAGE_PATH` | `./kubeconfigs` | Kubeconfig directory |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | Required | Administrator account |
+| `USER_USERNAME` / `USER_PASSWORD` | Required | Standard user account |
+| `LOG_LEVEL` | `INFO` | Logging level: ERROR, WARN, INFO, or DEBUG |
+| `MLFLOW_BASE_URL` | Optional | Reserved for the Results integration |
+| `HEARTH_ENABLED` | `true` | Enable Hearth integration |
+| `HEARTH_NAMESPACE` | `hearth` | Namespace for `FournosCluster` resources |
+| `HEARTH_KUBECONFIG_PATH` | Optional | Externally managed management-cluster kubeconfig |
+| `FOURNOS_NAMESPACE` | `psap-automation` | Namespace for `FournosJob` and Tekton resources |
+| `FOURNOS_API_GROUP` / `FOURNOS_API_VERSION` | `fournos.dev` / `v1` | Fournos custom-resource API |
+| `FOURNOS_JOB_PLURAL` | `fournosjobs` | Fournos job resource plural |
+| `FOURNOS_K8S_TIMEOUT` | `30` | Kubernetes API timeout in seconds |
+| `FORGE_REPO_PATH` | Optional | Local Forge checkout; when unset, discovery uses GitHub |
+| `FORGE_PROJECTS_CONFIG_PATH` | `/etc/fournos-dashboard/projects.yaml` | Optional project catalog path |
+| `FORGE_GITHUB_REPO` / `FORGE_GITHUB_REF` | `openshift-psap/forge` / `main` | Forge repository and content ref |
+| `GITHUB_TOKEN` | Optional | Token for authenticated GitHub requests |
+| `GITHUB_SYNC_INTERVAL_SECONDS` | `3600` | Successful metadata sync interval |
+| `GITHUB_SYNC_FAILURE_BACKOFF_SECONDS` | `300` | Failed metadata sync retry delay |
+| `FOURNOS_DEFAULT_PIPELINES` | Built-in list | Fallback comma-separated pipelines |
+| `BILLING_CSV_STORAGE_PATH` | `./billing_csvs` | Billing report storage |
+| `VITE_LOG_LEVEL` | `INFO` | Frontend build-time log level |
 
 On OCP, sensitive values are stored in Kubernetes Secrets and injected as environment variables via `envFrom`.
 
@@ -537,7 +638,7 @@ On OCP, sensitive values are stored in Kubernetes Secrets and injected as enviro
 
 ### Prerequisites
 
-- Python 3.9+ with virtualenv
+- Python 3.11 with virtualenv
 - Node.js 20+
 - npm
 
@@ -548,6 +649,7 @@ On OCP, sensitive values are stored in Kubernetes Secrets and injected as enviro
 cd backend
 source venv/bin/activate
 LOG_LEVEL=INFO ADMIN_USERNAME=admin ADMIN_PASSWORD=admin \
+  USER_USERNAME=user USER_PASSWORD=user \
   python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 # Frontend (separate terminal)
@@ -561,17 +663,15 @@ npm run dev
 ### Docker Compose
 
 ```bash
-docker-compose up          # Production build
-docker-compose -f docker-compose.dev.yml up  # Dev with hot reload
+docker compose up          # Production-style local build
+docker compose -f docker-compose.dev.yml up  # Dev with hot reload
 ```
 
 ---
 
 ## Future / Planned
 
-- **Per-user RBAC**: Fine-grained access control for namespaces and reservations
-- **Testing page**: Automated test execution (TOPSAIL, vLLM benchmarks, MLPerf)
+- **Custom Testing job definitions**: Non-Forge submission forms and workflows
 - **Results page**: MLFlow integration for test results visualization
-- **User model**: Per-user accounts with JWT auth (model and deps exist but are not wired up)
-- **PostgreSQL**: Supported by the codebase for multi-replica production deployments
+- **Fine-grained RBAC**: More granular permissions beyond the current admin/user roles
 - **Alembic migrations**: Currently using manual ALTER TABLE; planned migration to Alembic for production
