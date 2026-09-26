@@ -36,6 +36,7 @@ import YamlPreview from '../components/YamlPreview'
 import SearchableSelect from '../components/SearchableSelect'
 import EditableCombobox from '../components/EditableCombobox'
 import { buildSingleJobPreview, toYamlPreview, withVersionOverride } from '../utils/fournosJobPreview'
+import { workItemFromInput } from '../utils/workItems'
 import {
   useFournosJobs,
   useRecurringJobs,
@@ -60,6 +61,7 @@ import {
   useHistoryFilterOptions,
   useSaveHistoryPreference,
   useResetHistoryPreference,
+  useWorkItemConfig,
 } from '../hooks/useFournos'
 import type {
   FournosJobSummary,
@@ -168,6 +170,8 @@ const DEFAULT_HISTORY_VIEW: HistoryViewState = {
   pr_number: null,
   source_sha: '',
   forge: '',
+  work_item_provider: '',
+  work_item_key: '',
   tags: [],
   history_date: '',
   from_time: '00:00',
@@ -179,7 +183,7 @@ const DEFAULT_HISTORY_VIEW: HistoryViewState = {
 
 const HISTORY_URL_KEYS = [
   'q', 'project', 'cluster', 'status', 'scope', 'identity', 'failure',
-  'repository', 'pr', 'sha', 'forge', 'tags', 'date', 'from', 'to',
+  'repository', 'pr', 'sha', 'forge', 'work_provider', 'work_item', 'tags', 'date', 'from', 'to',
   'sort', 'dir', 'per_page', 'page',
 ] as const
 
@@ -208,6 +212,8 @@ function historyViewFromParams(params: URLSearchParams): HistoryViewState {
     pr_number: Number.isInteger(parsedPr) && parsedPr > 0 ? parsedPr : null,
     source_sha: /^[0-9a-fA-F]{4,64}$/.test(sourceSha) ? sourceSha : '',
     forge: params.get('forge') || '',
+    work_item_provider: params.get('work_provider') || '',
+    work_item_key: params.get('work_item') || '',
     tags: (params.get('tags') || '').split(',').map((tag) => tag.trim()).filter(Boolean).slice(0, 20),
     history_date: params.get('date') || '',
     from_time: params.get('from') || '00:00',
@@ -474,6 +480,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
   const { data: githubSyncStatus } = useGithubSyncStatus()
   const refreshGithubSync = useRefreshGithubSync()
   const submitJob = useSubmitJob()
+  const { data: workItemConfig } = useWorkItemConfig()
 
   // "Basics" — common to every project, owned here so there is exactly one
   // wizard/step indicator (DynamicSubmitForm only renders steps 2 and 3,
@@ -491,6 +498,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
   const [selectedPR, setSelectedPR] = useState<GitHubPR | null>(null)
   const [prSearch, setPrSearch] = useState('')
   const [prDropdownOpen, setPrDropdownOpen] = useState(false)
+  const [workItemInput, setWorkItemInput] = useState('')
   // step 1 = "what do you want to do" (Lock / Forge Job / Custom Job).
   // For jobType === 'forge': 2 = Basics, 3 = Project Details, 4 = Review & Submit.
   // For jobType === 'lock': 2 = pick a cluster + inspect/manage its locks.
@@ -590,6 +598,11 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
     requested_sha: selectedPR.head_sha,
   } : null
 
+  const workItems = useMemo(() => {
+    const item = workItemFromInput(workItemInput)
+    return item ? [item] : []
+  }, [workItemInput])
+
   const configOverrides = useMemo(() => {
     const overrides: Record<string, string> = {}
     configRaw.split('\n').forEach((line: string) => {
@@ -618,6 +631,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
         config_overrides: overrides,
         pull_request: pullRequest,
         pull_sha: pullSha,
+        work_items: workItems,
         schedule: scheduling.mode === 'recurring' ? scheduling.scheduleUtc : '',
         scheduled_start_time: scheduling.mode === 'defer' ? scheduling.scheduledStartTimeUtc : null,
       })
@@ -985,6 +999,25 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
             )}
           </div>
 
+          {workItemConfig?.enabled && (
+            <div>
+              <label className="block text-sm font-medium text-gray-700">
+                Jira work item (optional)
+              </label>
+              <input
+                type="text"
+                value={workItemInput}
+                onChange={(e) => setWorkItemInput(e.target.value)}
+                className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm"
+                placeholder="PROJECT-123 or an allowed Jira URL"
+                maxLength={1024}
+              />
+              <p className="mt-1 text-xs text-gray-400">
+                Associates an existing issue; Control Center will not modify Jira.
+              </p>
+            </div>
+          )}
+
           <div className="flex items-center justify-between pt-2">
             <button
               type="button"
@@ -1025,7 +1058,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
         <DynamicSubmitForm
           project={project}
           schema={dynamicSchema}
-          basics={{ cluster, pipeline, owner, priority, exclusive, pullSha, pullRequest, prLabel: prSearch || pullSha, scheduling }}
+          basics={{ cluster, pipeline, owner, priority, exclusive, pullSha, pullRequest, prLabel: prSearch || pullSha, scheduling, workItems }}
           step={step - 1}
           onBack={() => setStep(step - 1)}
           onNext={() => setStep(step + 1)}
@@ -1096,6 +1129,9 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
               <ReviewRow label="Priority" value={priority} />
               {exclusive && <ReviewRow label="Exclusive" value="Yes" />}
               {pullSha && <ReviewRow label="Pull Request" value={prSearch || pullSha} mono={!prSearch} />}
+              {workItems.map((item) => (
+                <ReviewRow key={`${item.provider}-${item.key || item.url}`} label="Work item" value={item.key || item.url} />
+              ))}
               <ReviewRow
                 label="Schedule"
                 value={
@@ -1483,6 +1519,8 @@ export default function Testing() {
   const [historyPrNumber, setHistoryPrNumber] = useState(initialHistory.pr_number ? String(initialHistory.pr_number) : '')
   const [historySourceSha, setHistorySourceSha] = useState(initialHistory.source_sha)
   const [historyForge, setHistoryForge] = useState(initialHistory.forge)
+  const [historyWorkItemProvider, setHistoryWorkItemProvider] = useState(initialHistory.work_item_provider)
+  const [historyWorkItemKey, setHistoryWorkItemKey] = useState(initialHistory.work_item_key)
   const [historyTags, setHistoryTags] = useState(initialHistory.tags.join(', '))
   const [historyPerPage, setHistoryPerPage] = useState(initialHistory.per_page)
   const authenticated = isAuthenticated()
@@ -1539,6 +1577,8 @@ export default function Testing() {
       pr_number: Number.isInteger(prNumber) && prNumber > 0 ? prNumber : null,
       source_sha: historySourceSha.trim(),
       forge: historyForge.trim(),
+      work_item_provider: historyWorkItemProvider.trim(),
+      work_item_key: historyWorkItemKey.trim().toUpperCase(),
       tags: historyTags.split(',').map((tag) => tag.trim()).filter(Boolean).slice(0, 20),
       history_date: historyDate,
       from_time: historyFromTime,
@@ -1550,7 +1590,7 @@ export default function Testing() {
   }, [
     historyQuery, filterProject, filterCluster, filterStatus, requesterScope,
     historyIdentity, historyFailure, historyRepository, historyPrNumber,
-    historySourceSha, historyForge, historyTags, historyDate,
+    historySourceSha, historyForge, historyWorkItemProvider, historyWorkItemKey, historyTags, historyDate,
     historyFromTime, historyToTime, historySort, historyPerPage,
   ])
 
@@ -1566,6 +1606,8 @@ export default function Testing() {
     setHistoryPrNumber(state.pr_number ? String(state.pr_number) : '')
     setHistorySourceSha(state.source_sha)
     setHistoryForge(state.forge)
+    setHistoryWorkItemProvider(state.work_item_provider)
+    setHistoryWorkItemKey(state.work_item_key)
     setHistoryTags(state.tags.join(', '))
     setHistoryDate(state.history_date)
     setHistoryFromTime(state.from_time)
@@ -1672,6 +1714,8 @@ export default function Testing() {
     setWhen('pr', String(historyViewState.pr_number || ''), historyViewState.pr_number !== null)
     setWhen('sha', historyViewState.source_sha)
     setWhen('forge', historyViewState.forge)
+    setWhen('work_provider', historyViewState.work_item_provider, authenticated && Boolean(historyViewState.work_item_provider))
+    setWhen('work_item', historyViewState.work_item_key, authenticated && Boolean(historyViewState.work_item_key))
     setWhen('tags', historyViewState.tags.join(','), historyViewState.tags.length > 0)
     setWhen('date', historyViewState.history_date)
     setWhen('from', historyViewState.from_time, Boolean(historyViewState.history_date) && historyViewState.from_time !== '00:00')
@@ -1707,8 +1751,10 @@ export default function Testing() {
     if (!authenticated) {
       if (requesterScope === 'mine') setRequesterScope('all')
       if (historyIdentity) setHistoryIdentity('')
+      if (historyWorkItemProvider) setHistoryWorkItemProvider('')
+      if (historyWorkItemKey) setHistoryWorkItemKey('')
     }
-  }, [authenticated, requesterScope, historyIdentity])
+  }, [authenticated, requesterScope, historyIdentity, historyWorkItemProvider, historyWorkItemKey])
 
   const { data: clustersData } = useClusters()
   const { data: forgeProjects } = useForgeProjects()
@@ -1751,6 +1797,8 @@ export default function Testing() {
     pr_number: activeTab === 'history' ? historyViewState.pr_number ?? undefined : undefined,
     source_sha: activeTab === 'history' && /^[0-9a-fA-F]{4,64}$/.test(debouncedTextFilters.sourceSha) ? debouncedTextFilters.sourceSha : undefined,
     forge: activeTab === 'history' ? debouncedTextFilters.forge || undefined : undefined,
+    work_item_provider: activeTab === 'history' && authenticated ? historyWorkItemProvider || undefined : undefined,
+    work_item_key: activeTab === 'history' && authenticated ? historyWorkItemKey || undefined : undefined,
     tags: activeTab === 'history' ? debouncedTextFilters.tags || undefined : undefined,
     start_time: historyStartUtc,
     end_time: historyEndUtc,
@@ -1784,6 +1832,8 @@ export default function Testing() {
     setHistoryPrNumber('')
     setHistorySourceSha('')
     setHistoryForge('')
+    setHistoryWorkItemProvider('')
+    setHistoryWorkItemKey('')
     setHistoryTags('')
     setHistoryDate('')
     setHistoryFromTime('00:00')
@@ -2008,6 +2058,26 @@ export default function Testing() {
                   placeholder="Forge version or image digest"
                   ariaLabel="Forge version or image digest"
                 />
+                {authenticated && (
+                  <EditableCombobox
+                    value={historyWorkItemProvider}
+                    maxLength={50}
+                    onChange={(value) => { setHistoryWorkItemProvider(value.toLowerCase()); setPage(1) }}
+                    options={historyFilterOptions?.work_item_providers || ['jira']}
+                    placeholder="Work-item provider"
+                    ariaLabel="Work-item provider"
+                  />
+                )}
+                {authenticated && (
+                  <EditableCombobox
+                    value={historyWorkItemKey}
+                    maxLength={100}
+                    onChange={(value) => { setHistoryWorkItemKey(value.toUpperCase()); setPage(1) }}
+                    options={historyFilterOptions?.work_item_keys || []}
+                    placeholder="Work-item key"
+                    ariaLabel="Work-item key"
+                  />
+                )}
                 <EditableCombobox
                   value={historyTags}
                   onChange={(value) => { setHistoryTags(value); setPage(1) }}
@@ -2021,7 +2091,7 @@ export default function Testing() {
           )}
           {(
             (activeTab === 'live' && (filterProject || filterCluster || filterStatus || requesterScope === 'mine')) ||
-            (activeTab === 'history' && (filterProject || filterCluster || filterStatus || historyDate || requesterScope === 'mine' || historyQuery || historyIdentity || historyFailure || historyRepository || historyPrNumber || historySourceSha || historyForge || historyTags))
+            (activeTab === 'history' && (filterProject || filterCluster || filterStatus || historyDate || requesterScope === 'mine' || historyQuery || historyIdentity || historyFailure || historyRepository || historyPrNumber || historySourceSha || historyForge || historyWorkItemProvider || historyWorkItemKey || historyTags))
           ) && (
             <button
               onClick={activeTab === 'history' ? clearHistoryFilters : () => {

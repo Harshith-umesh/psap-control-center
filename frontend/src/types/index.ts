@@ -460,6 +460,18 @@ export interface FournosJobSummary {
   forge_git_version: string
   forge_image_digest: string
   forge_provenance_state: string
+  work_items: WorkItemReference[]
+}
+
+export interface WorkItemReference {
+  provider: string
+  key: string
+  url: string
+}
+
+export interface WorkItemConfig {
+  enabled: boolean
+  providers: string[]
 }
 
 export interface FournosJobListResponse {
@@ -481,6 +493,8 @@ export interface HistoryViewState {
   pr_number: number | null
   source_sha: string
   forge: string
+  work_item_provider: string
+  work_item_key: string
   tags: string[]
   history_date: string
   from_time: string
@@ -503,6 +517,8 @@ export interface HistoryFilterOptionsResponse {
   source_shas: string[]
   forge: string[]
   tags: string[]
+  work_item_providers: string[]
+  work_item_keys: string[]
 }
 
 export interface AuthConfig {
@@ -610,6 +626,8 @@ export interface FournosJobDetailResponse {
   failure_enrichment_state: string
   forge_execution: ForgeExecutionProvenance
   forge_provenance_state: string
+  work_items: WorkItemReference[]
+  can_edit_work_items: boolean
 }
 
 export interface FournosJobEvent {
@@ -750,6 +768,7 @@ export interface SubmitJobRequest {
   scheduled_start_time?: string | null
   /** Cron expression, UTC — mutually exclusive with `scheduled_start_time`. Makes this a recurring template. */
   schedule?: string
+  work_items?: WorkItemReference[]
 }
 
 export interface SubmitJobResponse {
@@ -785,6 +804,7 @@ export interface SubmitMatrixRequest {
   gpu_type: string
   scheduled_start_time?: string | null
   schedule?: string
+  work_items?: WorkItemReference[]
 }
 
 export interface SubmitMatrixResultItem {

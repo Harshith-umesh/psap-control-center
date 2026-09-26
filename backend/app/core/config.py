@@ -72,6 +72,12 @@ class Settings(BaseSettings):
 
     FOURNOS_DEFAULT_PIPELINES: str = "forge-full,forge-prepare-test,forge-test-only,forge-prepare-only,forge-replot,nightly"
 
+    # Optional, read-only external work-item associations for test runs.
+    # Hosts are deployment configuration rather than UI constants so each
+    # environment can explicitly choose which Jira deployment it trusts.
+    WORK_ITEM_ALLOWED_HOSTS: str = ""
+    WORK_ITEM_JIRA_BASE_URL: Optional[str] = None
+
     class Config:
         env_file = ".env"
         case_sensitive = True

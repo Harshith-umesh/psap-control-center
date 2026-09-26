@@ -22,6 +22,8 @@ import type {
   HistoryPreferenceResponse,
   HistoryFilterOptionsResponse,
   HistoryViewState,
+  WorkItemConfig,
+  WorkItemReference,
 } from '../types'
 
 // ─── Jobs ──────────────────────────────────────────────────────────────
@@ -40,6 +42,8 @@ export function useFournosJobs(params: {
   pr_number?: number
   source_sha?: string
   forge?: string
+  work_item_provider?: string
+  work_item_key?: string
   tags?: string
   start_time?: string
   end_time?: string
@@ -104,6 +108,29 @@ export function useFournosJob(name: string | undefined) {
     queryFn: () => fournosApi.getJob(name!),
     enabled: !!name,
     refetchInterval: 5000,
+  })
+}
+
+export function useWorkItemConfig() {
+  return useQuery<WorkItemConfig>({
+    queryKey: ['fournos-work-item-config'],
+    queryFn: () => fournosApi.getWorkItemConfig(),
+    staleTime: Infinity,
+    retry: 1,
+  })
+}
+
+export function useUpdateJobWorkItems(name: string | undefined) {
+  const qc = useQueryClient()
+  return useMutation<WorkItemReference[], Error, WorkItemReference[]>({
+    mutationFn: (workItems) => fournosApi.updateJobWorkItems(name!, workItems),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['fournos-job', name] })
+      qc.invalidateQueries({ queryKey: ['fournos-jobs'] })
+      qc.invalidateQueries({ queryKey: ['fournos-history-filter-options'] })
+      toast.success('Work-item associations updated')
+    },
+    onError: (error) => toast.error(error.message || 'Failed to update work items'),
   })
 }
 

@@ -28,8 +28,10 @@ import {
   useFournosJob,
   useCancelJob,
   useRerunJob,
+  useUpdateJobWorkItems,
 } from '../hooks/useFournos'
 import type { PipelineStage, FournosPod } from '../types'
+import { workItemFromInput } from '../utils/workItems'
 
 function formatDuration(startStr: string | null, endStr: string | null): string {
   if (!startStr) return ''
@@ -300,6 +302,8 @@ export default function TestingJobDetail() {
   const { data, isLoading, error, refetch } = useFournosJob(name)
   const cancelJob = useCancelJob()
   const rerunJob = useRerunJob()
+  const updateWorkItems = useUpdateJobWorkItems(name)
+  const [workItemDraft, setWorkItemDraft] = useState('')
   const [selectedPod, setSelectedPod] = useState('')
   const [autoSelected, setAutoSelected] = useState(false)
   const [activeTab, setActiveTab] = useState<'timeline' | 'pods' | 'spec'>('timeline')
@@ -356,6 +360,7 @@ export default function TestingJobDetail() {
   }
 
   const { job, stages, forge_info, failure_summary, forge_execution } = data
+  const workItems = data.work_items ?? []
   const forgeExecution = forge_execution ?? { images: [], gitVersions: [], observedAt: null }
   const meta = job.metadata as Record<string, unknown>
   const spec = job.spec as Record<string, unknown>
@@ -471,7 +476,7 @@ export default function TestingJobDetail() {
       </div>
 
       {/* Forge info & MLflow */}
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 xl:grid-cols-4">
         {(forge_info.pr_url || forge_info.repository || forge_info.requested_sha) && (
           <div className="card p-4">
             <p className="text-xs text-gray-500 mb-1">Requested source revision</p>
@@ -544,6 +549,66 @@ export default function TestingJobDetail() {
             <p className="text-sm text-gray-300">-</p>
           )}
         </div>
+        {isAuthenticated() && (
+          <div className="card p-4">
+            <p className="text-xs text-gray-500 mb-1">Work items</p>
+            {workItems.length > 0 ? (
+              <div className="space-y-2">
+                {workItems.map((item) => (
+                  <div key={`${item.provider}-${item.key}`} className="flex items-center justify-between gap-2">
+                    <a
+                      href={item.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-sm font-medium text-indigo-600 hover:text-indigo-800 hover:underline"
+                    >
+                      {item.key}
+                    </a>
+                    {data.can_edit_work_items && (
+                      <button
+                        type="button"
+                        onClick={() => updateWorkItems.mutate(workItems.filter((candidate) => candidate.key !== item.key || candidate.provider !== item.provider))}
+                        disabled={updateWorkItems.isPending}
+                        className="text-xs text-gray-400 hover:text-red-600 disabled:opacity-50"
+                      >
+                        Remove
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-sm text-gray-300">-</p>
+            )}
+            {data.can_edit_work_items && (
+              <div className="mt-3 flex gap-2">
+                <input
+                  type="text"
+                  value={workItemDraft}
+                  onChange={(event) => setWorkItemDraft(event.target.value)}
+                  placeholder="PROJECT-123 or Jira URL"
+                  aria-label="Add Jira work item"
+                  className="min-w-0 flex-1 rounded-md border-gray-300 px-2 py-1 text-xs shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                />
+                <button
+                  type="button"
+                  disabled={!workItemDraft.trim() || updateWorkItems.isPending}
+                  onClick={() => {
+                    const item = workItemFromInput(workItemDraft)
+                    if (!item) return
+                    updateWorkItems.mutate([
+                      ...workItems,
+                      item,
+                    ], { onSuccess: () => setWorkItemDraft('') })
+                  }}
+                  className="rounded-md bg-indigo-600 px-2 py-1 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
+                >
+                  Add
+                </button>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Tab bar */}

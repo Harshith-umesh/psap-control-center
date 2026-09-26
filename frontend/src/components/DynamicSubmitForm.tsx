@@ -5,7 +5,7 @@ import ReviewRow, { ReviewSection } from './ReviewRow'
 import YamlPreview from './YamlPreview'
 import { useSubmitJob, useSubmitMatrix } from '../hooks/useFournos'
 import { buildMatrixJobPreviews, buildSingleJobPreview, toYamlPreview } from '../utils/fournosJobPreview'
-import type { JobScheduling, ProjectUiSchema, PullRequestSelection, UiField, UiMode, UiOption, UiPipeline, UiQuickPreset, UiVisibleIf } from '../types'
+import type { JobScheduling, ProjectUiSchema, PullRequestSelection, UiField, UiMode, UiOption, UiPipeline, UiQuickPreset, UiVisibleIf, WorkItemReference } from '../types'
 
 // ─── Generic, schema-driven submit form ────────────────────────────────
 //
@@ -38,6 +38,7 @@ export interface SubmitBasics {
   prLabel: string
   /** When this job (or recurring template) should run — see ClusterScheduleModal. */
   scheduling: JobScheduling
+  workItems: WorkItemReference[]
 }
 
 /** SubmitJobRequest/SubmitMatrixRequest's schedule/scheduled_start_time pair for a given choice. */
@@ -323,6 +324,7 @@ export default function DynamicSubmitForm({
           exclusive: basics.exclusive,
           pull_request: basics.pullRequest,
           pull_sha: basics.pullSha,
+          work_items: basics.workItems,
           gpu_type: '',
           ...schedulingRequestFields(basics.scheduling),
         })
@@ -347,6 +349,7 @@ export default function DynamicSubmitForm({
         config_overrides: configOverrides,
         pull_request: basics.pullRequest,
         pull_sha: basics.pullSha,
+        work_items: basics.workItems,
         priority: basics.priority,
         ...schedulingRequestFields(basics.scheduling),
       })
@@ -617,6 +620,9 @@ export default function DynamicSubmitForm({
                 {basics.pullSha && (
                   <ReviewRow label="Pull Request" value={basics.prLabel} mono={!basics.prLabel || basics.prLabel === basics.pullSha} />
                 )}
+                {basics.workItems.map((item) => (
+                  <ReviewRow key={`${item.provider}-${item.key || item.url}`} label="Work item" value={item.key || item.url} />
+                ))}
                 <ReviewRow
                   label="Schedule"
                   value={

@@ -395,8 +395,10 @@ async def _archive_job(job: dict) -> None:
     async with _watcher_session() as session, session.begin():
         existing = await db_svc.get_job_by_name(session, job_name)
         schedule_parent = fields.get("triggered_by_schedule")
-        if schedule_parent and not fields.get("requester_subject"):
+        parent = None
+        if schedule_parent:
             parent = await db_svc.get_job_by_name(session, schedule_parent)
+        if parent and not fields.get("requester_subject"):
             _inherit_requester_fields(fields, parent)
         previous_phase = existing.status if existing else None
         previous_message = existing.message if existing else None
@@ -607,6 +609,17 @@ async def _archive_job(job: dict) -> None:
         # on_conflict update leaves whatever's already stored untouched.
 
         db_job = await db_svc.upsert_job(session, **fields)
+        if (
+            parent
+            and parent.work_items
+            and (existing is None or not existing.work_items)
+        ):
+            await db_svc.copy_work_items(
+                session,
+                parent,
+                db_job,
+                created_by_subject=parent.requester_subject or "",
+            )
 
         if (
             fields["status"] != previous_phase

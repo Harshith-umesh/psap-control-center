@@ -68,6 +68,8 @@ def test_combined_provenance_filters_are_anded_and_index_friendly(monkeypatch):
         source_sha="abc123",
         forge="sha256:feedface",
         tags=["nightly", "h200"],
+        work_item_provider="jira",
+        work_item_key="PSAP-58",
     )
     where_sql = _where_sql(statement)
 
@@ -79,6 +81,9 @@ def test_combined_provenance_filters_are_anded_and_index_friendly(monkeypatch):
     assert "forge_execution" in where_sql
     assert "split_part" in where_sql
     assert "fournos_jobs.tags @>" in where_sql
+    assert "fournos_job_work_items" in where_sql
+    assert "provider" in where_sql
+    assert "key" in where_sql
 
 
 def test_history_view_state_normalizes_and_rejects_unknown_fields():
@@ -86,11 +91,15 @@ def test_history_view_state_normalizes_and_rejects_unknown_fields():
         query="  zeus  ",
         repository="  owner/repo  ",
         tags=[" nightly ", "nightly", "", "h200"],
+        work_item_provider=" JIRA ",
+        work_item_key=" psap-58 ",
     )
 
     assert state.query == "zeus"
     assert state.repository == "owner/repo"
     assert state.tags == ["nightly", "h200"]
+    assert state.work_item_provider == "jira"
+    assert state.work_item_key == "PSAP-58"
 
     with pytest.raises(ValidationError):
         HistoryViewState.model_validate({"unknown_filter": "unsafe"})
@@ -219,6 +228,8 @@ def test_history_filter_options_are_complete_and_deduplicated(monkeypatch):
         _scalar_result(["v1.2.3"]),
         _scalar_result(["sha256:feedface"]),
         _scalar_result(["nightly", "h200"]),
+        _scalar_result(["jira"]),
+        _scalar_result(["PSAP-58"]),
     ])
 
     options = asyncio.run(db_service.get_history_filter_options(
@@ -232,6 +243,8 @@ def test_history_filter_options_are_complete_and_deduplicated(monkeypatch):
     assert options["pr_numbers"] == [42, 7]
     assert options["source_shas"] == ["a" * 40, "b" * 40]
     assert options["forge"] == ["sha256:feedface", "v1.2.3"]
+    assert options["work_item_providers"] == ["jira"]
+    assert options["work_item_keys"] == ["PSAP-58"]
     assert options["tags"] == ["h200", "nightly"]
 
 

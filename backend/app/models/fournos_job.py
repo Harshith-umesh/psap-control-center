@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from sqlalchemy import (
     Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text, Index,
-    func,
+    UniqueConstraint, func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import relationship
@@ -92,6 +92,12 @@ class FournosJob(Base):
         back_populates="job",
         cascade="all, delete-orphan",
     )
+    work_items = relationship(
+        "FournosJobWorkItem",
+        back_populates="job",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
 
     __table_args__ = (
         Index("ix_fournos_jobs_created", "created_at"),
@@ -147,6 +153,42 @@ class FournosJobEvent(Base):
 
     def __repr__(self):
         return f"<FournosJobEvent({self.phase} @ {self.timestamp})>"
+
+
+class FournosJobWorkItem(Base):
+    """A safe, read-only reference to work tracked outside Control Center."""
+
+    __tablename__ = "fournos_job_work_items"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    job_id = Column(
+        String(36),
+        ForeignKey("fournos_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    provider = Column(String(50), nullable=False, index=True)
+    key = Column(String(100), nullable=False, index=True)
+    url = Column(String(1024), nullable=False)
+    created_by_subject = Column(String(255), default="")
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    job = relationship("FournosJob", back_populates="work_items")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id", "provider", "key",
+            name="uq_fournos_job_work_item",
+        ),
+        Index(
+            "ix_fournos_job_work_items_provider_key",
+            "provider", "key",
+        ),
+    )
 
 
 class FournosHistoryPreference(Base):

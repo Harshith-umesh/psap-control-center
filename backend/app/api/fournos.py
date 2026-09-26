@@ -54,6 +54,9 @@ from app.schemas.fournos import (
     SubmitJobResponse,
     SubmitMatrixRequest,
     SubmitMatrixResponse,
+    WorkItemConfigResponse,
+    WorkItemReference,
+    WorkItemUpdate,
 )
 from app.services import github_sync_service
 from app.services import slot_hold_service as slot_holds
@@ -68,6 +71,11 @@ from app.services.failure_details import (
     select_failure_summary,
 )
 from app.services.forge_discovery import discover_projects, get_project
+from app.services.work_items import (
+    WorkItemValidationError,
+    normalize_work_items,
+    work_items_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -323,7 +331,12 @@ def _trigger_type_for_live_job(meta: dict, spec: dict, schedule_parent: str) -> 
     return "manual"
 
 
-def _live_job_to_summary(job: dict, *, include_owner: bool = True) -> dict:
+def _live_job_to_summary(
+    job: dict,
+    *,
+    include_owner: bool = True,
+    work_items: Optional[list[dict[str, str]]] = None,
+) -> dict:
     meta = job.get("metadata", {})
     spec = job.get("spec", {})
     status = job.get("status", {})
@@ -347,6 +360,7 @@ def _live_job_to_summary(job: dict, *, include_owner: bool = True) -> dict:
         "triggered_by_schedule": schedule_parent or None,
         "scheduled_start_time": spec.get("scheduledStartTime"),
         "source": "live",
+        "work_items": work_items or [],
         **extract_source_request_fields(spec),
     }
 
@@ -397,7 +411,19 @@ def _db_job_to_summary(job, *, include_owner: bool = True) -> dict:
         "source_resolved_sha": job.source_resolved_sha or "",
         **_forge_execution_summary(job.forge_execution),
         "forge_provenance_state": job.forge_provenance_state or "pending",
+        "work_items": (
+            db_svc.serialize_work_items(job) if include_owner else []
+        ),
     }
+
+
+def _can_edit_work_items(job, user: Optional[dict]) -> bool:
+    if not user:
+        return False
+    if user.get("role") == "admin":
+        return True
+    subject = str(user.get("subject") or "")
+    return bool(subject and subject == (job.requester_subject or ""))
 
 
 def _db_job_to_fjob_dict(job) -> dict:
@@ -596,6 +622,8 @@ async def list_jobs(
         "", max_length=64, pattern=r"^$|^[0-9a-fA-F]{4,64}$"
     ),
     forge: str = Query("", max_length=255),
+    work_item_provider: str = Query("", max_length=50),
+    work_item_key: str = Query("", max_length=100),
     tags: str = Query("", max_length=2020),
     start_time: Optional[str] = Query(None, description="ISO 8601 UTC — history tab only"),
     end_time: Optional[str] = Query(None, description="ISO 8601 UTC — history tab only"),
@@ -608,6 +636,8 @@ async def list_jobs(
     include_owner = current_user is not None
     effective_sort_by = _visible_sort_by(sort_by, current_user)
     _validate_identity_search(identity, current_user)
+    if (work_item_provider or work_item_key) and current_user is None:
+        raise HTTPException(401, "Sign in to filter by work item")
     parsed_tags = []
     for raw_tag in tags.split(","):
         tag = raw_tag.strip()
@@ -667,8 +697,33 @@ async def list_jobs(
                 j for j in jobs
                 if j.get("spec", {}).get("owner") == owner
             ]
+        work_items_by_name: dict[str, list[dict[str, str]]] = {}
+        if include_owner:
+            async with AsyncSessionLocal() as session:
+                work_items_by_name = await db_svc.get_work_items_by_job_names(
+                    session,
+                    [j.get("metadata", {}).get("name", "") for j in jobs],
+                )
+        if work_item_provider or work_item_key:
+            jobs = [
+                job for job in jobs
+                if any(
+                    (not work_item_provider or item["provider"] == work_item_provider.lower())
+                    and (not work_item_key or item["key"] == work_item_key.upper())
+                    for item in work_items_by_name.get(
+                        job.get("metadata", {}).get("name", ""), []
+                    )
+                )
+            ]
         summaries = [
-            _live_job_to_summary(j, include_owner=include_owner) for j in jobs
+            _live_job_to_summary(
+                j,
+                include_owner=include_owner,
+                work_items=work_items_by_name.get(
+                    j.get("metadata", {}).get("name", ""), []
+                ),
+            )
+            for j in jobs
         ]
         key_fn = _live_sort_key(effective_sort_by)
         summaries.sort(key=key_fn, reverse=(sort_dir == "desc"))
@@ -694,6 +749,8 @@ async def list_jobs(
                 source_sha=source_sha.strip() or None,
                 forge=forge.strip() or None,
                 tags=parsed_tags or None,
+                work_item_provider=work_item_provider.strip() or None,
+                work_item_key=work_item_key.strip() or None,
                 created_after=created_after,
                 created_before=created_before,
                 sort_by=effective_sort_by or None,
@@ -778,9 +835,63 @@ async def reset_history_preferences(user: dict = Depends(require_auth)):
     return {"status": "ok", "deleted": deleted}
 
 
+@router.get("/work-items/config", response_model=WorkItemConfigResponse)
+async def get_work_item_config():
+    enabled = work_items_enabled()
+    return {
+        "enabled": enabled,
+        "providers": ["jira"] if enabled else [],
+    }
+
+
+@router.get(
+    "/jobs/{job_name}/work-items",
+    response_model=List[WorkItemReference],
+)
+async def get_job_work_items(job_name: str, _=Depends(require_auth)):
+    async with AsyncSessionLocal() as session:
+        job = await db_svc.get_job_by_name(session, job_name)
+        if job is None:
+            raise HTTPException(404, "Job not found")
+        return db_svc.serialize_work_items(job)
+
+
+@router.put(
+    "/jobs/{job_name}/work-items",
+    response_model=List[WorkItemReference],
+)
+async def update_job_work_items(
+    job_name: str,
+    body: WorkItemUpdate,
+    user: dict = Depends(require_auth),
+):
+    try:
+        normalized = normalize_work_items(body.work_items)
+    except WorkItemValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    async with AsyncSessionLocal() as session, session.begin():
+        job = await db_svc.get_job_by_name(session, job_name)
+        if job is None:
+            raise HTTPException(404, "Job not found")
+        if not _can_edit_work_items(job, user):
+            raise HTTPException(
+                403,
+                "Only the recorded requester or an administrator may edit work items",
+            )
+        await db_svc.replace_work_items(
+            session,
+            job,
+            normalized,
+            created_by_subject=str(user.get("subject") or ""),
+        )
+    return normalized
+
+
 @router.get("/jobs/{job_name}", response_model=FournosJobDetailResponse)
 async def get_job(job_name: str, request: Request):
-    include_owner = get_current_user(request) is not None
+    current_user = get_current_user(request)
+    include_owner = current_user is not None
     job = await asyncio.to_thread(k8s.get_fournos_job, job_name)
 
     pods = []
@@ -904,6 +1015,14 @@ async def get_job(job_name: str, request: Request):
                 archived.forge_provenance_state or "pending"
                 if archived else "pending"
             ),
+            "work_items": (
+                db_svc.serialize_work_items(archived)
+                if archived and include_owner else []
+            ),
+            "can_edit_work_items": (
+                _can_edit_work_items(archived, current_user)
+                if archived else False
+            ),
         }
 
     async with AsyncSessionLocal() as session:
@@ -954,6 +1073,10 @@ async def get_job(job_name: str, request: Request):
         "forge_provenance_state": (
             db_job.forge_provenance_state or "unavailable"
         ),
+        "work_items": (
+            db_svc.serialize_work_items(db_job) if include_owner else []
+        ),
+        "can_edit_work_items": _can_edit_work_items(db_job, current_user),
     }
 
 
@@ -986,12 +1109,16 @@ async def cancel_job(job_name: str, _=Depends(require_admin)):
 
 @router.post("/jobs/{job_name}/rerun")
 async def rerun_job(job_name: str, user=Depends(require_admin)):
+    async with AsyncSessionLocal() as session:
+        source_db_job = await db_svc.get_job_by_name(session, job_name)
+        source_work_items = (
+            db_svc.serialize_work_items(source_db_job)
+            if source_db_job else []
+        )
     job = await asyncio.to_thread(k8s.get_fournos_job, job_name)
     if not job:
-        async with AsyncSessionLocal() as session:
-            db_job = await db_svc.get_job_by_name(session, job_name)
-            if db_job:
-                job = _db_job_to_fjob_dict(db_job)
+        if source_db_job:
+            job = _db_job_to_fjob_dict(source_db_job)
 
     if job is None:
         raise HTTPException(404, "Job not found")
@@ -1024,7 +1151,7 @@ async def rerun_job(job_name: str, user=Depends(require_admin)):
     )
     try:
         async with AsyncSessionLocal() as session, session.begin():
-            await db_svc.upsert_job(
+            db_job = await db_svc.upsert_job(
                 session,
                 name=new_name,
                 project=project,
@@ -1046,6 +1173,13 @@ async def rerun_job(job_name: str, user=Depends(require_admin)):
                 ),
                 **source_fields,
             )
+            if source_work_items:
+                await db_svc.replace_work_items(
+                    session,
+                    db_job,
+                    source_work_items,
+                    created_by_subject=str(user.get("subject") or ""),
+                )
     except Exception as exc:
         logger.error("Could not persist rerun intent for %s: %s", new_name, exc)
         raise HTTPException(500, "Failed to persist job rerun") from exc
@@ -1143,6 +1277,10 @@ async def submit_job(req: SubmitJobRequest, user=Depends(require_auth)):
     env, source_fields = await _resolve_source_request(
         req.pull_request, req.pull_sha
     )
+    try:
+        normalized_work_items = normalize_work_items(req.work_items)
+    except WorkItemValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
     if req.version:
         version_key = _VERSION_KEYS.get(
@@ -1213,7 +1351,7 @@ async def submit_job(req: SubmitJobRequest, user=Depends(require_auth)):
     # cannot appear as a run that actually executed.
     try:
         async with AsyncSessionLocal() as session, session.begin():
-            await db_svc.upsert_job(
+            db_job = await db_svc.upsert_job(
                 session,
                 name=job_name,
                 project=req.project,
@@ -1235,6 +1373,13 @@ async def submit_job(req: SubmitJobRequest, user=Depends(require_auth)):
                 ),
                 **source_fields,
             )
+            if normalized_work_items:
+                await db_svc.replace_work_items(
+                    session,
+                    db_job,
+                    normalized_work_items,
+                    created_by_subject=str(user.get("subject") or ""),
+                )
     except Exception as exc:
         logger.error("Could not persist submission intent for %s: %s", job_name, exc)
         raise HTTPException(500, "Failed to persist job submission") from exc
@@ -1276,6 +1421,10 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
         raise HTTPException(400, "models and workloads are required")
 
     owner = _verified_owner(user)
+    try:
+        normalized_work_items = normalize_work_items(req.work_items)
+    except WorkItemValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
     source_env, source_fields = await _resolve_source_request(
         req.pull_request, req.pull_sha
     )
@@ -1350,7 +1499,7 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
         )
         try:
             async with AsyncSessionLocal() as session, session.begin():
-                await db_svc.upsert_job(
+                db_job = await db_svc.upsert_job(
                     session,
                     name=job_name,
                     project=req.project,
@@ -1372,6 +1521,13 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
                     ),
                     **source_fields,
                 )
+                if normalized_work_items:
+                    await db_svc.replace_work_items(
+                        session,
+                        db_job,
+                        normalized_work_items,
+                        created_by_subject=str(user.get("subject") or ""),
+                    )
         except Exception as exc:
             logger.error(
                 "Could not persist matrix submission intent for %s: %s",
