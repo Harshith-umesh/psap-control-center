@@ -303,7 +303,9 @@ async def init_db():
         FournosHistoryPreference,
         FournosJob,
         FournosJobEvent,
+        FournosJobGroupMembership,
         FournosJobWorkItem,
+        FournosRunGroup,
     )
 
     async with engine.begin() as conn:

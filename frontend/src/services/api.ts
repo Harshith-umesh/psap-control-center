@@ -523,6 +523,36 @@ export const fournosApi = {
     return data
   },
 
+  listRunGroups: async (includeArchived = false): Promise<import('../types').RunGroupReference[]> => {
+    const { data } = await api.get('/fournos/run-groups', {
+      params: includeArchived ? { include_archived: true } : undefined,
+    })
+    return data
+  },
+
+  createRunGroup: async (
+    group: import('../types').RunGroupCreate
+  ): Promise<import('../types').RunGroupReference> => {
+    const { data } = await api.post('/fournos/run-groups', group)
+    return data
+  },
+
+  updateRunGroup: async (
+    id: string,
+    update: import('../types').RunGroupUpdate
+  ): Promise<import('../types').RunGroupReference> => {
+    const { data } = await api.patch(`/fournos/run-groups/${id}`, update)
+    return data
+  },
+
+  updateJobRunGroups: async (
+    name: string,
+    groupIds: string[]
+  ): Promise<import('../types').RunGroupReference[]> => {
+    const { data } = await api.put(`/fournos/jobs/${name}/run-groups`, { group_ids: groupIds })
+    return data
+  },
+
   cancelJob: async (name: string) => {
     const { data } = await api.post(`/fournos/jobs/${name}/cancel`)
     return data

@@ -16,7 +16,9 @@ from app.models.fournos_job import (
     FournosHistoryPreference,
     FournosJob,
     FournosJobEvent,
+    FournosJobGroupMembership,
     FournosJobWorkItem,
+    FournosRunGroup,
 )
 
 logger = logging.getLogger(__name__)
@@ -219,6 +221,166 @@ async def get_work_items_by_job_names(
             "url": item.url,
         })
     return grouped
+
+
+def serialize_run_group(group: FournosRunGroup) -> dict[str, Any]:
+    return {
+        "id": group.id,
+        "group_type": group.group_type,
+        "key": group.key,
+        "display_name": group.display_name,
+        "description": group.description or "",
+        "archived": bool(group.archived),
+    }
+
+
+def serialize_run_groups(job: FournosJob) -> list[dict[str, Any]]:
+    groups = [membership.group for membership in job.group_memberships or []]
+    return [
+        serialize_run_group(group)
+        for group in sorted(groups, key=lambda item: (item.group_type, item.key))
+    ]
+
+
+async def list_run_groups(
+    session: AsyncSession,
+    *,
+    include_archived: bool = False,
+    group_type: Optional[str] = None,
+    query: Optional[str] = None,
+) -> list[FournosRunGroup]:
+    filters = []
+    if not include_archived:
+        filters.append(FournosRunGroup.archived.is_(False))
+    if group_type:
+        filters.append(FournosRunGroup.group_type == group_type)
+    if query:
+        needle = query.strip().lower()
+        filters.append(or_(
+            func.lower(FournosRunGroup.key).contains(needle, autoescape=True),
+            func.lower(FournosRunGroup.display_name).contains(
+                needle, autoescape=True
+            ),
+        ))
+    result = await session.execute(
+        select(FournosRunGroup)
+        .where(*filters)
+        .order_by(
+            FournosRunGroup.group_type,
+            FournosRunGroup.display_name,
+            FournosRunGroup.key,
+        )
+    )
+    return list(result.scalars().all())
+
+
+async def get_run_group(
+    session: AsyncSession, group_id: str
+) -> Optional[FournosRunGroup]:
+    result = await session.execute(
+        select(FournosRunGroup).where(FournosRunGroup.id == group_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def validate_active_run_group_ids(
+    session: AsyncSession, group_ids: Sequence[str]
+) -> None:
+    unique_ids = list(dict.fromkeys(group_ids))
+    if not unique_ids:
+        return
+    result = await session.execute(
+        select(FournosRunGroup.id).where(
+            FournosRunGroup.id.in_(unique_ids),
+            FournosRunGroup.archived.is_(False),
+        )
+    )
+    found = set(result.scalars().all())
+    if found != set(unique_ids):
+        raise ValueError("One or more run groups do not exist or are archived")
+
+
+async def create_run_group(
+    session: AsyncSession,
+    *,
+    group_type: str,
+    key: str,
+    display_name: str,
+    description: str,
+    created_by_subject: str,
+) -> FournosRunGroup:
+    group = FournosRunGroup(
+        group_type=group_type,
+        key=key,
+        display_name=display_name,
+        description=description,
+        created_by_subject=created_by_subject,
+    )
+    session.add(group)
+    await session.flush()
+    return group
+
+
+async def replace_run_groups(
+    session: AsyncSession,
+    job: FournosJob,
+    group_ids: Sequence[str],
+    *,
+    created_by_subject: str,
+    allow_archived: bool = False,
+) -> None:
+    unique_ids = list(dict.fromkeys(group_ids))
+    existing_result = await session.execute(
+        select(FournosJobGroupMembership.group_id).where(
+            FournosJobGroupMembership.job_id == job.id
+        )
+    )
+    existing_ids = set(existing_result.scalars().all())
+    groups: list[FournosRunGroup] = []
+    if unique_ids:
+        result = await session.execute(
+            select(FournosRunGroup).where(FournosRunGroup.id.in_(unique_ids))
+        )
+        groups = list(result.scalars().all())
+        found = {group.id for group in groups}
+        missing = [group_id for group_id in unique_ids if group_id not in found]
+        if missing:
+            raise ValueError("One or more run groups do not exist")
+        if not allow_archived and any(
+            group.archived and group.id not in existing_ids for group in groups
+        ):
+            raise ValueError("Archived run groups cannot be newly associated")
+
+    await session.execute(
+        delete(FournosJobGroupMembership).where(
+            FournosJobGroupMembership.job_id == job.id
+        )
+    )
+    for group_id in unique_ids:
+        session.add(FournosJobGroupMembership(
+            job_id=job.id,
+            group_id=group_id,
+            created_by_subject=created_by_subject,
+        ))
+    await session.flush()
+
+
+async def copy_run_groups(
+    session: AsyncSession,
+    source: Optional[FournosJob],
+    target: FournosJob,
+    *,
+    created_by_subject: str,
+) -> None:
+    if source is None:
+        return
+    await replace_run_groups(
+        session,
+        target,
+        [membership.group_id for membership in source.group_memberships or []],
+        created_by_subject=created_by_subject,
+        allow_archived=True,
+    )
 
 
 async def get_requester_subjects_by_names(

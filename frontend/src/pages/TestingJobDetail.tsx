@@ -29,9 +29,11 @@ import {
   useCancelJob,
   useRerunJob,
   useUpdateJobWorkItems,
+  useUpdateJobRunGroups,
 } from '../hooks/useFournos'
 import type { PipelineStage, FournosPod } from '../types'
 import { workItemFromInput } from '../utils/workItems'
+import RunGroupSelector from '../components/RunGroupSelector'
 
 function formatDuration(startStr: string | null, endStr: string | null): string {
   if (!startStr) return ''
@@ -302,6 +304,7 @@ export default function TestingJobDetail() {
   const { data, isLoading, error, refetch } = useFournosJob(name)
   const cancelJob = useCancelJob()
   const rerunJob = useRerunJob()
+  const updateRunGroups = useUpdateJobRunGroups(name)
   const updateWorkItems = useUpdateJobWorkItems(name)
   const [workItemDraft, setWorkItemDraft] = useState('')
   const [selectedPod, setSelectedPod] = useState('')
@@ -361,6 +364,7 @@ export default function TestingJobDetail() {
 
   const { job, stages, forge_info, failure_summary, forge_execution } = data
   const workItems = data.work_items ?? []
+  const runGroups = data.run_groups ?? []
   const forgeExecution = forge_execution ?? { images: [], gitVersions: [], observedAt: null }
   const meta = job.metadata as Record<string, unknown>
   const spec = job.spec as Record<string, unknown>
@@ -476,7 +480,7 @@ export default function TestingJobDetail() {
       </div>
 
       {/* Forge info & MLflow */}
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 xl:grid-cols-4">
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 xl:grid-cols-5">
         {(forge_info.pr_url || forge_info.repository || forge_info.requested_sha) && (
           <div className="card p-4">
             <p className="text-xs text-gray-500 mb-1">Requested source revision</p>
@@ -609,6 +613,27 @@ export default function TestingJobDetail() {
             )}
           </div>
         )}
+        <div className="card p-4">
+          <p className="mb-2 text-xs text-gray-500">Run grouping</p>
+          {data.can_edit_run_groups ? (
+            <RunGroupSelector
+              selectedIds={runGroups.map((group) => group.id)}
+              selectedGroups={runGroups}
+              onChange={(ids) => updateRunGroups.mutate(ids)}
+            />
+          ) : runGroups.length > 0 ? (
+            <div className="flex flex-wrap gap-2">
+              {runGroups.map((group) => (
+                <span key={group.id} className="rounded-full bg-indigo-50 px-2.5 py-1 text-xs font-medium text-indigo-700">
+                  <span className="text-indigo-400">{group.group_type}</span> {group.display_name}
+                  {group.archived && <span className="text-gray-400"> (archived)</span>}
+                </span>
+              ))}
+            </div>
+          ) : (
+            <p className="text-sm text-gray-300">-</p>
+          )}
+        </div>
       </div>
 
       {/* Tab bar */}

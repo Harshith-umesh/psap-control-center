@@ -37,6 +37,7 @@ import SearchableSelect from '../components/SearchableSelect'
 import EditableCombobox from '../components/EditableCombobox'
 import { buildSingleJobPreview, toYamlPreview, withVersionOverride } from '../utils/fournosJobPreview'
 import { workItemFromInput } from '../utils/workItems'
+import RunGroupSelector from '../components/RunGroupSelector'
 import {
   useFournosJobs,
   useRecurringJobs,
@@ -62,6 +63,7 @@ import {
   useSaveHistoryPreference,
   useResetHistoryPreference,
   useWorkItemConfig,
+  useRunGroups,
 } from '../hooks/useFournos'
 import type {
   FournosJobSummary,
@@ -481,6 +483,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
   const refreshGithubSync = useRefreshGithubSync()
   const submitJob = useSubmitJob()
   const { data: workItemConfig } = useWorkItemConfig()
+  const { data: runGroups = [] } = useRunGroups()
 
   // "Basics" — common to every project, owned here so there is exactly one
   // wizard/step indicator (DynamicSubmitForm only renders steps 2 and 3,
@@ -499,6 +502,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
   const [prSearch, setPrSearch] = useState('')
   const [prDropdownOpen, setPrDropdownOpen] = useState(false)
   const [workItemInput, setWorkItemInput] = useState('')
+  const [runGroupIds, setRunGroupIds] = useState<string[]>([])
   // step 1 = "what do you want to do" (Lock / Forge Job / Custom Job).
   // For jobType === 'forge': 2 = Basics, 3 = Project Details, 4 = Review & Submit.
   // For jobType === 'lock': 2 = pick a cluster + inspect/manage its locks.
@@ -632,6 +636,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
         pull_request: pullRequest,
         pull_sha: pullSha,
         work_items: workItems,
+        run_group_ids: runGroupIds,
         schedule: scheduling.mode === 'recurring' ? scheduling.scheduleUtc : '',
         scheduled_start_time: scheduling.mode === 'defer' ? scheduling.scheduledStartTimeUtc : null,
       })
@@ -1018,6 +1023,16 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
             </div>
           )}
 
+          <div>
+            <label className="block text-sm font-medium text-gray-700">
+              Run grouping (optional)
+            </label>
+            <p className="mb-2 mt-1 text-xs text-gray-400">
+              Associate this run with reusable experiments, workload families, campaigns, or cohorts.
+            </p>
+            <RunGroupSelector selectedIds={runGroupIds} onChange={setRunGroupIds} />
+          </div>
+
           <div className="flex items-center justify-between pt-2">
             <button
               type="button"
@@ -1058,7 +1073,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
         <DynamicSubmitForm
           project={project}
           schema={dynamicSchema}
-          basics={{ cluster, pipeline, owner, priority, exclusive, pullSha, pullRequest, prLabel: prSearch || pullSha, scheduling, workItems }}
+          basics={{ cluster, pipeline, owner, priority, exclusive, pullSha, pullRequest, prLabel: prSearch || pullSha, scheduling, workItems, runGroupIds, runGroups }}
           step={step - 1}
           onBack={() => setStep(step - 1)}
           onNext={() => setStep(step + 1)}
@@ -1132,6 +1147,10 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
               {workItems.map((item) => (
                 <ReviewRow key={`${item.provider}-${item.key || item.url}`} label="Work item" value={item.key || item.url} />
               ))}
+              {runGroupIds.map((id) => {
+                const group = runGroups.find((candidate) => candidate.id === id)
+                return group ? <ReviewRow key={id} label={group.group_type} value={group.display_name} /> : null
+              })}
               <ReviewRow
                 label="Schedule"
                 value={

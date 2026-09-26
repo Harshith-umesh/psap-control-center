@@ -98,6 +98,12 @@ class FournosJob(Base):
         cascade="all, delete-orphan",
         lazy="selectin",
     )
+    group_memberships = relationship(
+        "FournosJobGroupMembership",
+        back_populates="job",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
 
     __table_args__ = (
         Index("ix_fournos_jobs_created", "created_at"),
@@ -187,6 +193,87 @@ class FournosJobWorkItem(Base):
         Index(
             "ix_fournos_job_work_items_provider_key",
             "provider", "key",
+        ),
+    )
+
+
+class FournosRunGroup(Base):
+    """A reusable, product-neutral grouping for related test runs."""
+
+    __tablename__ = "fournos_run_groups"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    group_type = Column(String(50), nullable=False, index=True)
+    key = Column(String(100), nullable=False)
+    display_name = Column(String(255), nullable=False)
+    description = Column(Text, default="")
+    created_by_subject = Column(String(255), nullable=False, index=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+    archived = Column(Boolean, nullable=False, default=False, index=True)
+
+    memberships = relationship(
+        "FournosJobGroupMembership",
+        back_populates="group",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "group_type", "key", name="uq_fournos_run_group_type_key"
+        ),
+        Index(
+            "ix_fournos_run_groups_type_archived",
+            "group_type", "archived",
+        ),
+    )
+
+
+class FournosJobGroupMembership(Base):
+    """Links one durable run record to a reusable run group."""
+
+    __tablename__ = "fournos_job_group_memberships"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    job_id = Column(
+        String(36),
+        ForeignKey("fournos_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    group_id = Column(
+        String(36),
+        ForeignKey("fournos_run_groups.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    created_by_subject = Column(String(255), default="")
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    job = relationship("FournosJob", back_populates="group_memberships")
+    group = relationship(
+        "FournosRunGroup", back_populates="memberships", lazy="joined"
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id", "group_id", name="uq_fournos_job_group_membership"
+        ),
+        Index(
+            "ix_fournos_job_group_memberships_group_job",
+            "group_id", "job_id",
         ),
     )
 
