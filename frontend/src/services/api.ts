@@ -22,6 +22,7 @@ import type {
   HistoryPreferenceResponse,
   HistoryFilterOptionsResponse,
   HistoryViewState,
+  AuthConfig,
 } from '../types'
 import { createLogger } from '../utils/logger'
 import { clearSession } from '../stores/authStore'
@@ -306,7 +307,7 @@ export const hearthApi = {
 }
 
 export const authApi = {
-  config: async (): Promise<{ google_enabled: boolean; local_login_enabled: boolean }> => {
+  config: async (): Promise<AuthConfig> => {
     const { data } = await api.get('/auth/config')
     return data
   },

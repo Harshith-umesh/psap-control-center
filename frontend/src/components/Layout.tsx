@@ -17,6 +17,7 @@ import {
 } from '@heroicons/react/24/outline'
 import clsx from 'clsx'
 import LoginModal from './LoginModal'
+import { useAuthConfig } from '../hooks/useAuthConfig'
 import HearthConnectModal from './HearthConnectModal'
 import { isAuthenticated, isAdmin, getDisplayName, clearSession } from '../stores/authStore'
 import { authApi } from '../services/api'
@@ -132,6 +133,7 @@ export default function Layout() {
   const [hearthConnectOpen, setHearthConnectOpen] = useState(false)
   const [authed, setAuthed] = useState(isAuthenticated())
   const location = useLocation()
+  const authConfigQuery = useAuthConfig()
 
   const { data: hearthStatus } = useHearthStatus()
   const admin = isAdmin()
@@ -379,7 +381,14 @@ export default function Layout() {
         </main>
       </div>
 
-      <LoginModal open={loginOpen} onClose={() => setLoginOpen(false)} />
+      <LoginModal
+        open={loginOpen}
+        onClose={() => setLoginOpen(false)}
+        authConfig={authConfigQuery.data}
+        configLoading={authConfigQuery.isPending || authConfigQuery.isFetching}
+        configError={authConfigQuery.isError}
+        onRetryConfig={() => { void authConfigQuery.refetch() }}
+      />
       <HearthConnectModal
         open={hearthConnectOpen}
         configured={hearthStatus?.configured ?? false}
