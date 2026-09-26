@@ -5,7 +5,7 @@ import ReviewRow, { ReviewSection } from './ReviewRow'
 import YamlPreview from './YamlPreview'
 import { useSubmitJob, useSubmitMatrix } from '../hooks/useFournos'
 import { buildMatrixJobPreviews, buildSingleJobPreview, toYamlPreview } from '../utils/fournosJobPreview'
-import type { JobScheduling, ProjectUiSchema, PullRequestSelection, UiField, UiMode, UiOption, UiPipeline, UiQuickPreset, UiVisibleIf, WorkItemReference } from '../types'
+import type { JobScheduling, ProjectUiSchema, PullRequestSelection, RunGroupReference, UiField, UiMode, UiOption, UiPipeline, UiQuickPreset, UiVisibleIf, WorkItemReference } from '../types'
 
 // ─── Generic, schema-driven submit form ────────────────────────────────
 //
@@ -39,6 +39,8 @@ export interface SubmitBasics {
   /** When this job (or recurring template) should run — see ClusterScheduleModal. */
   scheduling: JobScheduling
   workItems: WorkItemReference[]
+  runGroupIds: string[]
+  runGroups: RunGroupReference[]
 }
 
 /** SubmitJobRequest/SubmitMatrixRequest's schedule/scheduled_start_time pair for a given choice. */
@@ -325,6 +327,7 @@ export default function DynamicSubmitForm({
           pull_request: basics.pullRequest,
           pull_sha: basics.pullSha,
           work_items: basics.workItems,
+          run_group_ids: basics.runGroupIds,
           gpu_type: '',
           ...schedulingRequestFields(basics.scheduling),
         })
@@ -350,6 +353,7 @@ export default function DynamicSubmitForm({
         pull_request: basics.pullRequest,
         pull_sha: basics.pullSha,
         work_items: basics.workItems,
+        run_group_ids: basics.runGroupIds,
         priority: basics.priority,
         ...schedulingRequestFields(basics.scheduling),
       })
@@ -623,6 +627,10 @@ export default function DynamicSubmitForm({
                 {basics.workItems.map((item) => (
                   <ReviewRow key={`${item.provider}-${item.key || item.url}`} label="Work item" value={item.key || item.url} />
                 ))}
+                {basics.runGroupIds.map((id) => {
+                  const group = basics.runGroups.find((candidate) => candidate.id === id)
+                  return group ? <ReviewRow key={id} label={group.group_type} value={group.display_name} /> : null
+                })}
                 <ReviewRow
                   label="Schedule"
                   value={

@@ -620,6 +620,17 @@ async def _archive_job(job: dict) -> None:
                 db_job,
                 created_by_subject=parent.requester_subject or "",
             )
+        if (
+            parent
+            and parent.group_memberships
+            and (existing is None or not existing.group_memberships)
+        ):
+            await db_svc.copy_run_groups(
+                session,
+                parent,
+                db_job,
+                created_by_subject=parent.requester_subject or "",
+            )
 
         if (
             fields["status"] != previous_phase

@@ -461,6 +461,7 @@ export interface FournosJobSummary {
   forge_image_digest: string
   forge_provenance_state: string
   work_items: WorkItemReference[]
+  run_groups: RunGroupReference[]
 }
 
 export interface WorkItemReference {
@@ -472,6 +473,30 @@ export interface WorkItemReference {
 export interface WorkItemConfig {
   enabled: boolean
   providers: string[]
+}
+
+export type RunGroupType = 'experiment' | 'workload' | 'campaign' | 'cohort'
+
+export interface RunGroupReference {
+  id: string
+  group_type: RunGroupType
+  key: string
+  display_name: string
+  description: string
+  archived: boolean
+}
+
+export interface RunGroupCreate {
+  group_type: RunGroupType
+  key: string
+  display_name: string
+  description?: string
+}
+
+export interface RunGroupUpdate {
+  display_name?: string
+  description?: string
+  archived?: boolean
 }
 
 export interface FournosJobListResponse {
@@ -628,6 +653,8 @@ export interface FournosJobDetailResponse {
   forge_provenance_state: string
   work_items: WorkItemReference[]
   can_edit_work_items: boolean
+  run_groups: RunGroupReference[]
+  can_edit_run_groups: boolean
 }
 
 export interface FournosJobEvent {
@@ -769,6 +796,7 @@ export interface SubmitJobRequest {
   /** Cron expression, UTC — mutually exclusive with `scheduled_start_time`. Makes this a recurring template. */
   schedule?: string
   work_items?: WorkItemReference[]
+  run_group_ids?: string[]
 }
 
 export interface SubmitJobResponse {
@@ -805,6 +833,7 @@ export interface SubmitMatrixRequest {
   scheduled_start_time?: string | null
   schedule?: string
   work_items?: WorkItemReference[]
+  run_group_ids?: string[]
 }
 
 export interface SubmitMatrixResultItem {

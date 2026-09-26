@@ -90,6 +90,9 @@ with Control Center's API.
   `ui/submit.yaml` schemas, supports standard or matrix submissions, and can run
   immediately, defer a run, or create a recurring schedule. Custom non-Forge
   job definitions remain a planned capability.
+- **Run grouping** associates jobs with reusable, product-neutral experiments,
+  workload families, campaigns, or cohorts. Matrix jobs, recurring children,
+  and reruns retain the selected grouping.
 - **Schedules/Locks** manages recurring jobs and immediate or scheduled cluster
   locks, with cluster activity and child-run views.
 

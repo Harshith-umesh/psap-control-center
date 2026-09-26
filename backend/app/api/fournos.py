@@ -16,6 +16,7 @@ from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
+from sqlalchemy.exc import IntegrityError
 
 from app.core.auth import (
     REQUESTER_EMAIL_ANNOTATION,
@@ -48,6 +49,10 @@ from app.schemas.fournos import (
     PullRequestSelection,
     ProjectInfoResponse,
     RecurringJobResponse,
+    RunGroupCreate,
+    RunGroupMembershipUpdate,
+    RunGroupReference,
+    RunGroupUpdate,
     ScheduleChildJobResponse,
     SlotHoldResponse,
     SubmitJobRequest,
@@ -75,6 +80,15 @@ from app.services.work_items import (
     WorkItemValidationError,
     normalize_work_items,
     work_items_enabled,
+)
+from app.services.run_groups import (
+    RunGroupValidationError,
+    can_manage_group,
+    normalize_description,
+    normalize_display_name,
+    normalize_group_ids,
+    normalize_group_key,
+    normalize_group_type,
 )
 
 logger = logging.getLogger(__name__)
@@ -414,6 +428,7 @@ def _db_job_to_summary(job, *, include_owner: bool = True) -> dict:
         "work_items": (
             db_svc.serialize_work_items(job) if include_owner else []
         ),
+        "run_groups": db_svc.serialize_run_groups(job),
     }
 
 
@@ -424,6 +439,10 @@ def _can_edit_work_items(job, user: Optional[dict]) -> bool:
         return True
     subject = str(user.get("subject") or "")
     return bool(subject and subject == (job.requester_subject or ""))
+
+
+def _can_edit_run_groups(job, user: Optional[dict]) -> bool:
+    return _can_edit_work_items(job, user)
 
 
 def _db_job_to_fjob_dict(job) -> dict:
@@ -844,6 +863,150 @@ async def get_work_item_config():
     }
 
 
+@router.get("/run-groups", response_model=List[RunGroupReference])
+async def get_run_groups(
+    include_archived: bool = False,
+    group_type: str = Query("", max_length=50),
+    q: str = Query("", max_length=100),
+    _=Depends(require_auth),
+):
+    normalized_type = ""
+    if group_type:
+        try:
+            normalized_type = normalize_group_type(group_type)
+        except RunGroupValidationError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    async with AsyncSessionLocal() as session:
+        groups = await db_svc.list_run_groups(
+            session,
+            include_archived=include_archived,
+            group_type=normalized_type or None,
+            query=q.strip() or None,
+        )
+        return [db_svc.serialize_run_group(group) for group in groups]
+
+
+@router.post(
+    "/run-groups",
+    response_model=RunGroupReference,
+    status_code=201,
+)
+async def create_run_group(
+    body: RunGroupCreate,
+    user: dict = Depends(require_auth),
+):
+    try:
+        values = {
+            "group_type": normalize_group_type(body.group_type),
+            "key": normalize_group_key(body.key),
+            "display_name": normalize_display_name(body.display_name),
+            "description": normalize_description(body.description),
+        }
+    except RunGroupValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    try:
+        async with AsyncSessionLocal() as session, session.begin():
+            group = await db_svc.create_run_group(
+                session,
+                **values,
+                created_by_subject=str(user.get("subject") or ""),
+            )
+            result = db_svc.serialize_run_group(group)
+    except IntegrityError as exc:
+        raise HTTPException(
+            409, "A run group with this type and key already exists"
+        ) from exc
+    return result
+
+
+@router.patch(
+    "/run-groups/{group_id}", response_model=RunGroupReference
+)
+async def update_run_group(
+    group_id: str,
+    body: RunGroupUpdate,
+    user: dict = Depends(require_auth),
+):
+    try:
+        normalized_id = normalize_group_ids([group_id])[0]
+        display_name = (
+            normalize_display_name(body.display_name)
+            if body.display_name is not None else None
+        )
+        description = (
+            normalize_description(body.description)
+            if body.description is not None else None
+        )
+    except RunGroupValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    async with AsyncSessionLocal() as session, session.begin():
+        group = await db_svc.get_run_group(session, normalized_id)
+        if group is None:
+            raise HTTPException(404, "Run group not found")
+        if not can_manage_group(group, user):
+            raise HTTPException(
+                403, "Only the group owner or an administrator may update it"
+            )
+        if display_name is not None:
+            group.display_name = display_name
+        if description is not None:
+            group.description = description
+        if body.archived is not None:
+            group.archived = body.archived
+        await session.flush()
+        result = db_svc.serialize_run_group(group)
+    return result
+
+
+@router.get(
+    "/jobs/{job_name}/run-groups",
+    response_model=List[RunGroupReference],
+)
+async def get_job_run_groups(job_name: str, _=Depends(require_auth)):
+    async with AsyncSessionLocal() as session:
+        job = await db_svc.get_job_by_name(session, job_name)
+        if job is None:
+            raise HTTPException(404, "Job not found")
+        return db_svc.serialize_run_groups(job)
+
+
+@router.put(
+    "/jobs/{job_name}/run-groups",
+    response_model=List[RunGroupReference],
+)
+async def update_job_run_groups(
+    job_name: str,
+    body: RunGroupMembershipUpdate,
+    user: dict = Depends(require_auth),
+):
+    try:
+        group_ids = normalize_group_ids(body.group_ids)
+    except RunGroupValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    async with AsyncSessionLocal() as session, session.begin():
+        job = await db_svc.get_job_by_name(session, job_name)
+        if job is None:
+            raise HTTPException(404, "Job not found")
+        if not _can_edit_run_groups(job, user):
+            raise HTTPException(
+                403,
+                "Only the recorded requester or an administrator may edit run groups",
+            )
+        try:
+            await db_svc.replace_run_groups(
+                session,
+                job,
+                group_ids,
+                created_by_subject=str(user.get("subject") or ""),
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        await session.refresh(job, attribute_names=["group_memberships"])
+        return db_svc.serialize_run_groups(job)
+
+
 @router.get(
     "/jobs/{job_name}/work-items",
     response_model=List[WorkItemReference],
@@ -1023,6 +1186,13 @@ async def get_job(job_name: str, request: Request):
                 _can_edit_work_items(archived, current_user)
                 if archived else False
             ),
+            "run_groups": (
+                db_svc.serialize_run_groups(archived) if archived else []
+            ),
+            "can_edit_run_groups": (
+                _can_edit_run_groups(archived, current_user)
+                if archived else False
+            ),
         }
 
     async with AsyncSessionLocal() as session:
@@ -1077,6 +1247,8 @@ async def get_job(job_name: str, request: Request):
             db_svc.serialize_work_items(db_job) if include_owner else []
         ),
         "can_edit_work_items": _can_edit_work_items(db_job, current_user),
+        "run_groups": db_svc.serialize_run_groups(db_job),
+        "can_edit_run_groups": _can_edit_run_groups(db_job, current_user),
     }
 
 
@@ -1113,6 +1285,13 @@ async def rerun_job(job_name: str, user=Depends(require_admin)):
         source_db_job = await db_svc.get_job_by_name(session, job_name)
         source_work_items = (
             db_svc.serialize_work_items(source_db_job)
+            if source_db_job else []
+        )
+        source_run_group_ids = (
+            [
+                membership.group_id
+                for membership in source_db_job.group_memberships or []
+            ]
             if source_db_job else []
         )
     job = await asyncio.to_thread(k8s.get_fournos_job, job_name)
@@ -1179,6 +1358,14 @@ async def rerun_job(job_name: str, user=Depends(require_admin)):
                     db_job,
                     source_work_items,
                     created_by_subject=str(user.get("subject") or ""),
+                )
+            if source_run_group_ids:
+                await db_svc.replace_run_groups(
+                    session,
+                    db_job,
+                    source_run_group_ids,
+                    created_by_subject=str(user.get("subject") or ""),
+                    allow_archived=True,
                 )
     except Exception as exc:
         logger.error("Could not persist rerun intent for %s: %s", new_name, exc)
@@ -1279,7 +1466,10 @@ async def submit_job(req: SubmitJobRequest, user=Depends(require_auth)):
     )
     try:
         normalized_work_items = normalize_work_items(req.work_items)
+        normalized_run_group_ids = normalize_group_ids(req.run_group_ids)
     except WorkItemValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RunGroupValidationError as exc:
         raise HTTPException(400, str(exc)) from exc
 
     if req.version:
@@ -1351,6 +1541,9 @@ async def submit_job(req: SubmitJobRequest, user=Depends(require_auth)):
     # cannot appear as a run that actually executed.
     try:
         async with AsyncSessionLocal() as session, session.begin():
+            await db_svc.validate_active_run_group_ids(
+                session, normalized_run_group_ids
+            )
             db_job = await db_svc.upsert_job(
                 session,
                 name=job_name,
@@ -1380,6 +1573,15 @@ async def submit_job(req: SubmitJobRequest, user=Depends(require_auth)):
                     normalized_work_items,
                     created_by_subject=str(user.get("subject") or ""),
                 )
+            if normalized_run_group_ids:
+                await db_svc.replace_run_groups(
+                    session,
+                    db_job,
+                    normalized_run_group_ids,
+                    created_by_subject=str(user.get("subject") or ""),
+                )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     except Exception as exc:
         logger.error("Could not persist submission intent for %s: %s", job_name, exc)
         raise HTTPException(500, "Failed to persist job submission") from exc
@@ -1423,8 +1625,18 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
     owner = _verified_owner(user)
     try:
         normalized_work_items = normalize_work_items(req.work_items)
+        normalized_run_group_ids = normalize_group_ids(req.run_group_ids)
     except WorkItemValidationError as exc:
         raise HTTPException(400, str(exc)) from exc
+    except RunGroupValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    async with AsyncSessionLocal() as session:
+        try:
+            await db_svc.validate_active_run_group_ids(
+                session, normalized_run_group_ids
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     source_env, source_fields = await _resolve_source_request(
         req.pull_request, req.pull_sha
     )
@@ -1526,6 +1738,13 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
                         session,
                         db_job,
                         normalized_work_items,
+                        created_by_subject=str(user.get("subject") or ""),
+                    )
+                if normalized_run_group_ids:
+                    await db_svc.replace_run_groups(
+                        session,
+                        db_job,
+                        normalized_run_group_ids,
                         created_by_subject=str(user.get("subject") or ""),
                     )
         except Exception as exc:

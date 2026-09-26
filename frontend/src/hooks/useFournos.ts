@@ -24,6 +24,8 @@ import type {
   HistoryViewState,
   WorkItemConfig,
   WorkItemReference,
+  RunGroupCreate,
+  RunGroupReference,
 } from '../types'
 
 // ─── Jobs ──────────────────────────────────────────────────────────────
@@ -131,6 +133,40 @@ export function useUpdateJobWorkItems(name: string | undefined) {
       toast.success('Work-item associations updated')
     },
     onError: (error) => toast.error(error.message || 'Failed to update work items'),
+  })
+}
+
+export function useRunGroups(includeArchived = false) {
+  return useQuery<RunGroupReference[]>({
+    queryKey: ['fournos-run-groups', includeArchived],
+    queryFn: () => fournosApi.listRunGroups(includeArchived),
+    staleTime: 60_000,
+    retry: 1,
+  })
+}
+
+export function useCreateRunGroup() {
+  const qc = useQueryClient()
+  return useMutation<RunGroupReference, Error, RunGroupCreate>({
+    mutationFn: (group) => fournosApi.createRunGroup(group),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['fournos-run-groups'] })
+      toast.success('Run group created')
+    },
+    onError: (error) => toast.error(error.message || 'Failed to create run group'),
+  })
+}
+
+export function useUpdateJobRunGroups(name: string | undefined) {
+  const qc = useQueryClient()
+  return useMutation<RunGroupReference[], Error, string[]>({
+    mutationFn: (groupIds) => fournosApi.updateJobRunGroups(name!, groupIds),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['fournos-job', name] })
+      qc.invalidateQueries({ queryKey: ['fournos-jobs'] })
+      toast.success('Run grouping updated')
+    },
+    onError: (error) => toast.error(error.message || 'Failed to update run grouping'),
   })
 }
 

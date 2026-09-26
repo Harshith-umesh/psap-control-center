@@ -40,6 +40,7 @@ class FournosJobSummary(BaseModel):
     forge_image_digest: str = ""
     forge_provenance_state: str = "pending"
     work_items: List["WorkItemReference"] = Field(default_factory=list)
+    run_groups: List["RunGroupReference"] = Field(default_factory=list)
 
     class Config:
         from_attributes = True
@@ -169,6 +170,8 @@ class FournosJobDetailResponse(BaseModel):
     forge_provenance_state: str = "not_applicable"
     work_items: List["WorkItemReference"] = Field(default_factory=list)
     can_edit_work_items: bool = False
+    run_groups: List["RunGroupReference"] = Field(default_factory=list)
+    can_edit_run_groups: bool = False
 
     @field_validator("failure_summary", mode="before")
     @classmethod
@@ -342,6 +345,32 @@ class WorkItemConfigResponse(BaseModel):
     enabled: bool = False
     providers: List[str] = Field(default_factory=list)
 
+
+class RunGroupReference(BaseModel):
+    id: str
+    group_type: Literal["experiment", "workload", "campaign", "cohort"]
+    key: str
+    display_name: str
+    description: str = ""
+    archived: bool = False
+
+
+class RunGroupCreate(BaseModel):
+    group_type: str
+    key: str
+    display_name: str
+    description: str = ""
+
+
+class RunGroupUpdate(BaseModel):
+    display_name: Optional[str] = None
+    description: Optional[str] = None
+    archived: Optional[bool] = None
+
+
+class RunGroupMembershipUpdate(BaseModel):
+    group_ids: List[str] = Field(default_factory=list, max_length=20)
+
 class SubmitJobRequest(BaseModel):
     project: str
     cluster: str
@@ -370,6 +399,7 @@ class SubmitJobRequest(BaseModel):
     scheduled_start_time: Optional[str] = None
     schedule: str = ""
     work_items: List[WorkItemReference] = Field(default_factory=list, max_length=20)
+    run_group_ids: List[str] = Field(default_factory=list, max_length=20)
 
 
 class SubmitJobResponse(BaseModel):
@@ -411,6 +441,7 @@ class SubmitMatrixRequest(BaseModel):
     scheduled_start_time: Optional[str] = None
     schedule: str = ""
     work_items: List[WorkItemReference] = Field(default_factory=list, max_length=20)
+    run_group_ids: List[str] = Field(default_factory=list, max_length=20)
 
 
 class SubmitMatrixResultItem(BaseModel):
