@@ -505,6 +505,11 @@ export interface HistoryFilterOptionsResponse {
   tags: string[]
 }
 
+export interface AuthConfig {
+  google_enabled: boolean
+  local_login_enabled: boolean
+}
+
 export interface PipelineStage {
   name: string
   displayName: string
