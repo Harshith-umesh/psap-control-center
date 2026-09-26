@@ -39,6 +39,7 @@ class FournosJobSummary(BaseModel):
     forge_git_version: str = ""
     forge_image_digest: str = ""
     forge_provenance_state: str = "pending"
+    work_items: List["WorkItemReference"] = Field(default_factory=list)
 
     class Config:
         from_attributes = True
@@ -166,6 +167,8 @@ class FournosJobDetailResponse(BaseModel):
         default_factory=ForgeExecutionProvenance
     )
     forge_provenance_state: str = "not_applicable"
+    work_items: List["WorkItemReference"] = Field(default_factory=list)
+    can_edit_work_items: bool = False
 
     @field_validator("failure_summary", mode="before")
     @classmethod
@@ -213,6 +216,8 @@ class HistoryViewState(BaseModel):
         "", max_length=64, pattern=r"^$|^[0-9a-fA-F]{4,64}$"
     )
     forge: str = Field("", max_length=255)
+    work_item_provider: str = Field("", max_length=50)
+    work_item_key: str = Field("", max_length=100)
     tags: List[str] = Field(default_factory=list, max_length=20)
     history_date: str = Field("", pattern=r"^$|^\d{4}-\d{2}-\d{2}$")
     from_time: str = Field("00:00", pattern=r"^\d{2}:\d{2}$")
@@ -227,10 +232,21 @@ class HistoryViewState(BaseModel):
     @field_validator(
         "query", "project", "cluster", "status", "identity",
         "failure_outcome", "repository", "source_sha", "forge",
+        "work_item_provider", "work_item_key",
     )
     @classmethod
     def strip_text(cls, value: str) -> str:
         return value.strip()
+
+    @field_validator("work_item_provider")
+    @classmethod
+    def normalize_work_item_provider(cls, value: str) -> str:
+        return value.strip().lower()
+
+    @field_validator("work_item_key")
+    @classmethod
+    def normalize_work_item_key(cls, value: str) -> str:
+        return value.strip().upper()
 
     @field_validator("status")
     @classmethod
@@ -296,6 +312,8 @@ class HistoryFilterOptionsResponse(BaseModel):
     source_shas: List[str] = Field(default_factory=list)
     forge: List[str] = Field(default_factory=list)
     tags: List[str] = Field(default_factory=list)
+    work_item_providers: List[str] = Field(default_factory=list)
+    work_item_keys: List[str] = Field(default_factory=list)
 
 
 # -- Submit job --
@@ -308,6 +326,21 @@ class PullRequestSelection(BaseModel):
     url: str
     head_branch: str
     requested_sha: str
+
+
+class WorkItemReference(BaseModel):
+    provider: str = "jira"
+    key: str = ""
+    url: str = ""
+
+
+class WorkItemUpdate(BaseModel):
+    work_items: List[WorkItemReference] = Field(default_factory=list, max_length=20)
+
+
+class WorkItemConfigResponse(BaseModel):
+    enabled: bool = False
+    providers: List[str] = Field(default_factory=list)
 
 class SubmitJobRequest(BaseModel):
     project: str
@@ -336,6 +369,7 @@ class SubmitJobRequest(BaseModel):
     # UTC-converting UI on top, mutually exclusive same as the CRD itself.
     scheduled_start_time: Optional[str] = None
     schedule: str = ""
+    work_items: List[WorkItemReference] = Field(default_factory=list, max_length=20)
 
 
 class SubmitJobResponse(BaseModel):
@@ -376,6 +410,7 @@ class SubmitMatrixRequest(BaseModel):
     gpu_type: str = ""
     scheduled_start_time: Optional[str] = None
     schedule: str = ""
+    work_items: List[WorkItemReference] = Field(default_factory=list, max_length=20)
 
 
 class SubmitMatrixResultItem(BaseModel):

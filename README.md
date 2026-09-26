@@ -158,6 +158,8 @@ default.
 | `FORGE_GITHUB_REF` | `main` | Forge ref used for repository content discovery |
 | `GITHUB_SYNC_INTERVAL_SECONDS` | `3600` | Background Forge metadata refresh interval |
 | `FOURNOS_DEFAULT_PIPELINES` | Built-in list | Fallback comma-separated pipeline names |
+| `WORK_ITEM_ALLOWED_HOSTS` | Empty | Comma-separated Jira hosts allowed for read-only run associations |
+| `WORK_ITEM_JIRA_BASE_URL` | Optional | HTTPS Jira base URL used to expand keys such as `PROJECT-123`; no credentials are stored or used |
 | `BILLING_CSV_STORAGE_PATH` | `./billing_csvs` | Billing report storage directory |
 | `LOG_LEVEL` | `INFO` | Backend log level: ERROR, WARN, INFO, or DEBUG |
 | `MLFLOW_BASE_URL` | Optional | Reserved for the planned Results integration |

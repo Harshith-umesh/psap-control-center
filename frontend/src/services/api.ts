@@ -463,6 +463,8 @@ export const fournosApi = {
     pr_number?: number
     source_sha?: string
     forge?: string
+    work_item_provider?: string
+    work_item_key?: string
     tags?: string
     start_time?: string
     end_time?: string
@@ -505,6 +507,19 @@ export const fournosApi = {
 
   getJobEvents: async (name: string) => {
     const { data } = await api.get(`/fournos/jobs/${name}/events`)
+    return data
+  },
+
+  getWorkItemConfig: async (): Promise<import('../types').WorkItemConfig> => {
+    const { data } = await api.get('/fournos/work-items/config')
+    return data
+  },
+
+  updateJobWorkItems: async (
+    name: string,
+    workItems: import('../types').WorkItemReference[]
+  ): Promise<import('../types').WorkItemReference[]> => {
+    const { data } = await api.put(`/fournos/jobs/${name}/work-items`, { work_items: workItems })
     return data
   },
 

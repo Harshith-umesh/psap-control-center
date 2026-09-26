@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional, Sequence, Tuple
 from uuid import uuid4
 
-from sqlalchemy import Text, and_, cast, func, literal_column, or_, select
+from sqlalchemy import Text, and_, cast, delete, func, literal_column, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,6 +16,7 @@ from app.models.fournos_job import (
     FournosHistoryPreference,
     FournosJob,
     FournosJobEvent,
+    FournosJobWorkItem,
 )
 
 logger = logging.getLogger(__name__)
@@ -145,6 +146,81 @@ async def get_job_by_name(
     return result.scalar_one_or_none()
 
 
+def serialize_work_items(job: FournosJob) -> list[dict[str, str]]:
+    return [
+        {"provider": item.provider, "key": item.key, "url": item.url}
+        for item in sorted(
+            job.work_items or [], key=lambda item: (item.provider, item.key)
+        )
+    ]
+
+
+async def replace_work_items(
+    session: AsyncSession,
+    job: FournosJob,
+    items: Sequence[dict[str, str]],
+    *,
+    created_by_subject: str,
+) -> None:
+    await session.execute(
+        delete(FournosJobWorkItem).where(FournosJobWorkItem.job_id == job.id)
+    )
+    for item in items:
+        session.add(FournosJobWorkItem(
+            job_id=job.id,
+            provider=item["provider"],
+            key=item["key"],
+            url=item["url"],
+            created_by_subject=created_by_subject,
+        ))
+    await session.flush()
+
+
+async def copy_work_items(
+    session: AsyncSession,
+    source: Optional[FournosJob],
+    target: FournosJob,
+    *,
+    created_by_subject: str,
+) -> None:
+    if source is None:
+        return
+    await replace_work_items(
+        session,
+        target,
+        serialize_work_items(source),
+        created_by_subject=created_by_subject,
+    )
+
+
+async def get_work_items_by_job_names(
+    session: AsyncSession, names: Sequence[str]
+) -> dict[str, list[dict[str, str]]]:
+    if not names:
+        return {}
+    result = await session.execute(
+        select(FournosJob.name, FournosJobWorkItem)
+        .join(
+            FournosJobWorkItem,
+            FournosJobWorkItem.job_id == FournosJob.id,
+        )
+        .where(FournosJob.name.in_(names))
+        .order_by(
+            FournosJob.name,
+            FournosJobWorkItem.provider,
+            FournosJobWorkItem.key,
+        )
+    )
+    grouped: dict[str, list[dict[str, str]]] = {}
+    for name, item in result.all():
+        grouped.setdefault(name, []).append({
+            "provider": item.provider,
+            "key": item.key,
+            "url": item.url,
+        })
+    return grouped
+
+
 async def get_requester_subjects_by_names(
     session: AsyncSession,
     names: Sequence[str],
@@ -179,6 +255,8 @@ async def list_jobs(
     source_sha: Optional[str] = None,
     forge: Optional[str] = None,
     tags: Optional[Sequence[str]] = None,
+    work_item_provider: Optional[str] = None,
+    work_item_key: Optional[str] = None,
     created_after: Optional[datetime] = None,
     created_before: Optional[datetime] = None,
     sort_by: Optional[str] = None,
@@ -270,6 +348,17 @@ async def list_jobs(
                         tag.lower(), autoescape=True
                     )
                 )
+    if work_item_provider or work_item_key:
+        work_item_filters = []
+        if work_item_provider:
+            work_item_filters.append(
+                FournosJobWorkItem.provider == work_item_provider.lower()
+            )
+        if work_item_key:
+            work_item_filters.append(
+                FournosJobWorkItem.key == work_item_key.upper()
+            )
+        filters.append(FournosJob.work_items.any(and_(*work_item_filters)))
     if created_after:
         filters.append(FournosJob.created_at >= created_after)
     if created_before:
@@ -422,6 +511,28 @@ async def get_history_filter_options(
         )
         tag_values = list(tag_result.scalars().all())
 
+    work_item_providers: list[str] = []
+    work_item_keys: list[str] = []
+    if include_identity:
+        provider_result = await session.execute(
+            select(FournosJobWorkItem.provider)
+            .join(FournosJob, FournosJob.id == FournosJobWorkItem.job_id)
+            .where(*filters)
+            .distinct()
+            .order_by(FournosJobWorkItem.provider)
+            .limit(limit)
+        )
+        key_result = await session.execute(
+            select(FournosJobWorkItem.key)
+            .join(FournosJob, FournosJob.id == FournosJobWorkItem.job_id)
+            .where(*filters)
+            .distinct()
+            .order_by(FournosJobWorkItem.key)
+            .limit(limit)
+        )
+        work_item_providers = list(provider_result.scalars().all())
+        work_item_keys = list(key_result.scalars().all())
+
     return {
         "identities": identities,
         "repositories": repositories,
@@ -429,6 +540,10 @@ async def get_history_filter_options(
         "source_shas": _normalized_options(sha_values, limit),
         "forge": _normalized_options(forge_values, limit),
         "tags": _normalized_options(tag_values, limit),
+        "work_item_providers": _normalized_options(
+            work_item_providers, limit
+        ),
+        "work_item_keys": _normalized_options(work_item_keys, limit),
     }
 
 
