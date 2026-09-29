@@ -212,12 +212,15 @@ def test_rhaiis_overrides_normalize_to_forge_keys():
 
 
 def test_rhaiis_schema_adds_legacy_controls(monkeypatch):
+    from app.services import rhaiis_ui_schema
+
     def fake_fetch_yaml(path):
         if path.endswith("config.d/rhaiis.yaml"):
             return {"engines": {"vllm": {"images": {"nvidia": "vllm:latest"}}}}
         raise AssertionError(path)
 
     monkeypatch.setattr(project_ui_schema, "fetch_yaml", fake_fetch_yaml)
+    monkeypatch.setattr(rhaiis_ui_schema, "fetch_yaml", fake_fetch_yaml)
     schema = project_ui_schema.ProjectUiSchema.model_validate(
         {
             "project": "rhaiis",
@@ -265,8 +268,46 @@ def test_rhaiis_schema_adds_legacy_controls(monkeypatch):
     assert fields["slack"].default is True
     assert fields["slack_member_id"].required is True
     assert fields["compare_version"].required is True
-    assert fields["prefix_caching"].default is False
+    assert fields["prefix_caching"].default is True
     assert fields["engine"].options == []
+
+
+def test_rhaiis_cpt_cache_uses_pipeline_preset_and_slack_target_is_optional(monkeypatch):
+    from app.schemas.ui_schema import ProjectUiSchema
+    from app.services import rhaiis_ui_schema
+
+    monkeypatch.setattr(rhaiis_ui_schema, "fetch_yaml", lambda _path: {"engines": {}})
+    schema = ProjectUiSchema.model_validate(
+        {
+            "project": "rhaiis",
+            "modes": [
+                {
+                    "id": "cpt",
+                    "kind": "matrix",
+                    "sections": [
+                        {"id": "infra", "label": "Infrastructure", "fields": []},
+                        {
+                            "id": "version",
+                            "label": "Version & Notifications",
+                            "fields": [
+                                {"key": "slack_member_id", "type": "text"},
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+
+    rhaiis_ui_schema.augment_schema(schema)
+
+    fields = {
+        field.key: field
+        for section in schema.modes[0].sections
+        for field in section.fields
+    }
+    assert "prefix_caching" not in fields
+    assert fields["slack_member_id"].required is False
 
 
 def test_rhaiis_workload_presets_are_quick_presets(monkeypatch):

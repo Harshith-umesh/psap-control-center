@@ -71,7 +71,7 @@ def augment_schema(schema: ProjectUiSchema) -> None:
             )
             all_fields.append(infra.fields[-1])
 
-        if run_settings is not None and not any(
+        if mode.id == "single" and run_settings is not None and not any(
             field.key == "prefix_caching" for field in run_settings.fields
         ):
             run_settings.fields.append(
@@ -79,10 +79,11 @@ def augment_schema(schema: ProjectUiSchema) -> None:
                     key="prefix_caching",
                     label="Prefix Caching",
                     type="boolean",
-                    default=False,
+                    default=True,
                     help=(
-                        "Enable runtime prefix caching. The Forge override is "
-                        "selected automatically for the chosen engine."
+                        "Enable runtime prefix caching. vLLM uses enable-prefix-caching; "
+                        "SGLang enables radix cache by default; TRT-LLM uses "
+                        "kv_cache_config.enable_block_reuse."
                     ),
                 )
             )
@@ -149,9 +150,19 @@ def augment_schema(schema: ProjectUiSchema) -> None:
                 # Single-job notifications are always on in the legacy form.
                 field.default = True
             elif field.key == "slack_member_id":
-                field.required = True
+                # The single-job form always sends Slack notifications and
+                # therefore needs a member ID. CPT's notification target is
+                # intentionally optional, matching the legacy FourNos form.
+                field.required = mode.id == "single"
                 if not field.help:
-                    field.help = "Required when Slack notifications are enabled."
+                    field.help = (
+                        "Required for single jobs; optional for CPT pipelines."
+                    )
+            elif field.key == "prefix_caching":
+                # FourNos defaults prefix caching on for RHAIIS single jobs.
+                # CPT cache behavior comes from each Forge pipeline preset;
+                # do not synthesize a false form override for those runs.
+                field.default = True
             elif field.key == "compare_version" and field.visible_if is not None:
                 # The field is conditional in the single-job form; once
                 # Compare Versions is enabled, the comparison target is

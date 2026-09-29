@@ -647,6 +647,7 @@ export default function DynamicSubmitForm({
                         <p className="text-xs text-gray-400">This pipeline declares no workloads.</p>
                       )}
                     </div>
+                    {projectAdapter?.renderMatrixExtras?.(selectedWorkloads)}
                   </div>
 
                   <p className="text-xs text-gray-400">

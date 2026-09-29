@@ -75,6 +75,7 @@ export interface ProjectSubmitAdapter {
     context: Omit<RenderContext, 'field'>,
   ): ReactNode
   renderAdditionalConfig(context: Omit<RenderContext, 'field'>): ReactNode
+  renderMatrixExtras?(selectedWorkloads: string[]): ReactNode
   renderReviewBasics(derived: ProjectDerivedState): ReactNode
   renderAdditionalReview(
     values: Record<string, unknown>,
@@ -126,6 +127,22 @@ function parseOverrideLines(raw: string): Record<string, string> {
     if (index > 0) overrides[line.slice(0, index).trim()] = line.slice(index + 1).trim()
   })
   return overrides
+}
+
+function workloadSelectionIncludesProfile5(field: UiField, selected: unknown): boolean {
+  if (!Array.isArray(selected)) return false
+  return selected.some((value) => {
+    const raw = rawOptionValue(field, value)
+    return raw === 'profile5' || (Array.isArray(raw) && raw.includes('profile5'))
+  })
+}
+
+function renderProfile5RunNote(benchmarkDescription: string): ReactNode {
+  return (
+    <div className="mt-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800" role="note">
+      <strong>Profile 5 (ultra-long context):</strong> PyTorch profiling and warmup never run for this profile. {benchmarkDescription}
+    </div>
+  )
 }
 
 const rhaiisSubmitAdapter: ProjectSubmitAdapter = {
@@ -347,55 +364,72 @@ const rhaiisSubmitAdapter: ProjectSubmitAdapter = {
       )
     }
 
-    if (field.key === 'workload' && this.isCustomWorkloadSelected(values)) {
+    if (field.key === 'workload') {
+      const customWorkload = this.isCustomWorkloadSelected(values)
+      const selectedProfile5 = workloadSelectionIncludesProfile5(field, values.workload)
+      if (!customWorkload && !selectedProfile5) return null
       return (
-        <div className="mt-3 space-y-3 rounded-md border border-gray-200 bg-gray-50 p-3">
-          <label className="block text-xs text-gray-600">
-            Data <span className="text-red-500">*</span>
-            <input
-              type="text"
-              value={String(values.custom_workload_data || '')}
-              onChange={(e) => setFieldValue('custom_workload_data', e.target.value)}
-              className="input mt-1"
-              placeholder="prompt_tokens=1000,output_tokens=1000"
-            />
-          </label>
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-            <label className="text-xs text-gray-600">
-              Concurrencies <span className="text-red-500">*</span>
-              <input
-                type="text"
-                value={String(values.custom_workload_concurrencies || '')}
-                onChange={(e) => setFieldValue('custom_workload_concurrencies', e.target.value)}
-                className="input mt-1"
-                placeholder="1,50,100"
-              />
-            </label>
-            <label className="text-xs text-gray-600">
-              Max Seconds
-              <input
-                type="number"
-                min={1}
-                value={Number(values.custom_workload_max_seconds) || 450}
-                onChange={(e) => setFieldValue('custom_workload_max_seconds', e.target.value === '' ? '' : Number(e.target.value))}
-                className="input mt-1"
-              />
-            </label>
-            <label className="text-xs text-gray-600">
-              Samples (optional)
-              <input
-                type="number"
-                min={1}
-                value={values.custom_workload_samples === '' ? '' : Number(values.custom_workload_samples) || ''}
-                onChange={(e) => setFieldValue('custom_workload_samples', e.target.value === '' ? '' : Number(e.target.value))}
-                className="input mt-1"
-              />
-            </label>
-          </div>
-        </div>
+        <>
+          {customWorkload && (
+            <div className="mt-3 space-y-3 rounded-md border border-gray-200 bg-gray-50 p-3">
+              <label className="block text-xs text-gray-600">
+                Data <span className="text-red-500">*</span>
+                <input
+                  type="text"
+                  value={String(values.custom_workload_data || '')}
+                  onChange={(e) => setFieldValue('custom_workload_data', e.target.value)}
+                  className="input mt-1"
+                  placeholder="prompt_tokens=1000,output_tokens=1000"
+                />
+              </label>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <label className="text-xs text-gray-600">
+                  Concurrencies <span className="text-red-500">*</span>
+                  <input
+                    type="text"
+                    value={String(values.custom_workload_concurrencies || '')}
+                    onChange={(e) => setFieldValue('custom_workload_concurrencies', e.target.value)}
+                    className="input mt-1"
+                    placeholder="1,50,100"
+                  />
+                </label>
+                <label className="text-xs text-gray-600">
+                  Max Seconds
+                  <input
+                    type="number"
+                    min={1}
+                    value={Number(values.custom_workload_max_seconds) || 450}
+                    onChange={(e) => setFieldValue('custom_workload_max_seconds', e.target.value === '' ? '' : Number(e.target.value))}
+                    className="input mt-1"
+                  />
+                </label>
+                <label className="text-xs text-gray-600">
+                  Samples (optional)
+                  <input
+                    type="number"
+                    min={1}
+                    value={values.custom_workload_samples === '' ? '' : Number(values.custom_workload_samples) || ''}
+                    onChange={(e) => setFieldValue('custom_workload_samples', e.target.value === '' ? '' : Number(e.target.value))}
+                    className="input mt-1"
+                  />
+                </label>
+              </div>
+            </div>
+          )}
+          {selectedProfile5 && (
+            renderProfile5RunNote("Its benchmark still runs when Benchmark is enabled.")
+          )}
+        </>
       )
     }
     return null
+  },
+
+  renderMatrixExtras(selectedWorkloads) {
+    if (!selectedWorkloads.includes('profile5')) return null
+    return (
+      renderProfile5RunNote("Its benchmark follows the pipeline's benchmark setting.")
+    )
   },
 
   renderSectionExtras(section, { derived }) {
