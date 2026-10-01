@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 from app.services import fournos_k8s_client as k8s
 from app.services import fournos_watcher as watcher
@@ -56,6 +57,41 @@ def test_log_stream_terminal_sentinel_displaces_oldest_item_when_full():
         assert queue.get_nowait() is None
 
     asyncio.run(exercise_queue())
+
+
+def test_pod_logs_are_processed_and_downloaded_in_bounded_chunks(monkeypatch):
+    class FakeResponse:
+        def __init__(self, chunks):
+            self.chunks = chunks
+            self.released = False
+            self.requested_chunk_sizes = []
+
+        def stream(self, amt):
+            self.requested_chunk_sizes.append(amt)
+            yield from self.chunks
+
+        def release_conn(self):
+            self.released = True
+
+    line_response = FakeResponse([b"first\nsec", b"ond\nthird"])
+    byte_response = FakeResponse([b"first\n", b"second\n"])
+    core_api = MagicMock()
+    core_api.read_namespaced_pod_log.side_effect = [line_response, byte_response]
+    monkeypatch.setattr(k8s, "_ensure_loaded", lambda: None)
+    monkeypatch.setattr(k8s, "_core_api", core_api)
+
+    assert list(k8s.read_pod_log("pod-a", follow=False)) == [
+        "first", "second", "third"
+    ]
+    assert list(k8s.stream_pod_log_bytes("pod-a")) == [
+        b"first\n", b"second\n"
+    ]
+    assert line_response.released is True
+    assert byte_response.released is True
+    assert all(
+        call.kwargs["_preload_content"] is False
+        for call in core_api.read_namespaced_pod_log.call_args_list
+    )
 
 
 def test_taskrun_condition_specific_terminal_reasons_win_over_false_status():
@@ -652,6 +688,21 @@ def test_rhaiis_build_source_requires_a_pin_or_explicit_latest_main():
         )
 
 
+@pytest.mark.parametrize("request_type", ["single", "matrix"])
+def test_submission_rejects_noncanonical_gpu_types(request_type):
+    kwargs = {"project": "rhaiis", "cluster": "hera", "gpu_type": "NVIDIA-H200"}
+    if request_type == "matrix":
+        kwargs.update(models=[{"key": "model"}], workloads=["profile1"])
+        model = SubmitMatrixRequest
+    else:
+        model = SubmitJobRequest
+
+    with pytest.raises(ValidationError, match="lowercase alphanumeric"):
+        model(**kwargs)
+
+    assert model(**{**kwargs, "gpu_type": "h200"}).gpu_type == "h200"
+
+
 def test_rhaiis_overrides_normalize_to_forge_keys():
     assert fournos_api._normalize_rhaiis_overrides(
         "rhaiis",
@@ -844,3 +895,18 @@ def test_rhaiis_workload_presets_are_quick_presets(monkeypatch):
 )
 def test_log_issue_detection_ignores_decoration_only_markers(line, expected):
     assert fournos_api._is_log_issue(line) is expected
+
+
+def test_release_refresh_replaces_an_existing_cache(monkeypatch):
+    monkeypatch.setattr(fournos_api, "_releases_cache", [{"tag_name": "old"}])
+    monkeypatch.setattr(fournos_api, "_releases_inflight", None)
+    monkeypatch.setattr(
+        fournos_api,
+        "_fetch_github_releases_sync",
+        lambda: [{"tag_name": "new"}],
+    )
+
+    refreshed = asyncio.run(fournos_api.refresh_releases())
+
+    assert refreshed == [{"tag_name": "new"}]
+    assert fournos_api._releases_cache == refreshed

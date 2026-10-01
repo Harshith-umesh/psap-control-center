@@ -1,6 +1,6 @@
 """Single shared point of truth for refreshing everything sourced from the
 Forge GitHub repo — project discovery, each project's ui/submit.yaml
-schema, Tekton pipeline definitions, and the open-PR list.
+schema, Tekton pipeline definitions, and the open-PR/release lists.
 
 Each of those already has its own in-process cache (forge_discovery,
 project_ui_schema, pipeline_definitions, the open-PR cache in api/
@@ -130,12 +130,15 @@ async def _do_refresh() -> dict:
 
     # Open PRs — imported lazily to avoid a circular import (api/fournos.py
     # imports several of the services this module also imports).
+    from app.api.fournos import refresh_open_prs, refresh_releases
     try:
-        from app.api.fournos import refresh_open_prs
-
         await refresh_open_prs()
     except Exception as exc:
         errors.append("open PRs: {}".format(exc))
+    try:
+        await refresh_releases()
+    except Exception as exc:
+        errors.append("releases: {}".format(exc))
 
     if errors:
         logger.warning(

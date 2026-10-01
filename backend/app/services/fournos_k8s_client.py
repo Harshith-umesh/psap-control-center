@@ -6,6 +6,7 @@ async FastAPI backend. Reuses the Hearth kubeconfig when available.
 
 from __future__ import annotations
 
+import codecs
 import logging
 import os
 import re
@@ -673,6 +674,20 @@ def get_forge_execution_images(
     return [images[key] for key in sorted(images)]
 
 
+_LOG_STREAM_CHUNK_SIZE = 64 * 1024
+
+
+def _stream_log_response_bytes(response) -> Generator[bytes, None, None]:
+    try:
+        for chunk in response.stream(amt=_LOG_STREAM_CHUNK_SIZE):
+            if chunk:
+                yield chunk
+    finally:
+        release_conn = getattr(response, "release_conn", None)
+        if callable(release_conn):
+            release_conn()
+
+
 def read_pod_log(
     pod_name: str,
     namespace: Optional[str] = None,
@@ -691,18 +706,47 @@ def read_pod_log(
     if tail_lines:
         kwargs["tail_lines"] = tail_lines
     try:
-        if follow:
-            for line in _core_api.read_namespaced_pod_log(
-                **kwargs, _preload_content=False
-            ).stream():
-                decoded = line.decode("utf-8", errors="replace").rstrip("\n")
-                yield decoded
-        else:
-            log_text = _core_api.read_namespaced_pod_log(**kwargs)
-            for line in log_text.splitlines():
-                yield line
+        response = _core_api.read_namespaced_pod_log(
+            **kwargs, _preload_content=False
+        )
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        buffered = ""
+        for chunk in _stream_log_response_bytes(response):
+            buffered += decoder.decode(chunk)
+            while "\n" in buffered:
+                line, buffered = buffered.split("\n", 1)
+                yield line.rstrip("\r")
+        buffered += decoder.decode(b"", final=True)
+        if buffered:
+            yield buffered.rstrip("\r")
     except ApiException as exc:
         yield "Error reading logs: {}".format(exc.reason)
+
+
+def stream_pod_log_bytes(
+    pod_name: str,
+    namespace: Optional[str] = None,
+    container: Optional[str] = None,
+) -> Generator[bytes, None, None]:
+    """Yield a complete pod log in bounded chunks without materializing it."""
+    _ensure_loaded()
+    if _core_api is None:
+        yield b"Kubernetes client not available\n"
+        return
+    ns = namespace or settings.FOURNOS_NAMESPACE
+    kwargs: dict = {
+        "name": pod_name,
+        "namespace": ns,
+        "follow": False,
+        "_preload_content": False,
+    }
+    if container:
+        kwargs["container"] = container
+    try:
+        response = _core_api.read_namespaced_pod_log(**kwargs)
+        yield from _stream_log_response_bytes(response)
+    except ApiException as exc:
+        yield "Error reading logs: {}\n".format(exc.reason).encode("utf-8")
 
 
 

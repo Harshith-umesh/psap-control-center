@@ -2,10 +2,23 @@
 
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+_FOURNOS_GPU_TYPE_RE = re.compile(r"^[a-z0-9]+$")
+
+
+def _validate_fournos_gpu_type(value: str) -> str:
+    normalized = value.strip()
+    if normalized and not _FOURNOS_GPU_TYPE_RE.fullmatch(normalized):
+        raise ValueError(
+            "gpu_type must be a lowercase alphanumeric Fournos short name"
+        )
+    return normalized
 
 
 # -- Job schemas --
@@ -405,6 +418,11 @@ class SubmitJobRequest(BaseModel):
     work_items: List[WorkItemReference] = Field(default_factory=list, max_length=20)
     run_group_ids: List[str] = Field(default_factory=list, max_length=20)
 
+    @field_validator("gpu_type")
+    @classmethod
+    def validate_gpu_type(cls, value: str) -> str:
+        return _validate_fournos_gpu_type(value)
+
 
 class SubmitJobResponse(BaseModel):
     status: str = "ok"
@@ -447,6 +465,11 @@ class SubmitMatrixRequest(BaseModel):
     schedule: str = ""
     work_items: List[WorkItemReference] = Field(default_factory=list, max_length=20)
     run_group_ids: List[str] = Field(default_factory=list, max_length=20)
+
+    @field_validator("gpu_type")
+    @classmethod
+    def validate_gpu_type(cls, value: str) -> str:
+        return _validate_fournos_gpu_type(value)
 
 
 class SubmitMatrixResultItem(BaseModel):

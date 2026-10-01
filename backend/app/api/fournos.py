@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import StreamingResponse
 from sqlalchemy.exc import IntegrityError
 
 from app.core.auth import (
@@ -1562,13 +1562,10 @@ async def download_logs(job_name: str, pod_name: str):
     if pod_name not in pod_names:
         raise HTTPException(404, "Pod not found for this job")
 
-    log_text = await asyncio.to_thread(
-        lambda: "\n".join(k8s.read_pod_log(pod_name, follow=False))
-    )
     safe_job = re.sub(r"[^A-Za-z0-9._-]", "-", job_name)
     safe_pod = re.sub(r"[^A-Za-z0-9._-]", "-", pod_name)
-    return Response(
-        content=log_text,
+    return StreamingResponse(
+        k8s.stream_pod_log_bytes(pod_name),
         media_type="text/plain",
         headers={
             "Cache-Control": "no-store",
@@ -2153,6 +2150,23 @@ async def _fetch_releases_coalesced() -> list:
     try:
         _releases_cache = await future
         return _releases_cache
+    finally:
+        _releases_inflight = None
+
+
+async def refresh_releases() -> list:
+    """Refresh the release cache for the shared GitHub sync lifecycle."""
+    global _releases_cache, _releases_inflight
+    if _releases_inflight is not None:
+        return await _releases_inflight
+    future: "asyncio.Future[list]" = asyncio.ensure_future(
+        asyncio.to_thread(_fetch_github_releases_sync)
+    )
+    _releases_inflight = future
+    try:
+        releases = await future
+        _releases_cache = releases
+        return releases
     finally:
         _releases_inflight = None
 

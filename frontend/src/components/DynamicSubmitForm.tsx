@@ -5,7 +5,7 @@ import ReviewRow, { ReviewSection } from './ReviewRow'
 import YamlPreview from './YamlPreview'
 import { getProjectSubmitAdapter } from './rhaiis/rhaiisSubmitAdapter'
 import { useSubmitJob, useSubmitMatrix } from '../hooks/useFournos'
-import { buildMatrixJobPreviews, buildSingleJobPreview, toYamlPreview } from '../utils/fournosJobPreview'
+import { buildMatrixJobPreviews, buildSingleJobPreview, mergeMatrixConfigOverrides, toYamlPreview } from '../utils/fournosJobPreview'
 import type { JobScheduling, ProjectUiSchema, PullRequestSelection, RunGroupReference, UiField, UiMode, UiOption, UiPipeline, UiQuickPreset, UiVisibleIf, WorkItemReference } from '../types'
 
 // ─── Generic, schema-driven submit form ────────────────────────────────
@@ -376,7 +376,7 @@ export default function DynamicSubmitForm({
           cluster: basics.cluster,
           pipeline: basics.pipeline,
           args,
-          config_overrides: { ...overrides, ...stringifyOverrides(selectedPipeline.overrides) },
+          config_overrides: mergeMatrixConfigOverrides(selectedPipeline.overrides, overrides),
           models: selectedModels.map((key) => {
             const m = modelByKey.get(key)
             return {
