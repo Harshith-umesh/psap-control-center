@@ -3,12 +3,16 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+from fastapi import HTTPException
+
 from app.services import fournos_k8s_client as k8s
 from app.services import fournos_watcher as watcher
 from app.services.source_provenance import extract_source_request_fields
 from app.api import fournos as fournos_api
 from app.core import database as database_core
 from app.services import fournos_db_service as db_service
+from app.services import project_ui_schema
 from app.schemas.fournos import (
     PullRequestSelection,
     SubmitJobRequest,
@@ -622,3 +626,221 @@ def test_pr_provenance_schema_migrations_and_indexes_are_registered():
     assert indexes["ix_fournos_jobs_source_pr"] == (
         "source_repository, source_pr_number"
     )
+def test_rhaiis_build_source_requires_a_pin_or_explicit_latest_main():
+    from app.schemas.fournos import SubmitJobRequest
+
+    with pytest.raises(HTTPException, match="build source is required"):
+        fournos_api._resolve_build_source(
+            SubmitJobRequest(project="rhaiis", cluster="hera")
+        )
+
+    assert fournos_api._resolve_build_source(
+        SubmitJobRequest(project="rhaiis", cluster="hera", pull_sha="  abc123  ")
+    ) == "abc123"
+    assert fournos_api._resolve_build_source(
+        SubmitJobRequest(project="rhaiis", cluster="hera", use_latest_main=True)
+    ) == "main"
+
+    with pytest.raises(HTTPException, match="either a pinned build source"):
+        fournos_api._resolve_build_source(
+            SubmitJobRequest(
+                project="rhaiis",
+                cluster="hera",
+                pull_sha="abc123",
+                use_latest_main=True,
+            )
+        )
+
+
+def test_rhaiis_overrides_normalize_to_forge_keys():
+    assert fournos_api._normalize_rhaiis_overrides(
+        "rhaiis",
+        {
+            "tests.rhaiis.slack_member_id": "U0123456789",
+            "rhaiis.compare_versions.enabled": "true",
+            "tests.rhaiis.workload_key": '["profile1", "custom"]',
+        },
+    ) == {
+        "tests.rhaiis.slack_user": "U0123456789",
+        "tests.rhaiis.workload_keys": '["profile1", "custom"]',
+    }
+
+
+def test_rhaiis_schema_adds_legacy_controls(monkeypatch):
+    from app.services import rhaiis_ui_schema
+
+    def fake_fetch_yaml(path):
+        if path.endswith("config.d/rhaiis.yaml"):
+            return {"engines": {"vllm": {"images": {"nvidia": "vllm:latest"}}}}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(project_ui_schema, "fetch_yaml", fake_fetch_yaml)
+    monkeypatch.setattr(rhaiis_ui_schema, "fetch_yaml", fake_fetch_yaml)
+    schema = project_ui_schema.ProjectUiSchema.model_validate(
+        {
+            "project": "rhaiis",
+            "modes": [
+                {
+                    "id": "single",
+                    "sections": [
+                        {
+                            "id": "infra",
+                            "fields": [
+                                {"key": "engine", "type": "select", "maps_to": "rhaiis.engine"},
+                            ],
+                        },
+                        {
+                            "id": "model",
+                            "fields": [
+                                {"key": "model", "type": "select"},
+                                {"key": "workload", "type": "multiselect"},
+                                {"key": "benchmark", "type": "boolean"},
+                                {"key": "warmup", "type": "boolean"},
+                                {"key": "slack", "type": "boolean"},
+                                {"key": "slack_member_id", "type": "text"},
+                                {
+                                    "key": "compare_version",
+                                    "type": "text",
+                                    "visible_if": {"field": "compare_versions", "equals": True},
+                                },
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+
+    resolved = project_ui_schema._resolve_schema("rhaiis", schema, strict=True)
+    mode = resolved.modes[0]
+    fields = {field.key: field for section in mode.sections for field in section.fields}
+    assert "cluster_profile" not in fields
+    assert fields["gpu_count"].default == 1
+    assert fields["model"].options[-1].value == "__custom_model__"
+    assert fields["workload"].options[-1].value == "__custom_workload__"
+    assert fields["warmup"].default is True
+    assert fields["benchmark"].default is True
+    assert fields["slack"].default is True
+    assert fields["slack_member_id"].required is True
+    assert fields["compare_version"].required is True
+    assert fields["prefix_caching"].default is True
+    assert fields["engine"].options == []
+
+
+def test_rhaiis_cpt_cache_uses_pipeline_preset_and_slack_target_is_optional(monkeypatch):
+    from app.schemas.ui_schema import ProjectUiSchema
+    from app.services import rhaiis_ui_schema
+
+    monkeypatch.setattr(rhaiis_ui_schema, "fetch_yaml", lambda _path: {"engines": {}})
+    schema = ProjectUiSchema.model_validate(
+        {
+            "project": "rhaiis",
+            "modes": [
+                {
+                    "id": "cpt",
+                    "kind": "matrix",
+                    "sections": [
+                        {"id": "infra", "label": "Infrastructure", "fields": []},
+                        {
+                            "id": "version",
+                            "label": "Version & Notifications",
+                            "fields": [
+                                {"key": "slack_member_id", "type": "text"},
+                            ],
+                        },
+                    ],
+                }
+            ],
+        }
+    )
+
+    rhaiis_ui_schema.augment_schema(schema)
+
+    fields = {
+        field.key: field
+        for section in schema.modes[0].sections
+        for field in section.fields
+    }
+    assert "prefix_caching" not in fields
+    assert fields["slack_member_id"].required is False
+
+
+def test_rhaiis_workload_presets_are_quick_presets(monkeypatch):
+    def fake_fetch_yaml(path):
+        if path.endswith("presets.d/workloads.yaml"):
+            return {
+                "__multiple": True,
+                "sglang": {"rhaiis.engine": "sglang"},
+                "profile1-balanced": {"tests.rhaiis.workload_key": "profile1"},
+                "profile4-long-context": {"tests.rhaiis.workload_key": "profile4"},
+                "benchmark-standard": {
+                    "extends": ["benchmark"],
+                    "tests.rhaiis.workload_key": ["profile1", "profile4"],
+                },
+                "sglang-ci-quick": {
+                    "extends": ["sglang"],
+                    "tests.rhaiis.workload_key": "profile1",
+                },
+            }
+        if path.endswith("config.d/rhaiis.yaml"):
+            return {"engines": {}}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(project_ui_schema, "fetch_yaml", fake_fetch_yaml)
+    schema = project_ui_schema.ProjectUiSchema.model_validate(
+        {
+            "project": "rhaiis",
+            "modes": [
+                {
+                    "id": "single",
+                    "presets_ref": {"path": "presets.d/workloads.yaml"},
+                    "sections": [
+                        {
+                            "id": "model",
+                            "fields": [
+                                {
+                                    "key": "engine",
+                                    "type": "radio",
+                                    "maps_to": "rhaiis.engine",
+                                },
+                                {
+                                    "key": "workload",
+                                    "type": "multiselect",
+                                    "maps_to": "tests.rhaiis.workload_key",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    mode = project_ui_schema._resolve_schema("rhaiis", schema, strict=True).modes[0]
+    workload = next(field for section in mode.sections for field in section.fields if field.key == "workload")
+    quick = {preset.key: preset for preset in mode.quick_presets}
+
+    assert {option.value for option in workload.options if option.value != "__custom_workload__"} == {
+        "profile1-balanced",
+        "profile4-long-context",
+    }
+    assert quick["benchmark-standard"].fills["workload"] == [
+        "profile1-balanced",
+        "profile4-long-context",
+    ]
+    assert quick["benchmark-standard"].overrides == {}
+    assert quick["sglang-ci-quick"].fills["engine"] == "sglang"
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("ERROR: failed to resolve the image", True),
+        ("warning: retrying request", True),
+        ("ERROR: ----------------", False),
+        ("normal output", False),
+        ("", False),
+    ],
+)
+def test_log_issue_detection_ignores_decoration_only_markers(line, expected):
+    assert fournos_api._is_log_issue(line) is expected

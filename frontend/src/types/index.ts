@@ -768,6 +768,14 @@ export interface PullRequestSelection {
   requested_sha: string
 }
 
+export interface GitHubRelease {
+  tag_name: string
+  name: string
+  prerelease: boolean
+  published_at: string | null
+  html_url: string
+}
+
 export interface GithubSyncStatus {
   in_progress: boolean
   last_synced_at: string | null
@@ -788,6 +796,7 @@ export interface SubmitJobRequest {
   config_overrides: Record<string, string>
   pull_request?: PullRequestSelection | null
   pull_sha: string
+  use_latest_main?: boolean
   priority?: string
   gpu_type?: string
   gpu_count?: number
@@ -829,6 +838,7 @@ export interface SubmitMatrixRequest {
   exclusive: boolean
   pull_request?: PullRequestSelection | null
   pull_sha: string
+  use_latest_main?: boolean
   gpu_type: string
   scheduled_start_time?: string | null
   schedule?: string

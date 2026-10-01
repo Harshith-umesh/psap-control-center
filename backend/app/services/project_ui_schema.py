@@ -40,6 +40,7 @@ from app.schemas.ui_schema import (
     UiQuickPreset,
 )
 from app.services.github_content import fetch_yaml, list_yamls
+from app.services import project_adapters
 
 logger = logging.getLogger(__name__)
 
@@ -157,11 +158,39 @@ def _resolve_mode_presets(
         )
         return
 
+    # Keep the pool available while resolving `extends`. Forge applies parent
+    # presets before the child, so the UI should expose inherited field values
+    # too (for example, `sglang-ci-quick` inherits the SGLang engine).
+    preset_entries = {
+        key: overrides
+        for key, overrides in entries
+        if isinstance(key, str) and isinstance(overrides, dict)
+    }
+
+    def inherited_overrides(key: str, overrides: dict, seen: frozenset[str] = frozenset()) -> dict:
+        if key in seen:
+            logger.warning("Cyclic preset inheritance detected at %s", key)
+            return {}
+        merged: dict = {}
+        parents = overrides.get("extends", [])
+        if isinstance(parents, str):
+            parents = [parents]
+        if isinstance(parents, list):
+            for parent in parents:
+                parent_key = str(parent)
+                parent_overrides = preset_entries.get(parent_key)
+                if isinstance(parent_overrides, dict):
+                    merged.update(
+                        inherited_overrides(parent_key, parent_overrides, seen | {key})
+                    )
+        merged.update({k: v for k, v in overrides.items() if k != "extends"})
+        return merged
+
     # Pass 1: single-dimension presets become options; remember, per field,
     # which preset key produced each raw override value (needed to translate
     # a compound preset's raw value back into a selectable option key below).
     value_to_key: Dict[str, Dict[str, str]] = {}
-    compound_candidates: List[Tuple[str, dict, List[UiField]]] = []
+    compound_candidates: List[Tuple[str, dict, List[UiField], dict]] = []
 
     for key, overrides in entries:
         if not isinstance(overrides, dict):
@@ -169,8 +198,26 @@ def _resolve_mode_presets(
 
         matched = [f for mt, f in maps_to_field.items() if mt in overrides]
 
-        if len(matched) >= 2:
-            compound_candidates.append((key, overrides, matched))
+        # A RHAIIS workload preset can still be compound even though its
+        # raw YAML only touches the workload key: `extends` carries the
+        # preset composition, and list-valued workload keys select multiple
+        # workload profiles. Those belong in Quick Presets, not in the
+        # Workload Profiles picker.
+        single_field_compound = (
+            len(matched) == 1
+            and (
+                "extends" in overrides
+                or (
+                    matched[0].type == "multiselect"
+                    and isinstance(overrides.get(matched[0].maps_to or ""), list)
+                )
+            )
+        )
+
+        if len(matched) >= 2 or single_field_compound:
+            compound_candidates.append(
+                (key, overrides, matched, inherited_overrides(key, overrides))
+            )
         elif len(matched) == 1 and matched[0].type in _OPTION_FIELD_TYPES:
             field = matched[0]
             field.options.append(
@@ -185,12 +232,43 @@ def _resolve_mode_presets(
 
     # Pass 2: resolve compound presets into quick_presets now that every
     # field's raw-value -> preset-key lookup is complete.
-    for key, overrides, matched in compound_candidates:
+    for key, overrides, matched, effective_overrides in compound_candidates:
+        # An inherited engine/accelerator is part of the quick preset even
+        # when the child YAML only declares it through `extends`.
+        effective_matched = list(matched)
+        for field in maps_to_field.values():
+            if field not in effective_matched and field.maps_to in effective_overrides:
+                effective_matched.append(field)
+
         fills: Dict[str, object] = {}
-        for field in matched:
-            raw_val = overrides[field.maps_to]
-            fills[field.key] = value_to_key.get(field.key, {}).get(str(raw_val), raw_val)
-        leftover = {k: v for k, v in overrides.items() if k not in maps_to_field}
+        for field in effective_matched:
+            raw_val = effective_overrides[field.maps_to]
+            if field.type == "multiselect" and isinstance(raw_val, list):
+                fills[field.key] = [
+                    value_to_key.get(field.key, {}).get(str(item), item)
+                    for item in raw_val
+                ]
+            else:
+                fills[field.key] = value_to_key.get(field.key, {}).get(str(raw_val), raw_val)
+
+        # Prefix caching is a derived control with engine-specific Forge keys,
+        # so it is intentionally not declared as a normal `maps_to` field.
+        # Still reflect inherited prefix-cache presets in the UI.
+        if "rhaiis.engines.vllm.args.enable-prefix-caching" in effective_overrides:
+            fills["prefix_caching"] = bool(
+                effective_overrides["rhaiis.engines.vllm.args.enable-prefix-caching"]
+            )
+        elif "rhaiis.engines.vllm.args.no-enable-prefix-caching" in effective_overrides:
+            fills["prefix_caching"] = not bool(
+                effective_overrides["rhaiis.engines.vllm.args.no-enable-prefix-caching"]
+            )
+        # `extends` is Forge preset metadata. It helps us classify the entry,
+        # but must never be submitted as a config override by the UI.
+        leftover = {
+            k: v
+            for k, v in overrides.items()
+            if k not in maps_to_field and k != "extends"
+        }
         mode.quick_presets.append(
             UiQuickPreset(key=key, label=_titleize(key), fills=fills, overrides=leftover)
         )
@@ -346,6 +424,7 @@ def _resolve_schema(
         for section in mode.sections:
             for field in section.fields:
                 _resolve_field_options_ref(project, field, strict=strict)
+    project_adapters.augment_schema(project, schema)
     return schema
 
 

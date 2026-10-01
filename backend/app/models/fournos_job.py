@@ -6,13 +6,20 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from sqlalchemy import (
-    Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text, Index,
-    UniqueConstraint, func,
+    Boolean, Column, DateTime, Float, ForeignKey, Integer, JSON, String, Text,
+    Index, UniqueConstraint, func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
+
+
+# Keep PostgreSQL as the primary type so production queries retain JSONB and
+# ARRAY operators/comparators, while allowing SQLite local development to
+# initialize the same model with portable JSON storage.
+_JSON = JSONB().with_variant(JSON(), "sqlite")
+_STRING_LIST = ARRAY(String).with_variant(JSON(), "sqlite")
 
 
 class FournosJob(Base):
@@ -39,7 +46,7 @@ class FournosJob(Base):
     # requester selected.  A merged-code run normally executes the Forge
     # commit baked into the container image; MLflow and the pod image digest
     # are therefore the authoritative record of what actually ran.
-    forge_execution = Column(JSONB, default=dict)
+    forge_execution = Column(_JSON, default=dict)
     forge_provenance_state = Column(
         String(50), default="pending", nullable=False
     )
@@ -55,24 +62,24 @@ class FournosJob(Base):
     duration_seconds = Column(Float, nullable=True)
     mlflow_url = Column(String(1024), default="")
     ci_artifacts_url = Column(String(1024), default="")
-    config_overrides = Column(JSONB, default=dict)
-    tags = Column(ARRAY(String), default=list)
-    fjob_spec = Column(JSONB, default=dict)
-    fjob_status = Column(JSONB, default=dict)
+    config_overrides = Column(_JSON, default=dict)
+    tags = Column(_STRING_LIST, default=list)
+    fjob_spec = Column(_JSON, default=dict)
+    fjob_status = Column(_JSON, default=dict)
     # Snapshot of the merged pipeline stage list (same shape the live
     # job-detail endpoint builds via pipeline_definitions.merge_pipeline_
     # stages) taken when the job reaches a terminal phase (with a small retry
     # window for transient K8s failures). The PipelineRun/TaskRuns themselves
     # may be gone by the time a job is opened from History, so this is the
     # durable copy used to render the timeline and failed step.
-    stages = Column(JSONB, default=list)
+    stages = Column(_JSON, default=list)
     # Failed/missing PipelineRun snapshots are retried a small, bounded number
     # of times. Keeping this state in the DB prevents every watcher restart or
     # full-sync pass from creating another Kubernetes API storm.
     stage_snapshot_attempts = Column(Integer, default=0, nullable=False)
     stage_snapshot_attempted_at = Column(DateTime(timezone=True), nullable=True)
     failure_outcome = Column(String(50), default="", index=True)
-    failure_summary = Column(JSONB, default=dict)
+    failure_summary = Column(_JSON, default=dict)
     failure_enrichment_state = Column(
         String(50), default="pending", nullable=False
     )
@@ -285,7 +292,7 @@ class FournosHistoryPreference(Base):
 
     subject = Column(String(255), primary_key=True)
     schema_version = Column(Integer, nullable=False, default=1)
-    state = Column(JSONB, nullable=False, default=dict)
+    state = Column(_JSON, nullable=False, default=dict)
     updated_at = Column(
         DateTime(timezone=True),
         nullable=False,

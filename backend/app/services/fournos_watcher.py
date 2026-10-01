@@ -53,11 +53,13 @@ FINAL_ENRICHMENT_STATES = {
 
 def _init_watcher_db(loop: asyncio.AbstractEventLoop) -> None:
     global _watcher_engine, _watcher_session
+    pool_kwargs = {}
+    if not settings.DATABASE_URL.startswith("sqlite"):
+        pool_kwargs = {"pool_size": 3, "max_overflow": 5}
     _watcher_engine = create_async_engine(
         settings.DATABASE_URL,
         echo=False,
-        pool_size=3,
-        max_overflow=5,
+        **pool_kwargs,
     )
     _watcher_session = async_sessionmaker(
         _watcher_engine,
