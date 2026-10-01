@@ -17,8 +17,9 @@ import {
 } from '@heroicons/react/24/outline'
 import clsx from 'clsx'
 import LoginModal from './LoginModal'
+import { useAuthConfig } from '../hooks/useAuthConfig'
 import HearthConnectModal from './HearthConnectModal'
-import { isAuthenticated, isAdmin, getSession, clearSession } from '../stores/authStore'
+import { isAuthenticated, isAdmin, getDisplayName, clearSession } from '../stores/authStore'
 import { authApi } from '../services/api'
 import { useHearthStatus, useDisconnectHearth } from '../hooks/useHearth'
 import { useReservations } from '../hooks/useReservations'
@@ -28,7 +29,7 @@ const navigation = [
   { name: 'Clusters', href: '/clusters', icon: ServerStackIcon },
   { name: 'Reservations', href: '/reservations', icon: ClipboardDocumentListIcon },
   { name: 'Calendar', href: '/calendar', icon: CalendarDaysIcon },
-  { name: 'Testing', href: '/testing', icon: BeakerIcon },
+  { name: 'Testing', href: '/testing', icon: BeakerIcon, badge: 'Experimental' },
   { name: 'Results', href: '/results', icon: ChartBarIcon, comingSoon: true },
   { name: 'Cost Explorer', href: '/cost-explorer', icon: CurrencyDollarIcon, adminOnly: true },
   { name: 'Settings', href: '/settings', icon: Cog6ToothIcon, adminOnly: true },
@@ -132,6 +133,7 @@ export default function Layout() {
   const [hearthConnectOpen, setHearthConnectOpen] = useState(false)
   const [authed, setAuthed] = useState(isAuthenticated())
   const location = useLocation()
+  const authConfigQuery = useAuthConfig()
 
   const { data: hearthStatus } = useHearthStatus()
   const admin = isAdmin()
@@ -223,6 +225,11 @@ export default function Layout() {
                                 Soon
                               </span>
                             )}
+                            {item.badge && (
+                              <span className="ml-auto rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-300">
+                                {item.badge}
+                              </span>
+                            )}
                           </NavLink>
                         </li>
                       ))}
@@ -278,6 +285,11 @@ export default function Layout() {
                     {item.comingSoon && (
                       <span className="ml-auto text-xs text-gray-500 bg-white/10 px-2 py-0.5 rounded-full">
                         Soon
+                      </span>
+                    )}
+                    {item.badge && (
+                      <span className="ml-auto rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-300">
+                        {item.badge}
                       </span>
                     )}
                   </NavLink>
@@ -342,7 +354,7 @@ export default function Layout() {
                 <div className="flex items-center gap-3">
                   <span className="flex items-center gap-1.5 text-sm text-gray-300">
                     <LockClosedIcon className="h-4 w-4 text-green-400" />
-                    <span className="hidden sm:inline font-medium">{getSession()?.username}</span>
+                    <span className="hidden sm:inline font-medium">{getDisplayName()}</span>
                   </span>
                   <button
                     onClick={handleLogout}
@@ -369,7 +381,14 @@ export default function Layout() {
         </main>
       </div>
 
-      <LoginModal open={loginOpen} onClose={() => setLoginOpen(false)} />
+      <LoginModal
+        open={loginOpen}
+        onClose={() => setLoginOpen(false)}
+        authConfig={authConfigQuery.data}
+        configLoading={authConfigQuery.isPending || authConfigQuery.isFetching}
+        configError={authConfigQuery.isError}
+        onRetryConfig={() => { void authConfigQuery.refetch() }}
+      />
       <HearthConnectModal
         open={hearthConnectOpen}
         configured={hearthStatus?.configured ?? false}

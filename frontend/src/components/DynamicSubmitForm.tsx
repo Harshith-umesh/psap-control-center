@@ -6,7 +6,7 @@ import YamlPreview from './YamlPreview'
 import { getProjectSubmitAdapter } from './rhaiis/rhaiisSubmitAdapter'
 import { useSubmitJob, useSubmitMatrix } from '../hooks/useFournos'
 import { buildMatrixJobPreviews, buildSingleJobPreview, toYamlPreview } from '../utils/fournosJobPreview'
-import type { JobScheduling, ProjectUiSchema, UiField, UiMode, UiOption, UiPipeline, UiQuickPreset, UiVisibleIf } from '../types'
+import type { JobScheduling, ProjectUiSchema, PullRequestSelection, RunGroupReference, UiField, UiMode, UiOption, UiPipeline, UiQuickPreset, UiVisibleIf, WorkItemReference } from '../types'
 
 // ─── Generic, schema-driven submit form ────────────────────────────────
 //
@@ -35,11 +35,15 @@ export interface SubmitBasics {
   priority: string
   exclusive: boolean
   pullSha: string
+  pullRequest: PullRequestSelection | null
   useLatestMain: boolean
   /** Human-readable label for the review step, e.g. "#123 — title (author)". */
   prLabel: string
   /** When this job (or recurring template) should run — see ClusterScheduleModal. */
   scheduling: JobScheduling
+  workItems: WorkItemReference[]
+  runGroupIds: string[]
+  runGroups: RunGroupReference[]
 }
 
 /** SubmitJobRequest/SubmitMatrixRequest's schedule/scheduled_start_time pair for a given choice. */
@@ -385,7 +389,10 @@ export default function DynamicSubmitForm({
           owner: basics.owner,
           priority: basics.priority,
           exclusive: basics.exclusive,
+          pull_request: basics.pullRequest,
           pull_sha: basics.pullSha,
+          work_items: basics.workItems,
+          run_group_ids: basics.runGroupIds,
           use_latest_main: basics.useLatestMain,
           gpu_type: derived.gpuType,
           ...schedulingRequestFields(basics.scheduling),
@@ -409,7 +416,10 @@ export default function DynamicSubmitForm({
         owner: basics.owner,
         exclusive: basics.exclusive,
         config_overrides: configOverrides,
+        pull_request: basics.pullRequest,
         pull_sha: basics.pullSha,
+        work_items: basics.workItems,
+        run_group_ids: basics.runGroupIds,
         use_latest_main: basics.useLatestMain,
         priority: basics.priority,
         gpu_type: derived.gpuType,
@@ -690,6 +700,7 @@ export default function DynamicSubmitForm({
           priority: basics.priority,
           exclusive: basics.exclusive,
           pullSha: basics.useLatestMain ? 'main' : basics.pullSha,
+          pullRequest: basics.pullRequest,
           gpuType: derived.gpuType,
           gpuCount: derived.gpuCount,
           args,
@@ -724,7 +735,7 @@ export default function DynamicSubmitForm({
                 <ReviewRow label="Cluster" value={basics.cluster} missing={!basics.cluster.trim()} />
                 <ReviewRow label="Pipeline" value={basics.pipeline} />
                 {projectAdapter?.renderReviewBasics(derived)}
-                {basics.owner && <ReviewRow label="Owner" value={basics.owner} />}
+                {basics.owner && <ReviewRow label="Requested by" value={basics.owner} />}
                 <ReviewRow label="Priority" value={basics.priority} />
                 {basics.exclusive && <ReviewRow label="Exclusive" value="Yes" />}
                 {projectAdapter?.requiresBuildSource && basics.useLatestMain && (
@@ -733,6 +744,13 @@ export default function DynamicSubmitForm({
                 {basics.pullSha && (
                   <ReviewRow label={projectAdapter?.buildSourceLabel || 'Pull Request'} value={basics.prLabel} mono={!basics.prLabel || basics.prLabel === basics.pullSha} />
                 )}
+                {basics.workItems.map((item) => (
+                  <ReviewRow key={`${item.provider}-${item.key || item.url}`} label="Work item" value={item.key || item.url} />
+                ))}
+                {basics.runGroupIds.map((id) => {
+                  const group = basics.runGroups.find((candidate) => candidate.id === id)
+                  return group ? <ReviewRow key={id} label={group.group_type} value={group.display_name} /> : null
+                })}
                 <ReviewRow
                   label="Schedule"
                   value={

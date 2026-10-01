@@ -14,6 +14,44 @@ import Settings from './pages/Settings'
 import CostExplorer from './pages/CostExplorer'
 import { isAdmin, setSession } from './stores/authStore'
 import { authApi } from './services/api'
+import toast from 'react-hot-toast'
+
+const OAUTH_QUERY_KEYS = [
+  'code',
+  'state',
+  'scope',
+  'authuser',
+  'hd',
+  'prompt',
+  'iss',
+  'error',
+  'error_description',
+]
+
+function consumeOAuthCallback() {
+  const params = new URLSearchParams(window.location.search)
+  const callback = {
+    code: params.get('code'),
+    state: params.get('state'),
+    error: params.get('error'),
+  }
+
+  if (callback.code || callback.state || callback.error) {
+    for (const key of OAUTH_QUERY_KEYS) params.delete(key)
+    const query = params.toString()
+    window.history.replaceState(
+      {},
+      '',
+      `${window.location.pathname}${query ? `?${query}` : ''}${window.location.hash}`,
+    )
+  }
+
+  return callback
+}
+
+// Consume OAuth parameters before React renders so child data requests cannot
+// copy the authorization code or state into their Referer header.
+const oauthCallback = consumeOAuthCallback()
 
 function NotFound() {
   return (
@@ -37,19 +75,46 @@ function App() {
   }, [syncAuth])
 
   useEffect(() => {
-    authApi.me()
-      .then((session) => {
-        setSession(session)
-      })
-      .catch(() => {
-        // No valid session cookie — anonymous viewing is fine
-      })
+    const bootstrapAuth = async () => {
+      const { code, state, error: oauthError } = oauthCallback
+
+      try {
+        if (code && state) {
+          const session = await authApi.completeGoogleLogin(code, state)
+          setSession(session)
+          toast.success(`Welcome, ${session.name || session.email || session.username}`)
+        } else if (oauthError) {
+          toast.error('Google sign-in was cancelled or denied')
+        } else {
+          const session = await authApi.me()
+          setSession(session)
+        }
+      } catch (error) {
+        if (code || oauthError) {
+          toast.error(error instanceof Error ? error.message : 'Google sign-in failed')
+        }
+        // No valid session cookie is expected for anonymous visitors.
+      }
+    }
+    bootstrapAuth()
   }, [])
 
   return (
     <Routes>
       <Route path="/" element={<Layout />}>
-        <Route index element={<Navigate to="/clusters" replace />} />
+        <Route
+          index
+          element={
+            <Navigate
+              to={{
+                pathname: '/clusters',
+                search: window.location.search,
+                hash: window.location.hash,
+              }}
+              replace
+            />
+          }
+        />
         <Route path="dashboard" element={<Dashboard />} />
         <Route path="clusters" element={<Clusters />} />
         <Route path="clusters/:id" element={<ClusterDetail />} />

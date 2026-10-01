@@ -96,20 +96,13 @@ podman push quay.io/${QUAY_ORG}/psap-control-center-frontend:latest
 oc new-project psap-control-center
 ```
 
-### 4. Create secrets
+### 4. Configure runtime settings
 
-```bash
-oc create secret generic psap-control-center-admin \
-  --from-literal=ADMIN_USERNAME=admin \
-  --from-literal=ADMIN_PASSWORD='<pick-a-secure-password>' \
-  --from-literal=USER_USERNAME=user \
-  --from-literal=USER_PASSWORD='<pick-a-secure-password>'
-
-oc create secret generic psap-control-center-config \
-  --from-literal=SECRET_KEY='<random-string>' \
-  --from-literal=DATABASE_URL='sqlite+aiosqlite:///./data/psap_control_center.db' \
-  --from-literal=LOG_LEVEL='INFO'
-```
+Provision authentication, database, and application settings through the
+organization's approved runtime secret-management process. Credential values,
+creation commands, and rotation procedures are intentionally excluded from
+this repository. The Google OAuth redirect URI must exactly match an authorized
+redirect URI configured for its web client.
 
 ### 5. Create persistent volume claims
 
@@ -184,6 +177,75 @@ oc get route psap-control-center
 curl -k https://control-center.<apps-domain>/api/v1/health
 ```
 
+## Hearth/Management-Cluster Permissions
+
+The Hearth connection is also the Kubernetes connection used by the Testing
+tab. Control Center uses the identity from the uploaded management-cluster
+kubeconfig or from the OpenShift username/password login; it does not replace
+that identity with the Control Center pod's service account and does not
+elevate its permissions.
+
+Before connecting Hearth, ensure that identity has the required permissions in
+the configured namespaces:
+
+- In `HEARTH_NAMESPACE` (default: `hearth`), read access to
+  `fournosclusters.fournos.dev`.
+- In `FOURNOS_NAMESPACE` (default: `psap-automation`), read access to
+  `fournosjobs.fournos.dev`, `pipelineruns.tekton.dev`,
+  `taskruns.tekton.dev`, Pods, and the Pod log subresource.
+- Testing actions additionally require the corresponding `create`, `patch`, or
+  `delete` permission on `fournosjobs.fournos.dev`.
+
+Use the same kubeconfig that will be supplied to Control Center to verify the
+timeline permissions:
+
+```bash
+oc --kubeconfig=<management-kubeconfig> auth can-i get taskruns.tekton.dev \
+  -n <fournos-namespace>
+oc --kubeconfig=<management-kubeconfig> auth can-i list taskruns.tekton.dev \
+  -n <fournos-namespace>
+oc --kubeconfig=<management-kubeconfig> auth can-i watch taskruns.tekton.dev \
+  -n <fournos-namespace>
+```
+
+If an existing Fournos user has all other required permissions but lacks
+TaskRun read access, a management-cluster RBAC administrator can apply this
+least-privilege grant. Replace the namespace and subject with the values used
+by that deployment:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: psap-control-center-taskrun-reader
+  namespace: <fournos-namespace>
+rules:
+  - apiGroups: ["tekton.dev"]
+    resources: ["taskruns"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: psap-control-center-taskrun-reader
+  namespace: <fournos-namespace>
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: psap-control-center-taskrun-reader
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: <management-cluster-user>
+```
+
+Without TaskRun read access, the Pods view may still show accurate status while
+the Pipeline Timeline remains `Pending` for active runs or `UNKNOWN` for
+terminal runs. Control Center also cannot preserve durable stage snapshots in
+that state. The connected user usually cannot grant this permission to itself;
+the Role and RoleBinding must be created by an appropriately authorized
+management-cluster user.
+
 ## CI/CD: Automatic Build & Deploy
 
 The repository includes GitHub Actions workflows and OCP manifests for
@@ -237,6 +299,17 @@ oc apply -n <namespace> -f deploy/ocp/image-updater-cronjob.yaml
 
 **Before applying the CronJob**, edit `deploy/ocp/image-updater-cronjob.yaml`:
 
+- Pin the updater container to the CLI image referenced by the target
+  cluster. Refresh this digest after an OpenShift upgrade:
+
+  ```bash
+  oc get imagestream cli -n openshift \
+    -o jsonpath='{.status.tags[?(@.tag=="latest")].items[0].dockerImageReference}{"\n"}'
+  ```
+
+  Use the returned immutable reference for the updater container. Do not use
+  `registry.redhat.io/openshift4/ose-cli:latest`; that repository requires an
+  explicit version or digest.
 - Set `IMAGE_TAG` to `latest` (prod) or `dev` (dev).
 - Adjust `HTTPS_PROXY` / `NO_PROXY` for your cluster's network, or remove
   them entirely if no proxy is needed.
@@ -313,30 +386,13 @@ oc rollout restart deployment/psap-control-center-frontend
 
 ## Authentication
 
-Authentication uses HttpOnly session cookies (JWT). Two role-based accounts
-are configured via environment variables:
-
-| Role    | Env Vars                              | Permissions |
-| ------- | ------------------------------------- | ----------- |
-| `admin` | `ADMIN_USERNAME` / `ADMIN_PASSWORD`   | Full access: cluster management, reservations, Hearth |
-| `user`  | `USER_USERNAME` / `USER_PASSWORD`     | View all data, create/cancel own reservations |
-
-All GET endpoints remain open (no authentication required).
+Authentication uses HttpOnly session cookies (JWT) and supports Google
+Workspace SSO plus optional local break-glass accounts. Administrator-only
+operations are enforced by the backend. Selected read-only APIs, including
+Testing run history and pod logs, intentionally remain accessible without
+authentication.
 
 Sessions expire after eight hours by default (configurable via `ACCESS_TOKEN_EXPIRE_MINUTES`).
-
-## Updating Credentials
-
-```bash
-oc delete secret psap-control-center-admin
-oc create secret generic psap-control-center-admin \
-  --from-literal=ADMIN_USERNAME=admin \
-  --from-literal=ADMIN_PASSWORD='<new-password>' \
-  --from-literal=USER_USERNAME=user \
-  --from-literal=USER_PASSWORD='<new-password>'
-
-oc rollout restart deployment/psap-control-center-backend
-```
 
 ## Teardown
 

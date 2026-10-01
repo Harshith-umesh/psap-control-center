@@ -9,15 +9,27 @@ import asyncio
 import json
 import logging
 import re
+import threading
 import urllib.request
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
+from sqlalchemy.exc import IntegrityError
 
-from app.core.auth import require_admin, require_auth
+from app.core.auth import (
+    REQUESTER_EMAIL_ANNOTATION,
+    REQUESTER_NAME_ANNOTATION,
+    REQUESTER_PROVIDER_ANNOTATION,
+    REQUESTER_SUBJECT_ANNOTATION,
+    actor_label,
+    get_current_user,
+    requester_annotations,
+    require_admin,
+    require_auth,
+)
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.schemas.fournos import (
@@ -25,20 +37,33 @@ from app.schemas.fournos import (
     ClusterOverviewResponse,
     CreateClusterLockRequest,
     FournosJobSummary,
+    FournosJobDetailResponse,
     GitHubPR,
     GitHubRelease,
     GithubSyncStatusResponse,
+    HistoryFilterOptionsResponse,
+    HistoryPreferenceResponse,
+    HistoryPreferenceUpdate,
+    HistoryViewState,
     HoldSlotRequest,
     JobEventResponse,
     JobListResponse,
+    PullRequestSelection,
     ProjectInfoResponse,
     RecurringJobResponse,
+    RunGroupCreate,
+    RunGroupMembershipUpdate,
+    RunGroupReference,
+    RunGroupUpdate,
     ScheduleChildJobResponse,
     SlotHoldResponse,
     SubmitJobRequest,
     SubmitJobResponse,
     SubmitMatrixRequest,
     SubmitMatrixResponse,
+    WorkItemConfigResponse,
+    WorkItemReference,
+    WorkItemUpdate,
 )
 from app.services import github_sync_service
 from app.services import slot_hold_service as slot_holds
@@ -48,7 +73,26 @@ from app.services import fournos_k8s_client as k8s
 from app.services import pipeline_definitions
 from app.services import project_adapters
 from app.services import project_ui_schema
+from app.services.source_provenance import extract_source_request_fields
+from app.services.failure_details import (
+    first_actionable_failure,
+    select_failure_summary,
+)
 from app.services.forge_discovery import discover_projects, get_project
+from app.services.work_items import (
+    WorkItemValidationError,
+    normalize_work_items,
+    work_items_enabled,
+)
+from app.services.run_groups import (
+    RunGroupValidationError,
+    can_manage_group,
+    normalize_description,
+    normalize_display_name,
+    normalize_group_ids,
+    normalize_group_key,
+    normalize_group_type,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +124,81 @@ def _is_log_issue(line: str) -> bool:
     ).strip()
     return bool(issue_text) and not re.fullmatch(r"[-=*_]{3,}", issue_text)
 
+_REQUESTER_ANNOTATIONS = {
+    REQUESTER_SUBJECT_ANNOTATION,
+    REQUESTER_EMAIL_ANNOTATION,
+    REQUESTER_NAME_ANNOTATION,
+    REQUESTER_PROVIDER_ANNOTATION,
+}
+
 _VERSION_KEYS = {"mcp_gateway": "infrastructure.mcp_gateway_version"}
+
+
+async def _resolve_source_request(
+    selection: Optional[PullRequestSelection],
+    legacy_pull_sha: str,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Validate a structured PR selection and build its Fournos/DB record.
+
+    Control Center records the exact server-side PR snapshot the user chose.
+    It never silently replaces a stale selection with a newer PR head.
+    """
+    if selection is None:
+        sha = legacy_pull_sha.strip()
+        env = {"PULL_PULL_SHA": sha} if sha else {}
+        return env, extract_source_request_fields({"env": env})
+
+    repository = selection.repository.strip()
+    if repository != settings.FORGE_GITHUB_REPO:
+        raise HTTPException(
+            400,
+            "Pull request repository must match the configured Forge repository",
+        )
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", selection.requested_sha.strip()):
+        raise HTTPException(400, "Pull request SHA must be a full 40-character commit SHA")
+
+    prs = _open_prs_cache
+    if prs is None:
+        try:
+            prs = await _fetch_open_prs_coalesced()
+        except Exception as exc:
+            raise HTTPException(
+                502, "Unable to validate pull request selection"
+            ) from exc
+    current = next(
+        (pr for pr in prs if pr.get("number") == selection.number), None
+    )
+    if current is None:
+        raise HTTPException(
+            409,
+            "The selected pull request is no longer in the current Forge PR snapshot; refresh and select it again",
+        )
+
+    expected_url = current["url"]
+    requested_sha = selection.requested_sha.strip().lower()
+    if (
+        current["repository"] != repository
+        or current["head_sha"].lower() != requested_sha
+        or current["branch"] != selection.head_branch
+        or expected_url != selection.url
+    ):
+        raise HTTPException(
+            409,
+            "The selected pull request changed; refresh and select it again",
+        )
+
+    repo_owner, repo_name = repository.split("/", 1)
+    env = {
+        "REPO_OWNER": repo_owner,
+        "REPO_NAME": repo_name,
+        "PULL_NUMBER": str(current["number"]),
+        "PULL_TITLE": current["title"],
+        "PULL_HEAD_REF": current["branch"],
+        "PULL_PULL_SHA": current["head_sha"],
+        "CONTROL_CENTER_REQUESTED_SHA": selection.requested_sha.strip(),
+        "CONTROL_CENTER_PR_URL": expected_url,
+    }
+    return env, extract_source_request_fields({"env": env})
 
 
 # Compatibility shims for callers that imported these helpers from the API
@@ -99,6 +217,115 @@ def _normalize_rhaiis_overrides(
 
 # ─── helper functions ────────────────────────────────────────────────────
 
+def _enqueue_stream_item(
+    queue: asyncio.Queue,
+    item: Optional[str],
+) -> None:
+    """Enqueue a log item from the event-loop thread without raising.
+
+    Log lines may be dropped when a slow client fills the bounded queue. The
+    terminal sentinel must always be delivered, so it replaces the oldest
+    queued line when necessary.
+    """
+    if queue.full():
+        if item is not None:
+            return
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+    try:
+        queue.put_nowait(item)
+    except asyncio.QueueFull:
+        # Another callback cannot interleave while this synchronous helper is
+        # running, but retain a defensive guard for alternate event loops.
+        pass
+
+def _public_job_metadata(metadata: dict) -> dict:
+    """Return job metadata without private requester identity annotations."""
+    public_metadata = dict(metadata or {})
+    annotations = dict(public_metadata.get("annotations") or {})
+    public_metadata["annotations"] = {
+        key: value
+        for key, value in annotations.items()
+        if key not in _REQUESTER_ANNOTATIONS
+    }
+    return public_metadata
+
+
+def _public_job_spec(spec: dict, *, include_owner: bool) -> dict:
+    """Return a copy of a job spec with identity hidden from public callers."""
+    public_spec = dict(spec or {})
+    if not include_owner:
+        public_spec.pop("owner", None)
+    return public_spec
+
+
+def _verified_owner(user: dict) -> str:
+    """Visible Fournos owner derived only from the authenticated identity."""
+    return str(user.get("name") or actor_label(user))
+
+
+def _requester_subject_for_scope(
+    requester_scope: str,
+    user: Optional[dict],
+) -> Optional[str]:
+    """Resolve the caller-controlled scope without accepting an identity."""
+    if requester_scope == "all":
+        return None
+    subject = str((user or {}).get("subject") or "")
+    if not subject:
+        raise HTTPException(status_code=401, detail="Sign in to view your jobs")
+    return subject
+
+
+def _validate_identity_search(
+    identity: str, user: Optional[dict]
+) -> None:
+    """Identity predicates are private even though general History is public."""
+    if identity and user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Sign in to search owner or requester identity",
+        )
+
+
+def _visible_sort_by(sort_by: str, user: Optional[dict]) -> str:
+    """Do not let anonymous ordering reveal otherwise-redacted identity."""
+    if sort_by == "owner" and user is None:
+        return ""
+    return sort_by
+
+
+def _live_job_requester_subject(job: dict) -> str:
+    annotations = job.get("metadata", {}).get("annotations", {}) or {}
+    return str(annotations.get(REQUESTER_SUBJECT_ANNOTATION, ""))
+
+
+def _inherit_live_requester(
+    job: dict,
+    parent_subjects: dict[str, str],
+) -> dict:
+    """Resolve recurring children whose operator-created metadata has no annotations."""
+    if _live_job_requester_subject(job):
+        return job
+    metadata = job.get("metadata", {}) or {}
+    parent_name = (metadata.get("labels", {}) or {}).get(
+        k8s.LABEL_RECURRING_PARENT, ""
+    )
+    parent_subject = parent_subjects.get(parent_name, "")
+    if not parent_subject:
+        return job
+
+    resolved_job = dict(job)
+    resolved_metadata = dict(metadata)
+    resolved_annotations = dict(resolved_metadata.get("annotations", {}) or {})
+    resolved_annotations[REQUESTER_SUBJECT_ANNOTATION] = parent_subject
+    resolved_metadata["annotations"] = resolved_annotations
+    resolved_job["metadata"] = resolved_metadata
+    return resolved_job
+
+
 def _extract_forge_info(job: dict) -> dict:
     forge = job.get("spec", {}).get("executionEngine", {}).get("forge", {})
     env = job.get("spec", {}).get("env", {})
@@ -106,11 +333,15 @@ def _extract_forge_info(job: dict) -> dict:
     pr_title = env.get("PULL_TITLE", "")
     repo_owner = env.get("REPO_OWNER", "")
     repo_name = env.get("REPO_NAME", "")
-    pr_url = ""
-    if pr_number:
+    repository = "/".join(
+        part for part in (repo_owner, repo_name) if part
+    )
+    pr_url = env.get("CONTROL_CENTER_PR_URL", "")
+    if not pr_url and pr_number:
         pr_url = "https://github.com/{}/{}/pull/{}".format(
             repo_owner, repo_name, pr_number
         )
+    resolved_sha = env.get("PULL_PULL_SHA", "")
     return {
         "project": forge.get("project", ""),
         "args": forge.get("args", []),
@@ -118,6 +349,12 @@ def _extract_forge_info(job: dict) -> dict:
         "pr_number": pr_number,
         "pr_title": pr_title,
         "pr_url": pr_url,
+        "repository": repository,
+        "head_branch": env.get("PULL_HEAD_REF", ""),
+        "requested_sha": env.get(
+            "CONTROL_CENTER_REQUESTED_SHA", resolved_sha
+        ),
+        "resolved_sha": resolved_sha,
     }
 
 
@@ -149,7 +386,12 @@ def _trigger_type_for_live_job(meta: dict, spec: dict, schedule_parent: str) -> 
     return "manual"
 
 
-def _live_job_to_summary(job: dict) -> dict:
+def _live_job_to_summary(
+    job: dict,
+    *,
+    include_owner: bool = True,
+    work_items: Optional[list[dict[str, str]]] = None,
+) -> dict:
     meta = job.get("metadata", {})
     spec = job.get("spec", {})
     status = job.get("status", {})
@@ -162,7 +404,7 @@ def _live_job_to_summary(job: dict) -> dict:
         "preset": " ".join(forge.get("args", [])),
         "cluster": spec.get("cluster", ""),
         "pipeline": spec.get("pipeline", ""),
-        "owner": spec.get("owner", ""),
+        "owner": spec.get("owner", "") if include_owner else "",
         "status": status.get("phase", "Pending"),
         "message": status.get("message", ""),
         "created_at": meta.get("creationTimestamp", ""),
@@ -173,17 +415,38 @@ def _live_job_to_summary(job: dict) -> dict:
         "triggered_by_schedule": schedule_parent or None,
         "scheduled_start_time": spec.get("scheduledStartTime"),
         "source": "live",
+        "work_items": work_items or [],
+        **extract_source_request_fields(spec),
     }
 
 
-def _db_job_to_summary(job) -> dict:
+def _forge_execution_summary(execution: Optional[dict]) -> dict:
+    execution = execution or {}
+    versions = execution.get("gitVersions", []) or []
+    images = execution.get("images", []) or []
+    version = next(
+        (item.get("version", "") for item in versions if isinstance(item, dict)),
+        "",
+    )
+    image_id = next(
+        (item.get("imageID", "") for item in images if isinstance(item, dict)),
+        "",
+    )
+    digest = image_id.rsplit("@", 1)[-1] if "@" in image_id else image_id
+    return {
+        "forge_git_version": version,
+        "forge_image_digest": digest,
+    }
+
+
+def _db_job_to_summary(job, *, include_owner: bool = True) -> dict:
     return {
         "name": job.name,
         "project": job.project,
         "preset": job.preset,
         "cluster": job.cluster,
         "pipeline": job.pipeline,
-        "owner": job.owner,
+        "owner": job.owner if include_owner else "",
         "status": job.status,
         "message": job.message,
         "created_at": job.created_at.isoformat() if job.created_at else "",
@@ -195,7 +458,32 @@ def _db_job_to_summary(job) -> dict:
         "trigger_type": job.trigger_type or "manual",
         "triggered_by_schedule": job.triggered_by_schedule,
         "source": "history",
+        "source_repository": job.source_repository or "",
+        "source_pr_number": job.source_pr_number,
+        "source_pr_url": job.source_pr_url or "",
+        "source_head_branch": job.source_head_branch or "",
+        "source_requested_sha": job.source_requested_sha or "",
+        "source_resolved_sha": job.source_resolved_sha or "",
+        **_forge_execution_summary(job.forge_execution),
+        "forge_provenance_state": job.forge_provenance_state or "pending",
+        "work_items": (
+            db_svc.serialize_work_items(job) if include_owner else []
+        ),
+        "run_groups": db_svc.serialize_run_groups(job),
     }
+
+
+def _can_edit_work_items(job, user: Optional[dict]) -> bool:
+    if not user:
+        return False
+    if user.get("role") == "admin":
+        return True
+    subject = str(user.get("subject") or "")
+    return bool(subject and subject == (job.requester_subject or ""))
+
+
+def _can_edit_run_groups(job, user: Optional[dict]) -> bool:
+    return _can_edit_work_items(job, user)
 
 
 def _db_job_to_fjob_dict(job) -> dict:
@@ -215,6 +503,23 @@ def _db_job_to_fjob_dict(job) -> dict:
     spec.setdefault("pipeline", job.pipeline)
     spec.setdefault("owner", job.owner)
     spec.setdefault("displayName", "{} {}".format(job.project, job.preset).strip())
+    if job.source_resolved_sha:
+        env = spec.setdefault("env", {})
+        if job.source_repository and "/" in job.source_repository:
+            repo_owner, repo_name = job.source_repository.split("/", 1)
+            env.setdefault("REPO_OWNER", repo_owner)
+            env.setdefault("REPO_NAME", repo_name)
+        if job.source_pr_number:
+            env.setdefault("PULL_NUMBER", str(job.source_pr_number))
+        if job.source_head_branch:
+            env.setdefault("PULL_HEAD_REF", job.source_head_branch)
+        if job.source_requested_sha:
+            env.setdefault(
+                "CONTROL_CENTER_REQUESTED_SHA", job.source_requested_sha
+            )
+        if job.source_pr_url:
+            env.setdefault("CONTROL_CENTER_PR_URL", job.source_pr_url)
+        env.setdefault("PULL_PULL_SHA", job.source_resolved_sha)
 
     status.setdefault("phase", job.status)
     status.setdefault("message", job.message)
@@ -228,6 +533,14 @@ def _db_job_to_fjob_dict(job) -> dict:
                 job.created_at.isoformat() if job.created_at else ""
             ),
             "uid": job.id,
+            "annotations": {
+                key: value for key, value in {
+                    REQUESTER_SUBJECT_ANNOTATION: job.requester_subject,
+                    REQUESTER_EMAIL_ANNOTATION: job.requester_email,
+                    REQUESTER_NAME_ANNOTATION: job.requester_name,
+                    REQUESTER_PROVIDER_ANNOTATION: job.auth_provider,
+                }.items() if value
+            },
         },
         "spec": spec,
         "status": status,
@@ -242,6 +555,11 @@ def _get_live_jobs_sync() -> list:
     from dateutil.parser import parse
 
     jobs = k8s.list_fournos_jobs()
+    parent_subjects = {
+        job.get("metadata", {}).get("name", ""): _live_job_requester_subject(job)
+        for job in jobs
+        if job.get("spec", {}).get("schedule")
+    }
     now = datetime.now(timezone.utc)
     visible = []
     for j in jobs:
@@ -270,7 +588,7 @@ def _get_live_jobs_sync() -> list:
                         pass
             if last_ts and (now - last_ts).total_seconds() > _COMPLETED_GRACE_SECONDS:
                 continue
-        visible.append(j)
+        visible.append(_inherit_live_requester(j, parent_subjects))
     visible.sort(
         key=lambda j: j.get("metadata", {}).get("creationTimestamp", ""),
         reverse=True,
@@ -346,11 +664,27 @@ def _sort_latest(items: List[dict], *date_fields: str) -> List[dict]:
 @router.get("/runs", response_model=JobListResponse)
 @router.get("/runs/", response_model=JobListResponse, include_in_schema=False)
 async def list_jobs(
+    request: Request,
     tab: str = Query("live", regex="^(live|history)$"),
     project: str = Query(""),
     cluster: str = Query(""),
     status: str = Query(""),
     owner: str = Query(""),
+    requester_scope: str = Query("all", pattern="^(all|mine)$"),
+    q: str = Query("", max_length=200),
+    identity: str = Query("", max_length=255),
+    failure_outcome: str = Query(
+        "", pattern="^$|^(failed|cancelled|infrastructure_error|unknown)$"
+    ),
+    repository: str = Query("", max_length=255),
+    pr_number: Optional[int] = Query(None, ge=1, le=2147483647),
+    source_sha: str = Query(
+        "", max_length=64, pattern=r"^$|^[0-9a-fA-F]{4,64}$"
+    ),
+    forge: str = Query("", max_length=255),
+    work_item_provider: str = Query("", max_length=50),
+    work_item_key: str = Query("", max_length=100),
+    tags: str = Query("", max_length=2020),
     start_time: Optional[str] = Query(None, description="ISO 8601 UTC — history tab only"),
     end_time: Optional[str] = Query(None, description="ISO 8601 UTC — history tab only"),
     sort_by: str = Query(""),
@@ -358,8 +692,51 @@ async def list_jobs(
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=200),
 ):
+    current_user = get_current_user(request)
+    include_owner = current_user is not None
+    effective_sort_by = _visible_sort_by(sort_by, current_user)
+    _validate_identity_search(identity, current_user)
+    if (work_item_provider or work_item_key) and current_user is None:
+        raise HTTPException(401, "Sign in to filter by work item")
+    parsed_tags = []
+    for raw_tag in tags.split(","):
+        tag = raw_tag.strip()
+        if not tag or tag in parsed_tags:
+            continue
+        if len(tag) > 100:
+            raise HTTPException(400, "Tags must be at most 100 characters")
+        parsed_tags.append(tag)
+    if len(parsed_tags) > 20:
+        raise HTTPException(400, "At most 20 tags may be filtered at once")
+    requester_subject = _requester_subject_for_scope(
+        requester_scope, current_user
+    )
     if tab == "live":
         jobs = await _get_live_jobs()
+        if requester_subject:
+            missing_parent_names = {
+                (job.get("metadata", {}).get("labels", {}) or {}).get(
+                    k8s.LABEL_RECURRING_PARENT, ""
+                )
+                for job in jobs
+                if not _live_job_requester_subject(job)
+            }
+            missing_parent_names.discard("")
+            if missing_parent_names:
+                async with AsyncSessionLocal() as session:
+                    archived_parent_subjects = (
+                        await db_svc.get_requester_subjects_by_names(
+                            session, sorted(missing_parent_names)
+                        )
+                    )
+                jobs = [
+                    _inherit_live_requester(job, archived_parent_subjects)
+                    for job in jobs
+                ]
+            jobs = [
+                job for job in jobs
+                if _live_job_requester_subject(job) == requester_subject
+            ]
         if project:
             jobs = [
                 j for j in jobs
@@ -375,13 +752,40 @@ async def list_jobs(
                 j for j in jobs
                 if j.get("status", {}).get("phase") == status
             ]
-        if owner:
+        if owner and include_owner:
             jobs = [
                 j for j in jobs
                 if j.get("spec", {}).get("owner") == owner
             ]
-        summaries = [_live_job_to_summary(j) for j in jobs]
-        key_fn = _live_sort_key(sort_by)
+        work_items_by_name: dict[str, list[dict[str, str]]] = {}
+        if include_owner:
+            async with AsyncSessionLocal() as session:
+                work_items_by_name = await db_svc.get_work_items_by_job_names(
+                    session,
+                    [j.get("metadata", {}).get("name", "") for j in jobs],
+                )
+        if work_item_provider or work_item_key:
+            jobs = [
+                job for job in jobs
+                if any(
+                    (not work_item_provider or item["provider"] == work_item_provider.lower())
+                    and (not work_item_key or item["key"] == work_item_key.upper())
+                    for item in work_items_by_name.get(
+                        job.get("metadata", {}).get("name", ""), []
+                    )
+                )
+            ]
+        summaries = [
+            _live_job_to_summary(
+                j,
+                include_owner=include_owner,
+                work_items=work_items_by_name.get(
+                    j.get("metadata", {}).get("name", ""), []
+                ),
+            )
+            for j in jobs
+        ]
+        key_fn = _live_sort_key(effective_sort_by)
         summaries.sort(key=key_fn, reverse=(sort_dir == "desc"))
         total = len(summaries)
         offset = (page - 1) * per_page
@@ -395,15 +799,28 @@ async def list_jobs(
                 project=project or None,
                 cluster=cluster or None,
                 status=status or None,
-                owner=owner or None,
+                owner=(owner or None) if include_owner else None,
+                requester_subject=requester_subject,
+                query=q.strip() or None,
+                identity=identity.strip() or None,
+                failure_outcome=failure_outcome.strip() or None,
+                repository=repository.strip() or None,
+                pr_number=pr_number,
+                source_sha=source_sha.strip() or None,
+                forge=forge.strip() or None,
+                tags=parsed_tags or None,
+                work_item_provider=work_item_provider.strip() or None,
+                work_item_key=work_item_key.strip() or None,
                 created_after=created_after,
                 created_before=created_before,
-                sort_by=sort_by or None,
+                sort_by=effective_sort_by or None,
                 sort_dir=sort_dir,
                 limit=per_page,
                 offset=(page - 1) * per_page,
             )
-        summaries = [_db_job_to_summary(j) for j in db_jobs]
+        summaries = [
+            _db_job_to_summary(j, include_owner=include_owner) for j in db_jobs
+        ]
 
     return {
         "jobs": summaries,
@@ -413,8 +830,272 @@ async def list_jobs(
     }
 
 
-@router.get("/jobs/{job_name}")
-async def get_job(job_name: str):
+@router.get(
+    "/history/filter-options",
+    response_model=HistoryFilterOptionsResponse,
+)
+async def get_history_filter_options(request: Request):
+    async with AsyncSessionLocal() as session:
+        options = await db_svc.get_history_filter_options(
+            session,
+            include_identity=get_current_user(request) is not None,
+        )
+    return HistoryFilterOptionsResponse(**options)
+
+
+@router.get(
+    "/history/preferences",
+    response_model=HistoryPreferenceResponse,
+)
+async def get_history_preferences(user: dict = Depends(require_auth)):
+    subject = str(user.get("subject") or "")
+    async with AsyncSessionLocal() as session:
+        preference = await db_svc.get_history_preference(session, subject)
+    if preference is None:
+        return HistoryPreferenceResponse()
+    return HistoryPreferenceResponse(
+        schema_version=preference.schema_version,
+        state=HistoryViewState.model_validate(preference.state or {}),
+        updated_at=preference.updated_at,
+    )
+
+
+@router.put(
+    "/history/preferences",
+    response_model=HistoryPreferenceResponse,
+)
+async def update_history_preferences(
+    body: HistoryPreferenceUpdate,
+    user: dict = Depends(require_auth),
+):
+    subject = str(user.get("subject") or "")
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            preference = await db_svc.save_history_preference(
+                session,
+                subject=subject,
+                schema_version=1,
+                state=body.state.model_dump(),
+            )
+    return HistoryPreferenceResponse(
+        schema_version=preference.schema_version,
+        state=HistoryViewState.model_validate(preference.state or {}),
+        updated_at=preference.updated_at,
+    )
+
+
+@router.delete("/history/preferences")
+async def reset_history_preferences(user: dict = Depends(require_auth)):
+    subject = str(user.get("subject") or "")
+    async with AsyncSessionLocal() as session:
+        async with session.begin():
+            deleted = await db_svc.delete_history_preference(
+                session, subject
+            )
+    return {"status": "ok", "deleted": deleted}
+
+
+@router.get("/work-items/config", response_model=WorkItemConfigResponse)
+async def get_work_item_config():
+    enabled = work_items_enabled()
+    return {
+        "enabled": enabled,
+        "providers": ["jira"] if enabled else [],
+    }
+
+
+@router.get("/run-groups", response_model=List[RunGroupReference])
+async def get_run_groups(
+    include_archived: bool = False,
+    group_type: str = Query("", max_length=50),
+    q: str = Query("", max_length=100),
+    _=Depends(require_auth),
+):
+    normalized_type = ""
+    if group_type:
+        try:
+            normalized_type = normalize_group_type(group_type)
+        except RunGroupValidationError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    async with AsyncSessionLocal() as session:
+        groups = await db_svc.list_run_groups(
+            session,
+            include_archived=include_archived,
+            group_type=normalized_type or None,
+            query=q.strip() or None,
+        )
+        return [db_svc.serialize_run_group(group) for group in groups]
+
+
+@router.post(
+    "/run-groups",
+    response_model=RunGroupReference,
+    status_code=201,
+)
+async def create_run_group(
+    body: RunGroupCreate,
+    user: dict = Depends(require_auth),
+):
+    try:
+        values = {
+            "group_type": normalize_group_type(body.group_type),
+            "key": normalize_group_key(body.key),
+            "display_name": normalize_display_name(body.display_name),
+            "description": normalize_description(body.description),
+        }
+    except RunGroupValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    try:
+        async with AsyncSessionLocal() as session, session.begin():
+            group = await db_svc.create_run_group(
+                session,
+                **values,
+                created_by_subject=str(user.get("subject") or ""),
+            )
+            result = db_svc.serialize_run_group(group)
+    except IntegrityError as exc:
+        raise HTTPException(
+            409, "A run group with this type and key already exists"
+        ) from exc
+    return result
+
+
+@router.patch(
+    "/run-groups/{group_id}", response_model=RunGroupReference
+)
+async def update_run_group(
+    group_id: str,
+    body: RunGroupUpdate,
+    user: dict = Depends(require_auth),
+):
+    try:
+        normalized_id = normalize_group_ids([group_id])[0]
+        display_name = (
+            normalize_display_name(body.display_name)
+            if body.display_name is not None else None
+        )
+        description = (
+            normalize_description(body.description)
+            if body.description is not None else None
+        )
+    except RunGroupValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    async with AsyncSessionLocal() as session, session.begin():
+        group = await db_svc.get_run_group(session, normalized_id)
+        if group is None:
+            raise HTTPException(404, "Run group not found")
+        if not can_manage_group(group, user):
+            raise HTTPException(
+                403, "Only the group owner or an administrator may update it"
+            )
+        if display_name is not None:
+            group.display_name = display_name
+        if description is not None:
+            group.description = description
+        if body.archived is not None:
+            group.archived = body.archived
+        await session.flush()
+        result = db_svc.serialize_run_group(group)
+    return result
+
+
+@router.get(
+    "/jobs/{job_name}/run-groups",
+    response_model=List[RunGroupReference],
+)
+async def get_job_run_groups(job_name: str, _=Depends(require_auth)):
+    async with AsyncSessionLocal() as session:
+        job = await db_svc.get_job_by_name(session, job_name)
+        if job is None:
+            raise HTTPException(404, "Job not found")
+        return db_svc.serialize_run_groups(job)
+
+
+@router.put(
+    "/jobs/{job_name}/run-groups",
+    response_model=List[RunGroupReference],
+)
+async def update_job_run_groups(
+    job_name: str,
+    body: RunGroupMembershipUpdate,
+    user: dict = Depends(require_auth),
+):
+    try:
+        group_ids = normalize_group_ids(body.group_ids)
+    except RunGroupValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    async with AsyncSessionLocal() as session, session.begin():
+        job = await db_svc.get_job_by_name(session, job_name)
+        if job is None:
+            raise HTTPException(404, "Job not found")
+        if not _can_edit_run_groups(job, user):
+            raise HTTPException(
+                403,
+                "Only the recorded requester or an administrator may edit run groups",
+            )
+        try:
+            await db_svc.replace_run_groups(
+                session,
+                job,
+                group_ids,
+                created_by_subject=str(user.get("subject") or ""),
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        await session.refresh(job, attribute_names=["group_memberships"])
+        return db_svc.serialize_run_groups(job)
+
+
+@router.get(
+    "/jobs/{job_name}/work-items",
+    response_model=List[WorkItemReference],
+)
+async def get_job_work_items(job_name: str, _=Depends(require_auth)):
+    async with AsyncSessionLocal() as session:
+        job = await db_svc.get_job_by_name(session, job_name)
+        if job is None:
+            raise HTTPException(404, "Job not found")
+        return db_svc.serialize_work_items(job)
+
+
+@router.put(
+    "/jobs/{job_name}/work-items",
+    response_model=List[WorkItemReference],
+)
+async def update_job_work_items(
+    job_name: str,
+    body: WorkItemUpdate,
+    user: dict = Depends(require_auth),
+):
+    try:
+        normalized = normalize_work_items(body.work_items)
+    except WorkItemValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    async with AsyncSessionLocal() as session, session.begin():
+        job = await db_svc.get_job_by_name(session, job_name)
+        if job is None:
+            raise HTTPException(404, "Job not found")
+        if not _can_edit_work_items(job, user):
+            raise HTTPException(
+                403,
+                "Only the recorded requester or an administrator may edit work items",
+            )
+        await db_svc.replace_work_items(
+            session,
+            job,
+            normalized,
+            created_by_subject=str(user.get("subject") or ""),
+        )
+    return normalized
+
+
+@router.get("/jobs/{job_name}", response_model=FournosJobDetailResponse)
+async def get_job(job_name: str, request: Request):
+    current_user = get_current_user(request)
+    include_owner = current_user is not None
     job = await asyncio.to_thread(k8s.get_fournos_job, job_name)
 
     pods = []
@@ -492,15 +1173,36 @@ async def get_job(job_name: str):
         task_progress = _parse_task_progress(
             job.get("status", {}).get("message", "")
         )
+        phase = job.get("status", {}).get("phase", "")
+        failure_summary = first_actionable_failure(
+            stages,
+            job_phase=phase,
+            job_message=job.get("status", {}).get("message", ""),
+        )
+        enrichment_state = "pending" if phase in (
+            "Succeeded", "Failed", "Stopped"
+        ) else "not_applicable"
+        async with AsyncSessionLocal() as session:
+            archived = await db_svc.get_job_by_name(session, job_name)
+        if phase in ("Succeeded", "Failed", "Stopped"):
+            if archived:
+                failure_summary = select_failure_summary(
+                    failure_summary, archived.failure_summary
+                )
+                enrichment_state = (
+                    archived.failure_enrichment_state or enrichment_state
+                )
 
         return {
             "job": {
-                "metadata": job.get("metadata", {}),
-                "spec": job.get("spec", {}),
+                "metadata": _public_job_metadata(job.get("metadata", {})),
+                "spec": _public_job_spec(
+                    job.get("spec", {}), include_owner=include_owner
+                ),
                 "status": job.get("status", {}),
                 "source": "live",
                 "duration_seconds": None,
-                "mlflow_url": "",
+                "mlflow_url": (archived.mlflow_url or "") if archived else "",
                 "ci_artifacts_url": "",
             },
             "pods": pods,
@@ -508,6 +1210,30 @@ async def get_job(job_name: str):
             "current_step": current_step,
             "forge_info": forge_info,
             "task_progress": task_progress,
+            "failure_summary": failure_summary or None,
+            "failure_enrichment_state": enrichment_state,
+            "forge_execution": (
+                archived.forge_execution or {} if archived else {}
+            ),
+            "forge_provenance_state": (
+                archived.forge_provenance_state or "pending"
+                if archived else "pending"
+            ),
+            "work_items": (
+                db_svc.serialize_work_items(archived)
+                if archived and include_owner else []
+            ),
+            "can_edit_work_items": (
+                _can_edit_work_items(archived, current_user)
+                if archived else False
+            ),
+            "run_groups": (
+                db_svc.serialize_run_groups(archived) if archived else []
+            ),
+            "can_edit_run_groups": (
+                _can_edit_run_groups(archived, current_user)
+                if archived else False
+            ),
         }
 
     async with AsyncSessionLocal() as session:
@@ -538,12 +1264,32 @@ async def get_job(job_name: str):
     )
 
     return {
-        "job": fjob,
+        "job": {
+            **fjob,
+            "metadata": _public_job_metadata(fjob.get("metadata", {})),
+            "spec": _public_job_spec(
+                fjob.get("spec", {}), include_owner=include_owner
+            ),
+        },
         "pods": [],
         "stages": stages,
         "current_step": current_step,
         "forge_info": forge_info,
         "task_progress": task_progress,
+        "failure_summary": db_job.failure_summary or None,
+        "failure_enrichment_state": (
+            db_job.failure_enrichment_state or "unavailable"
+        ),
+        "forge_execution": db_job.forge_execution or {},
+        "forge_provenance_state": (
+            db_job.forge_provenance_state or "unavailable"
+        ),
+        "work_items": (
+            db_svc.serialize_work_items(db_job) if include_owner else []
+        ),
+        "can_edit_work_items": _can_edit_work_items(db_job, current_user),
+        "run_groups": db_svc.serialize_run_groups(db_job),
+        "can_edit_run_groups": _can_edit_run_groups(db_job, current_user),
     }
 
 
@@ -575,13 +1321,24 @@ async def cancel_job(job_name: str, _=Depends(require_admin)):
 
 
 @router.post("/jobs/{job_name}/rerun")
-async def rerun_job(job_name: str, _=Depends(require_admin)):
+async def rerun_job(job_name: str, user=Depends(require_admin)):
+    async with AsyncSessionLocal() as session:
+        source_db_job = await db_svc.get_job_by_name(session, job_name)
+        source_work_items = (
+            db_svc.serialize_work_items(source_db_job)
+            if source_db_job else []
+        )
+        source_run_group_ids = (
+            [
+                membership.group_id
+                for membership in source_db_job.group_memberships or []
+            ]
+            if source_db_job else []
+        )
     job = await asyncio.to_thread(k8s.get_fournos_job, job_name)
     if not job:
-        async with AsyncSessionLocal() as session:
-            db_job = await db_svc.get_job_by_name(session, job_name)
-            if db_job:
-                job = _db_job_to_fjob_dict(db_job)
+        if source_db_job:
+            job = _db_job_to_fjob_dict(source_db_job)
 
     if job is None:
         raise HTTPException(404, "Job not found")
@@ -590,6 +1347,7 @@ async def rerun_job(job_name: str, _=Depends(require_admin)):
     forge = spec.get("executionEngine", {}).get("forge", {})
     project = forge.get("project", "unknown")
     spec.pop("shutdown", None)
+    spec["owner"] = _verified_owner(user)
 
     new_name = k8s.sanitize_job_name("forge-{}".format(project))
     body = {
@@ -600,9 +1358,59 @@ async def rerun_job(job_name: str, _=Depends(require_admin)):
         "metadata": {
             "name": new_name,
             "namespace": settings.FOURNOS_NAMESPACE,
+            "annotations": requester_annotations(user),
         },
         "spec": spec,
     }
+
+    source_fields = extract_source_request_fields(spec)
+    initial_status = (
+        "Recurring" if spec.get("schedule")
+        else "Scheduled" if spec.get("scheduledStartTime")
+        else "Pending"
+    )
+    try:
+        async with AsyncSessionLocal() as session, session.begin():
+            db_job = await db_svc.upsert_job(
+                session,
+                name=new_name,
+                project=project,
+                preset=" ".join(forge.get("args", [])),
+                cluster=spec.get("cluster", ""),
+                pipeline=spec.get("pipeline", ""),
+                owner=spec.get("owner", ""),
+                requester_subject=user.get("subject", ""),
+                requester_email=user.get("email", ""),
+                requester_name=user.get("name", ""),
+                auth_provider=user.get("auth_provider", ""),
+                status=initial_status,
+                config_overrides=forge.get("configOverrides", {}),
+                fjob_spec=spec,
+                trigger_type=(
+                    "recurring-parent" if spec.get("schedule")
+                    else "deferred" if spec.get("scheduledStartTime")
+                    else "manual"
+                ),
+                **source_fields,
+            )
+            if source_work_items:
+                await db_svc.replace_work_items(
+                    session,
+                    db_job,
+                    source_work_items,
+                    created_by_subject=str(user.get("subject") or ""),
+                )
+            if source_run_group_ids:
+                await db_svc.replace_run_groups(
+                    session,
+                    db_job,
+                    source_run_group_ids,
+                    created_by_subject=str(user.get("subject") or ""),
+                    allow_archived=True,
+                )
+    except Exception as exc:
+        logger.error("Could not persist rerun intent for %s: %s", new_name, exc)
+        raise HTTPException(500, "Failed to persist job rerun") from exc
 
     try:
         created = await asyncio.to_thread(k8s.create_fournos_job, body)
@@ -613,6 +1421,15 @@ async def rerun_job(job_name: str, _=Depends(require_admin)):
             "redirect": "/testing/jobs/{}".format(created_name),
         }
     except Exception as exc:
+        try:
+            async with AsyncSessionLocal() as session, session.begin():
+                await db_svc.delete_job_by_name(session, new_name)
+        except Exception as cleanup_exc:
+            logger.error(
+                "Failed to remove provisional rerun %s: %s",
+                new_name,
+                cleanup_exc,
+            )
         raise HTTPException(500, str(exc))
 
 
@@ -781,10 +1598,24 @@ def _apply_scheduling(spec: dict, schedule: str, scheduled_start_time: Optional[
 
 
 @router.post("/submit", response_model=SubmitJobResponse)
-async def submit_job(req: SubmitJobRequest, _=Depends(require_auth)):
+async def submit_job(req: SubmitJobRequest, user=Depends(require_auth)):
     config_overrides = project_adapters.normalize_overrides(
         req.project, dict(req.config_overrides)
     )
+    owner = _verified_owner(user)
+    resolved_pull_sha = project_adapters.resolve_build_source(
+        req.project, req.pull_sha, req.use_latest_main
+    )
+    env, source_fields = await _resolve_source_request(
+        req.pull_request, resolved_pull_sha
+    )
+    try:
+        normalized_work_items = normalize_work_items(req.work_items)
+        normalized_run_group_ids = normalize_group_ids(req.run_group_ids)
+    except WorkItemValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RunGroupValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
     if req.version:
         version_key = _VERSION_KEYS.get(
@@ -805,17 +1636,10 @@ async def submit_job(req: SubmitJobRequest, _=Depends(require_auth)):
         args = [req.preset] if req.preset else []
         job_name = k8s.sanitize_job_name("forge-{}".format(req.project))
 
-    pull_sha = project_adapters.resolve_build_source(
-        req.project, req.pull_sha, req.use_latest_main
-    )
-    env = {}
-    if pull_sha:
-        env["PULL_PULL_SHA"] = pull_sha
-
     spec: dict[str, Any] = {
         "cluster": req.cluster,
         "displayName": display_name,
-        "owner": req.owner or "fournos-dashboard",
+        "owner": owner,
         "pipeline": req.pipeline,
         "exclusive": req.exclusive,
         "priority": req.priority,
@@ -844,32 +1668,39 @@ async def submit_job(req: SubmitJobRequest, _=Depends(require_auth)):
         "metadata": {
             "name": job_name,
             "namespace": settings.FOURNOS_NAMESPACE,
+            "annotations": requester_annotations(user),
         },
         "spec": spec,
     }
     if env:
         body["spec"]["env"] = env
 
-    try:
-        created = await asyncio.to_thread(k8s.create_fournos_job, body)
-    except Exception as exc:
-        raise HTTPException(500, "Failed to create FournosJob: {}".format(exc))
-
-    created_name = created.get("metadata", {}).get("name", job_name)
     initial_status = (
-        "Recurring" if req.schedule else "Scheduled" if req.scheduled_start_time else "Pending"
+        "Recurring" if req.schedule
+        else "Scheduled" if req.scheduled_start_time
+        else "Pending"
     )
 
+    # The request record must exist before the execution resource can start.
+    # If Kubernetes rejects the submission, remove the provisional row so it
+    # cannot appear as a run that actually executed.
     try:
         async with AsyncSessionLocal() as session, session.begin():
-            await db_svc.upsert_job(
+            await db_svc.validate_active_run_group_ids(
+                session, normalized_run_group_ids
+            )
+            db_job = await db_svc.upsert_job(
                 session,
-                name=created_name,
+                name=job_name,
                 project=req.project,
                 preset=req.preset or " ".join(req.args),
                 cluster=req.cluster,
                 pipeline=req.pipeline,
-                owner=req.owner or "fournos-dashboard",
+                owner=owner,
+                requester_subject=user.get("subject", ""),
+                requester_email=user.get("email", ""),
+                requester_name=user.get("name", ""),
+                auth_provider=user.get("auth_provider", ""),
                 status=initial_status,
                 config_overrides=config_overrides,
                 fjob_spec=body.get("spec", {}),
@@ -878,13 +1709,43 @@ async def submit_job(req: SubmitJobRequest, _=Depends(require_auth)):
                     else "deferred" if req.scheduled_start_time
                     else "manual"
                 ),
+                **source_fields,
             )
+            if normalized_work_items:
+                await db_svc.replace_work_items(
+                    session,
+                    db_job,
+                    normalized_work_items,
+                    created_by_subject=str(user.get("subject") or ""),
+                )
+            if normalized_run_group_ids:
+                await db_svc.replace_run_groups(
+                    session,
+                    db_job,
+                    normalized_run_group_ids,
+                    created_by_subject=str(user.get("subject") or ""),
+                )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     except Exception as exc:
-        logger.error(
-            "DB upsert failed for %s (job was created in K8s): %s",
-            created_name,
-            exc,
-        )
+        logger.error("Could not persist submission intent for %s: %s", job_name, exc)
+        raise HTTPException(500, "Failed to persist job submission") from exc
+
+    try:
+        created = await asyncio.to_thread(k8s.create_fournos_job, body)
+    except Exception as exc:
+        try:
+            async with AsyncSessionLocal() as session, session.begin():
+                await db_svc.delete_job_by_name(session, job_name)
+        except Exception as cleanup_exc:
+            logger.error(
+                "Failed to remove provisional job %s: %s",
+                job_name,
+                cleanup_exc,
+            )
+        raise HTTPException(500, "Failed to create FournosJob: {}".format(exc))
+
+    created_name = created.get("metadata", {}).get("name", job_name)
 
     return {
         "status": "ok",
@@ -899,18 +1760,52 @@ async def submit_job(req: SubmitJobRequest, _=Depends(require_auth)):
 # ui/submit.yaml (see app/schemas/ui_schema.py) — no project-specific code.
 
 @router.post("/submit-matrix", response_model=SubmitMatrixResponse)
-async def submit_matrix(req: SubmitMatrixRequest, _=Depends(require_auth)):
+async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
     """Submit a matrix pipeline — creates one FournosJob per model, each
     carrying all of the selected workloads plus the shared args/overrides.
     """
     if not req.models or not req.workloads:
         raise HTTPException(400, "models and workloads are required")
 
-    pull_sha = project_adapters.resolve_build_source(
+    owner = _verified_owner(user)
+    try:
+        normalized_work_items = normalize_work_items(req.work_items)
+        normalized_run_group_ids = normalize_group_ids(req.run_group_ids)
+    except WorkItemValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RunGroupValidationError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    async with AsyncSessionLocal() as session:
+        try:
+            await db_svc.validate_active_run_group_ids(
+                session, normalized_run_group_ids
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    resolved_pull_sha = project_adapters.resolve_build_source(
         req.project, req.pull_sha, req.use_latest_main
     )
+    source_env, source_fields = await _resolve_source_request(
+        req.pull_request, resolved_pull_sha
+    )
+    model_prefixes = [
+        re.sub(
+            r"[^a-z0-9-]",
+            "-",
+            "{}-{}".format(req.project, model_item.key).lower(),
+        )
+        for model_item in req.models
+    ]
+    job_names = [k8s.sanitize_job_name(prefix) for prefix in model_prefixes]
+    if (
+        len(set(model_prefixes)) != len(model_prefixes)
+        or len(set(job_names)) != len(job_names)
+    ):
+        raise HTTPException(
+            400, "models must produce unique Kubernetes job names"
+        )
     results = []
-    for model_item in req.models:
+    for model_item, job_name in zip(req.models, job_names):
         args = list(req.args) + [model_item.key] + list(req.workloads)
 
         job_overrides: dict[str, Any] = dict(req.config_overrides)
@@ -923,18 +1818,12 @@ async def submit_matrix(req: SubmitMatrixRequest, _=Depends(require_auth)):
         )
 
         display_name = "{}-{}-{}".format(req.project, model_item.key, req.cluster)
-        generate_name = re.sub(
-            r"[^a-z0-9-]", "-", "{}-{}-".format(req.project, model_item.key).lower()
-        )
-
-        env: dict[str, str] = {}
-        if pull_sha:
-            env["PULL_PULL_SHA"] = pull_sha
+        env = dict(source_env)
 
         spec: dict[str, Any] = {
             "cluster": req.cluster,
             "displayName": display_name,
-            "owner": req.owner,
+            "owner": owner,
             "pipeline": req.pipeline,
             "exclusive": req.exclusive,
             "priority": req.priority,
@@ -959,51 +1848,89 @@ async def submit_matrix(req: SubmitMatrixRequest, _=Depends(require_auth)):
             ),
             "kind": "FournosJob",
             "metadata": {
-                "generateName": generate_name,
+                "name": job_name,
                 "namespace": settings.FOURNOS_NAMESPACE,
+                "annotations": requester_annotations(user),
             },
             "spec": spec,
         }
         if env:
             body["spec"]["env"] = env
 
+        initial_status = (
+            "Recurring" if req.schedule
+            else "Scheduled" if req.scheduled_start_time
+            else "Pending"
+        )
+        try:
+            async with AsyncSessionLocal() as session, session.begin():
+                db_job = await db_svc.upsert_job(
+                    session,
+                    name=job_name,
+                    project=req.project,
+                    preset="{} {}".format(model_item.key, " ".join(req.workloads)),
+                    cluster=req.cluster,
+                    pipeline=req.pipeline,
+                    owner=owner,
+                    requester_subject=user.get("subject", ""),
+                    requester_email=user.get("email", ""),
+                    requester_name=user.get("name", ""),
+                    auth_provider=user.get("auth_provider", ""),
+                    status=initial_status,
+                    config_overrides=job_overrides,
+                    fjob_spec=body.get("spec", {}),
+                    trigger_type=(
+                        "recurring-parent" if req.schedule
+                        else "deferred" if req.scheduled_start_time
+                        else "manual"
+                    ),
+                    **source_fields,
+                )
+                if normalized_work_items:
+                    await db_svc.replace_work_items(
+                        session,
+                        db_job,
+                        normalized_work_items,
+                        created_by_subject=str(user.get("subject") or ""),
+                    )
+                if normalized_run_group_ids:
+                    await db_svc.replace_run_groups(
+                        session,
+                        db_job,
+                        normalized_run_group_ids,
+                        created_by_subject=str(user.get("subject") or ""),
+                    )
+        except Exception as exc:
+            logger.error(
+                "Could not persist matrix submission intent for %s: %s",
+                job_name,
+                exc,
+            )
+            results.append({
+                "model": model_item.key,
+                "status": "failed",
+                "error": "Failed to persist job submission",
+            })
+            continue
+
         try:
             created = await asyncio.to_thread(k8s.create_fournos_job, body)
-            created_name = created.get("metadata", {}).get("name", generate_name)
+            created_name = created.get("metadata", {}).get("name", job_name)
             results.append({
                 "model": model_item.key,
                 "job_name": created_name,
                 "status": "created",
             })
-
+        except Exception as exc:
             try:
                 async with AsyncSessionLocal() as session, session.begin():
-                    await db_svc.upsert_job(
-                        session,
-                        name=created_name,
-                        project=req.project,
-                        preset="{} {}".format(model_item.key, " ".join(req.workloads)),
-                        cluster=req.cluster,
-                        pipeline=req.pipeline,
-                        owner=req.owner,
-                        status=(
-                            "Recurring" if req.schedule
-                            else "Scheduled" if req.scheduled_start_time
-                            else "Pending"
-                        ),
-                        config_overrides=job_overrides,
-                        fjob_spec=body.get("spec", {}),
-                        trigger_type=(
-                            "recurring-parent" if req.schedule
-                            else "deferred" if req.scheduled_start_time
-                            else "manual"
-                        ),
-                    )
-            except Exception as exc:
+                    await db_svc.delete_job_by_name(session, job_name)
+            except Exception as cleanup_exc:
                 logger.error(
-                    "DB upsert failed for matrix job %s: %s", created_name, exc
+                    "Failed to remove provisional matrix job %s: %s",
+                    job_name,
+                    cleanup_exc,
                 )
-        except Exception as exc:
             results.append({
                 "model": model_item.key,
                 "status": "failed",
@@ -1113,6 +2040,10 @@ def _fetch_github_open_prs_sync() -> list:
             "author": pr["user"]["login"],
             "head_sha": pr["head"]["sha"],
             "branch": pr["head"]["ref"],
+            "repository": settings.FORGE_GITHUB_REPO,
+            "url": pr.get("html_url") or "https://github.com/{}/pull/{}".format(
+                settings.FORGE_GITHUB_REPO, pr["number"]
+            ),
             "draft": pr["draft"],
         }
         for pr in prs
@@ -1287,7 +2218,7 @@ async def github_sync_refresh(_=Depends(require_auth)):
 # fournos/fournos/handlers/lifecycle.py). No separate CRD, no Control
 # Center-managed CronJobs — this reads/writes real FournosJob objects only.
 
-def _recurring_job_to_response(job: dict) -> dict:
+def _recurring_job_to_response(job: dict, *, include_owner: bool = True) -> dict:
     meta = job.get("metadata", {})
     spec = job.get("spec", {})
     status = job.get("status", {})
@@ -1298,7 +2229,7 @@ def _recurring_job_to_response(job: dict) -> dict:
         "cluster": spec.get("cluster", ""),
         "pipeline": spec.get("pipeline", ""),
         "preset": " ".join(forge.get("args", [])),
-        "owner": spec.get("owner", ""),
+        "owner": spec.get("owner", "") if include_owner else "",
         "schedule": spec.get("schedule", ""),
         "phase": status.get("phase", ""),
         "message": status.get("message", ""),
@@ -1308,12 +2239,16 @@ def _recurring_job_to_response(job: dict) -> dict:
 
 
 @router.get("/recurring-jobs", response_model=List[RecurringJobResponse])
-async def list_recurring_jobs(cluster: str = Query("")):
+async def list_recurring_jobs(request: Request, cluster: str = Query("")):
+    include_owner = get_current_user(request) is not None
     jobs = await asyncio.to_thread(k8s.list_recurring_jobs)
     if cluster:
         jobs = [j for j in jobs if j.get("spec", {}).get("cluster") == cluster]
     return _sort_latest(
-        [_recurring_job_to_response(j) for j in jobs],
+        [
+            _recurring_job_to_response(j, include_owner=include_owner)
+            for j in jobs
+        ],
         "last_scheduled_time",
         "created_at",
     )
@@ -1374,14 +2309,14 @@ async def delete_recurring_job(name: str, _=Depends(require_admin)):
 # spec.lockUntil) holds the cluster's full Kueue quota without running a
 # pipeline (see fournos/fournos/handlers/execution.py::is_lock_only).
 
-def _cluster_lock_to_response(job: dict) -> dict:
+def _cluster_lock_to_response(job: dict, *, include_owner: bool = True) -> dict:
     meta = job.get("metadata", {})
     spec = job.get("spec", {})
     status = job.get("status", {})
     return {
         "name": meta.get("name", ""),
         "cluster": spec.get("cluster", ""),
-        "owner": spec.get("owner", ""),
+        "owner": spec.get("owner", "") if include_owner else "",
         "reason": spec.get("displayName", ""),
         "phase": status.get("phase", ""),
         "lock_until": spec.get("lockUntil"),
@@ -1391,10 +2326,14 @@ def _cluster_lock_to_response(job: dict) -> dict:
 
 
 @router.get("/cluster-locks", response_model=List[ClusterLockResponse])
-async def list_cluster_locks(cluster: str = Query("")):
+async def list_cluster_locks(request: Request, cluster: str = Query("")):
+    include_owner = get_current_user(request) is not None
     locks = await asyncio.to_thread(k8s.list_cluster_locks, None, cluster or None)
     return _sort_latest(
-        [_cluster_lock_to_response(j) for j in locks],
+        [
+            _cluster_lock_to_response(j, include_owner=include_owner)
+            for j in locks
+        ],
         "scheduled_start_time",
         "created_at",
     )
@@ -1402,12 +2341,12 @@ async def list_cluster_locks(cluster: str = Query("")):
 
 @router.post("/cluster-locks", response_model=ClusterLockResponse)
 async def create_cluster_lock(
-    req: CreateClusterLockRequest, _=Depends(require_auth)
+    req: CreateClusterLockRequest, user=Depends(require_auth)
 ):
     spec: dict[str, Any] = {
         "cluster": req.cluster,
         "displayName": req.reason or "Cluster lock",
-        "owner": req.owner or "fournos-dashboard",
+        "owner": _verified_owner(user),
         "exclusive": True,
         "lockOnly": True,
     }
@@ -1422,7 +2361,11 @@ async def create_cluster_lock(
             settings.FOURNOS_API_GROUP, settings.FOURNOS_API_VERSION
         ),
         "kind": "FournosJob",
-        "metadata": {"name": job_name, "namespace": settings.FOURNOS_NAMESPACE},
+        "metadata": {
+            "name": job_name,
+            "namespace": settings.FOURNOS_NAMESPACE,
+            "annotations": requester_annotations(user),
+        },
         "spec": spec,
     }
     try:
@@ -1444,7 +2387,7 @@ async def delete_cluster_lock(name: str, _=Depends(require_admin)):
 # ─── routes: per-cluster overview ────────────────────────────────────────
 
 @router.get("/clusters/{cluster}/overview", response_model=ClusterOverviewResponse)
-async def cluster_overview(cluster: str):
+async def cluster_overview(cluster: str, request: Request):
     """Backs the "Defer / Recurring / Lock cluster" popup on the Submit
     page: what's running on this cluster now, what recurs on it, and what
     locks (active or scheduled) it has — all live from the fournos
@@ -1458,17 +2401,26 @@ async def cluster_overview(cluster: str):
     recurring = await asyncio.to_thread(k8s.list_recurring_jobs)
     recurring = [j for j in recurring if j.get("spec", {}).get("cluster") == cluster]
     locks = await asyncio.to_thread(k8s.list_cluster_locks, None, cluster)
+    include_owner = get_current_user(request) is not None
 
     return {
         "cluster": cluster,
-        "current_jobs": [_live_job_to_summary(j) for j in current],
+        "current_jobs": [
+            _live_job_to_summary(j, include_owner=include_owner) for j in current
+        ],
         "recurring_jobs": _sort_latest(
-            [_recurring_job_to_response(j) for j in recurring],
+            [
+                _recurring_job_to_response(j, include_owner=include_owner)
+                for j in recurring
+            ],
             "last_scheduled_time",
             "created_at",
         ),
         "locks": _sort_latest(
-            [_cluster_lock_to_response(j) for j in locks],
+            [
+                _cluster_lock_to_response(j, include_owner=include_owner)
+                for j in locks
+            ],
             "scheduled_start_time",
             "created_at",
         ),

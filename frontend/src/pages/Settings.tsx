@@ -8,9 +8,17 @@ import {
   ArrowUpTrayIcon,
   TrashIcon,
   DocumentTextIcon,
+  UserGroupIcon,
 } from '@heroicons/react/24/outline'
-import { useSlackSettings, useUpdateSlackSettings, useTestSlack } from '../hooks/useSettings'
+import {
+  useManagedUsers,
+  useSlackSettings,
+  useTestSlack,
+  useUpdateSlackSettings,
+  useUpdateUserRole,
+} from '../hooks/useSettings'
 import { useBillingReports, useUploadBillingCsv, useDeleteBillingReport, useCostRefreshStatus } from '../hooks/useBilling'
+import { getSession } from '../stores/authStore'
 
 export default function Settings() {
   const { data: slackSettings, isLoading, isError, error } = useSlackSettings()
@@ -44,6 +52,8 @@ export default function Settings() {
         <h1 className="text-2xl font-bold text-gray-900 font-display">Settings</h1>
         <p className="mt-1 text-sm text-gray-500">Manage integrations and system configuration.</p>
       </div>
+
+      <UserManagementCard />
 
       <div className="card">
         <div className="p-6">
@@ -155,6 +165,108 @@ export default function Settings() {
         </div>
       </div>
       <BillingCsvCard />
+    </div>
+  )
+}
+
+
+function UserManagementCard() {
+  const { data: users = [], isLoading, isError, error } = useManagedUsers()
+  const updateRole = useUpdateUserRole()
+  const currentEmail = getSession()?.email?.toLowerCase()
+
+  return (
+    <div className="card">
+      <div className="p-6">
+        <div className="flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className="h-10 w-10 rounded-lg bg-primary-600 flex items-center justify-center">
+              <UserGroupIcon className="h-5 w-5 text-white" />
+            </div>
+            <div>
+              <h2 className="text-lg font-semibold text-gray-900 font-display">User Management</h2>
+              <p className="text-sm text-gray-500">
+                Assign administrator or general-user access to people who have signed in with Google SSO.
+              </p>
+            </div>
+          </div>
+          {!isLoading && !isError && (
+            <span className="inline-flex rounded-full bg-gray-100 px-3 py-1 text-xs font-medium text-gray-600">
+              {users.length} user{users.length !== 1 ? 's' : ''}
+            </span>
+          )}
+        </div>
+
+        <div className="mt-6">
+          {isLoading ? (
+            <p className="text-sm text-gray-500">Loading users...</p>
+          ) : isError ? (
+            <div className="rounded-lg bg-orange-50 border border-orange-200 p-3 text-sm text-orange-800">
+              Failed to load users{error instanceof Error ? `: ${error.message}` : ''}.
+            </div>
+          ) : users.length === 0 ? (
+            <div className="rounded-lg border border-dashed border-gray-300 px-4 py-6 text-center text-sm text-gray-500">
+              Users will appear here after their first successful Google SSO sign-in.
+            </div>
+          ) : (
+            <div className="overflow-x-auto rounded-lg border border-gray-200">
+              <table className="min-w-full divide-y divide-gray-200">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wide text-gray-500">User</th>
+                    <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wide text-gray-500">Role</th>
+                    <th className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wide text-gray-500">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100 bg-white">
+                  {users.map((user) => {
+                    const isCurrentUser = user.email.toLowerCase() === currentEmail
+                    const isUpdating = updateRole.isPending && updateRole.variables?.userId === user.id
+                    return (
+                      <tr key={user.id}>
+                        <td className="px-4 py-3">
+                          <p className="text-sm font-medium text-gray-900">
+                            {user.full_name || user.username}
+                            {isCurrentUser && <span className="ml-2 text-xs font-normal text-gray-400">You</span>}
+                          </p>
+                          <p className="text-xs text-gray-500">{user.email}</p>
+                        </td>
+                        <td className="px-4 py-3">
+                          <select
+                            aria-label={`Role for ${user.email}`}
+                            value={user.role}
+                            disabled={isUpdating || (isCurrentUser && user.role === 'admin')}
+                            onChange={(event) => updateRole.mutate({
+                              userId: user.id,
+                              role: event.target.value as 'admin' | 'user',
+                            })}
+                            className="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm text-gray-700 shadow-sm focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500 disabled:cursor-not-allowed disabled:bg-gray-100"
+                          >
+                            <option value="user">General user</option>
+                            <option value="admin">Administrator</option>
+                          </select>
+                        </td>
+                        <td className="px-4 py-3">
+                          <span className={`inline-flex rounded-full px-2.5 py-1 text-xs font-medium ${
+                            user.is_active
+                              ? 'bg-green-100 text-green-800'
+                              : 'bg-gray-100 text-gray-600'
+                          }`}>
+                            {user.is_active ? 'Active' : 'Disabled'}
+                          </span>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <p className="mt-3 text-xs text-gray-500">
+            Role changes apply to API access immediately. The affected user may need to refresh the page to update navigation.
+          </p>
+        </div>
+      </div>
     </div>
   )
 }

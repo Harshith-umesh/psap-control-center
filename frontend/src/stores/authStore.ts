@@ -7,6 +7,9 @@ export type UserRole = 'admin' | 'user'
 export interface AuthSession {
   username: string
   role: UserRole
+  email?: string | null
+  name?: string | null
+  auth_provider?: 'local' | 'google' | string
 }
 
 let session: AuthSession | null = null
@@ -25,6 +28,10 @@ export function isAdmin(): boolean {
 
 export function getUsername(): string | null {
   return session?.username ?? null
+}
+
+export function getDisplayName(): string | null {
+  return session?.name || session?.email || session?.username || null
 }
 
 export function getRole(): UserRole | null {

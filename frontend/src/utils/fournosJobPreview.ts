@@ -1,4 +1,5 @@
 import { dump } from 'js-yaml'
+import type { PullRequestSelection } from '../types'
 
 // Mirrors the FournosJob CR construction in backend/app/api/fournos.py
 // (submit_job / submit_matrix) field-for-field, so what's previewed here on
@@ -23,11 +24,6 @@ function sanitizeJobName(prefix: string): string {
   return name.slice(0, 63)
 }
 
-/** Mirrors the inline generate_name sanitization in submit_matrix(). */
-function sanitizeGenerateName(project: string, modelKey: string): string {
-  return `${project}-${modelKey}-`.toLowerCase().replace(/[^a-z0-9-]/g, '-')
-}
-
 interface SharedInput {
   project: string
   cluster: string
@@ -36,6 +32,7 @@ interface SharedInput {
   priority: string
   exclusive: boolean
   pullSha: string
+  pullRequest?: PullRequestSelection | null
   args: string[]
   configOverrides: Record<string, string>
   gpuType?: string
@@ -44,6 +41,22 @@ interface SharedInput {
   schedule?: string
   /** ISO 8601 UTC — mutually exclusive with schedule. */
   scheduledStartTime?: string | null
+}
+
+function sourceEnvironment(input: Pick<SharedInput, 'pullSha' | 'pullRequest'>): Record<string, string> | null {
+  if (input.pullRequest) {
+    const [owner, name] = input.pullRequest.repository.split('/', 2)
+    return {
+      REPO_OWNER: owner,
+      REPO_NAME: name,
+      PULL_NUMBER: String(input.pullRequest.number),
+      PULL_HEAD_REF: input.pullRequest.head_branch,
+      PULL_PULL_SHA: input.pullRequest.requested_sha,
+      CONTROL_CENTER_REQUESTED_SHA: input.pullRequest.requested_sha,
+      CONTROL_CENTER_PR_URL: input.pullRequest.url,
+    }
+  }
+  return input.pullSha.trim() ? { PULL_PULL_SHA: input.pullSha.trim() } : null
 }
 
 function applyScheduling(spec: Record<string, unknown>, input: Pick<SharedInput, 'schedule' | 'scheduledStartTime'>): void {
@@ -74,9 +87,8 @@ export function buildSingleJobPreview(input: SharedInput): Record<string, unknow
   if (input.gpuType?.trim()) {
     spec.hardware = { gpuType: input.gpuType.trim(), gpuCount: input.gpuCount || 1 }
   }
-  if (input.pullSha.trim()) {
-    spec.env = { PULL_PULL_SHA: input.pullSha.trim() }
-  }
+  const env = sourceEnvironment(input)
+  if (env) spec.env = env
   applyScheduling(spec, input)
 
   return {
@@ -117,16 +129,15 @@ export function buildMatrixJobPreviews(
     if (input.gpuType?.trim() || model.gpuCount) {
       spec.hardware = { gpuType: input.gpuType?.trim() || 'unknown', gpuCount: model.gpuCount || 1 }
     }
-    if (input.pullSha.trim()) {
-      spec.env = { PULL_PULL_SHA: input.pullSha.trim() }
-    }
+    const env = sourceEnvironment(input)
+    if (env) spec.env = env
     applyScheduling(spec, input)
 
     return {
       apiVersion: API_VERSION,
       kind: 'FournosJob',
       metadata: {
-        generateName: sanitizeGenerateName(input.project, model.key),
+        name: sanitizeJobName(`${input.project}-${model.key}`),
         namespace: NAMESPACE,
       },
       spec,

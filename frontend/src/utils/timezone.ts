@@ -140,4 +140,3 @@ export function buildUtcCron(time: string, weekdays: number[], tz: string): stri
   const dows = Array.from(new Set(utcSlots.map((s) => s.dow))).sort((a, b) => a - b)
   return `${minute} ${hour} * * ${dows.join(',')}`
 }
-

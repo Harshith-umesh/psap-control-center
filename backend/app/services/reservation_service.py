@@ -24,7 +24,8 @@ class ReservationService:
 
     async def create_reservation(
         self,
-        reservation_data: ReservationCreate
+        reservation_data: ReservationCreate,
+        actor: Optional[dict] = None,
     ) -> Reservation:
         cluster_result = await self.db.execute(
             select(Cluster)
@@ -47,6 +48,10 @@ class ReservationService:
             user_name=reservation_data.user_name,
             user_email=reservation_data.user_email,
             team=reservation_data.team,
+            created_by_subject=(actor or {}).get("subject"),
+            created_by_email=(actor or {}).get("email"),
+            created_by_name=(actor or {}).get("name"),
+            created_by_provider=(actor or {}).get("auth_provider"),
             start_time=start,
             end_time=end,
             reservation_type=reservation_data.reservation_type,

@@ -19,6 +19,11 @@ from kubernetes import client, config, watch
 from kubernetes.client.rest import ApiException
 
 from app.core.config import settings
+from app.services.failure_details import (
+    is_infrastructure_reason,
+    normalize_reason,
+    outcome_for_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +39,18 @@ LABEL_RECURRING_PARENT = "fournos.dev/recurring-parent"
 ANNOTATION_TRIGGER_NOW = "fournos.dev/trigger-now"
 
 HEARTH_KUBECONFIG_FILENAME = "hearth-management.kubeconfig"
+
+
+class TaskRunLookupError(RuntimeError):
+    """A TaskRun lookup failed for a reason other than not-found."""
+
+    def __init__(self, name: str, status: Optional[int], reason: str):
+        self.name = name
+        self.status = status
+        self.reason = reason
+        super().__init__(
+            f"TaskRun {name} lookup failed ({status or 'unknown'}): {reason}"
+        )
 
 
 def _saved_hearth_kubeconfig() -> Optional[str]:
@@ -323,7 +340,7 @@ def get_taskrun(name: str, namespace: Optional[str] = None) -> Optional[dict]:
         if exc.status == 404:
             return None
         logger.error("Failed to get TaskRun %s: %s", name, exc.reason)
-        return None
+        raise TaskRunLookupError(name, exc.status, exc.reason or "API error") from exc
 
 
 def _phase_from_conditions(conditions: list) -> str:
@@ -336,7 +353,13 @@ def _phase_from_conditions(conditions: list) -> str:
         return "Succeeded"
     # Cancellation/skipping are also represented by a False condition, so
     # classify their specific reasons before the generic failure fallback.
-    if reason == "TaskRunCancelled":
+    if reason in (
+        "TaskRunCancelled",
+        "PipelineRunCancelled",
+        "Cancelled",
+        "StoppedRunFinally",
+        "CancelledRunFinally",
+    ):
         return "Cancelled"
     if reason == "SkippingNoMatch":
         return "Skipped"
@@ -371,11 +394,15 @@ def get_current_step_for_job(
     return None
 
 
-def extract_pipeline_stages(pipelinerun: dict) -> list:
+def extract_pipeline_stages(
+    pipelinerun: dict, *, strict_lookup_errors: bool = False
+) -> list:
     status = pipelinerun.get("status") or {}
     child_refs = status.get("childReferences") or []
     skipped_tasks = status.get("skippedTasks") or []
     pipeline_spec = status.get("pipelineSpec") or {}
+    pipeline_phase = _phase_from_conditions(status.get("conditions", []))
+    pipeline_terminal = pipeline_phase in ("Succeeded", "Failed", "Cancelled")
 
     finally_task_names = set()
     for task in pipeline_spec.get("finally", []):
@@ -389,8 +416,21 @@ def extract_pipeline_stages(pipelinerun: dict) -> list:
         start_time = None
         completion_time = None
         task_phase = "Pending"
+        outcome = ""
+        reason = ""
+        reason_code = ""
+        reason_source = ""
+        failed_step = ""
+        exit_code = None
 
-        tr = get_taskrun(task_run_name)
+        lookup_error = None
+        try:
+            tr = get_taskrun(task_run_name)
+        except TaskRunLookupError as exc:
+            if strict_lookup_errors:
+                raise
+            tr = None
+            lookup_error = exc
         if tr:
             tr_status = tr.get("status", {})
             start_time = tr_status.get("startTime")
@@ -398,6 +438,54 @@ def extract_pipeline_stages(pipelinerun: dict) -> list:
             task_phase = _phase_from_conditions(
                 tr_status.get("conditions", [])
             )
+            outcome = outcome_for_status(task_phase)
+            conditions = tr_status.get("conditions") or []
+            condition = conditions[0] if conditions else {}
+            reason_code = condition.get("reason", "")
+            reason = normalize_reason(condition.get("message"))
+            reason_source = "tekton_condition" if reason or reason_code else ""
+
+            if task_phase == "Failed":
+                for step in tr_status.get("steps") or []:
+                    terminated = (step.get("terminated") or {}) if isinstance(step, dict) else {}
+                    step_exit_code = terminated.get("exitCode")
+                    step_reason = terminated.get("reason", "")
+                    if not terminated or (
+                        step_exit_code in (None, 0) and step_reason in ("", "Completed")
+                    ):
+                        continue
+                    failed_step = step.get("name", "")
+                    exit_code = step_exit_code
+                    reason_code = step_reason or reason_code
+                    reason = normalize_reason(
+                        terminated.get("message") or reason or step_reason
+                    )
+                    reason_source = "step_termination"
+                    break
+
+                if is_infrastructure_reason(
+                    reason_code, condition.get("reason", "")
+                ):
+                    outcome = "infrastructure_error"
+        elif lookup_error:
+            task_phase = "Unknown"
+            outcome = "unknown"
+            if lookup_error.status in (401, 403):
+                reason = "Control Center is not authorized to read this TaskRun."
+                reason_code = "TASKRUN_ACCESS_DENIED"
+            else:
+                reason = (
+                    "TaskRun status could not be read due to a Kubernetes "
+                    "API error."
+                )
+                reason_code = "TASKRUN_LOOKUP_FAILED"
+            reason_source = "tekton_api"
+        elif pipeline_terminal:
+            task_phase = "Unknown"
+            outcome = "unknown"
+            reason = "TaskRun details were unavailable after the pipeline terminated."
+            reason_code = "TASKRUN_UNAVAILABLE"
+            reason_source = "tekton_reference"
 
         return {
             "name": task_name,
@@ -406,6 +494,12 @@ def extract_pipeline_stages(pipelinerun: dict) -> list:
             "startTime": start_time,
             "completionTime": completion_time,
             "finally": task_name in finally_task_names,
+            "outcome": outcome,
+            "reason": reason,
+            "reasonCode": reason_code,
+            "reasonSource": reason_source,
+            "failedStep": failed_step,
+            "exitCode": exit_code,
         }
 
     # Each of these is its own blocking K8s API round-trip — a pipeline
@@ -439,6 +533,12 @@ def extract_pipeline_stages(pipelinerun: dict) -> list:
             "startTime": None,
             "completionTime": None,
             "finally": task_name in finally_task_names,
+            "outcome": "skipped",
+            "reason": normalize_reason(skipped.get("reason")) if isinstance(skipped, dict) else "",
+            "reasonCode": "SkippingNoMatch",
+            "reasonSource": "tekton_skipped_task",
+            "failedStep": "",
+            "exitCode": None,
         })
         existing_names.add(task_name)
 
@@ -523,6 +623,54 @@ def list_pods_for_job(
     except ApiException as exc:
         logger.error("Failed to list pods for %s: %s", job_name, exc.reason)
         return []
+
+
+def get_forge_execution_images(
+    job_name: str, namespace: Optional[str] = None
+) -> list[dict]:
+    """Return the observed Forge container image refs and immutable IDs.
+
+    Tekton prefixes step containers with ``step-``.  The image ID is the
+    runtime-resolved digest and remains authoritative even when the declared
+    image uses a moving tag such as ``latest``.
+    """
+    _ensure_loaded()
+    if _core_api is None:
+        return []
+    ns = namespace or settings.FOURNOS_NAMESPACE
+    try:
+        result = _core_api.list_namespaced_pod(
+            namespace=ns,
+            label_selector=f"fournos.dev/job-name={job_name}",
+        )
+    except ApiException as exc:
+        logger.warning(
+            "Failed to read Forge image provenance for %s: %s",
+            job_name,
+            exc.reason,
+        )
+        return []
+
+    images: dict[tuple[str, str, str], dict] = {}
+    for pod in result.items:
+        for container_status in pod.status.container_statuses or []:
+            container_name = container_status.name or ""
+            if container_name not in {"forge", "step-forge"}:
+                continue
+            image = container_status.image or ""
+            image_id = container_status.image_id or ""
+            # A declared tag without the runtime-resolved ID is not immutable
+            # evidence. Leave it pending so a later watcher pass can capture
+            # the digest once Kubernetes has populated containerStatuses.
+            if not image_id:
+                continue
+            evidence = {
+                "image": image,
+                "imageID": image_id,
+                "container": container_name,
+            }
+            images[(image, image_id, container_name)] = evidence
+    return [images[key] for key in sorted(images)]
 
 
 def read_pod_log(

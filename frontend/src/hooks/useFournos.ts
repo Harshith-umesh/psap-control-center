@@ -20,6 +20,13 @@ import type {
   SubmitMatrixRequest,
   SubmitMatrixResponse,
   ProjectUiSchemaResponse,
+  HistoryPreferenceResponse,
+  HistoryFilterOptionsResponse,
+  HistoryViewState,
+  WorkItemConfig,
+  WorkItemReference,
+  RunGroupCreate,
+  RunGroupReference,
 } from '../types'
 
 // ─── Jobs ──────────────────────────────────────────────────────────────
@@ -30,18 +37,71 @@ export function useFournosJobs(params: {
   cluster?: string
   status?: string
   owner?: string
+  requester_scope?: 'all' | 'mine'
+  q?: string
+  identity?: string
+  failure_outcome?: string
+  repository?: string
+  pr_number?: number
+  source_sha?: string
+  forge?: string
+  work_item_provider?: string
+  work_item_key?: string
+  tags?: string
   start_time?: string
   end_time?: string
   sort_by?: string
   sort_dir?: 'asc' | 'desc'
   page?: number
   per_page?: number
-} = {}) {
+} = {}, enabled = true) {
   return useQuery<FournosJobListResponse>({
     queryKey: ['fournos-jobs', params],
     queryFn: () => fournosApi.listJobs(params),
+    enabled,
     refetchInterval: params.tab === 'live' ? 5000 : false,
     retry: 1,
+  })
+}
+
+export function useHistoryPreference(enabled: boolean) {
+  return useQuery<HistoryPreferenceResponse>({
+    queryKey: ['fournos-history-preference'],
+    queryFn: () => fournosApi.getHistoryPreference(),
+    enabled,
+    retry: 1,
+  })
+}
+
+export function useHistoryFilterOptions(enabled: boolean) {
+  return useQuery<HistoryFilterOptionsResponse>({
+    queryKey: ['fournos-history-filter-options'],
+    queryFn: () => fournosApi.getHistoryFilterOptions(),
+    enabled,
+    staleTime: 5 * 60 * 1000,
+    retry: 1,
+  })
+}
+
+export function useSaveHistoryPreference() {
+  const qc = useQueryClient()
+  return useMutation<HistoryPreferenceResponse, Error, HistoryViewState>({
+    mutationFn: (state) => fournosApi.saveHistoryPreference(state),
+    onSuccess: (data) => {
+      qc.setQueryData(['fournos-history-preference'], data)
+    },
+    onError: (error) => toast.error(error.message || 'Failed to save History view'),
+  })
+}
+
+export function useResetHistoryPreference() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: () => fournosApi.resetHistoryPreference(),
+    onSuccess: () => {
+      qc.removeQueries({ queryKey: ['fournos-history-preference'] })
+    },
+    onError: (error) => toast.error(error.message || 'Failed to reset History view'),
   })
 }
 
@@ -51,6 +111,63 @@ export function useFournosJob(name: string | undefined) {
     queryFn: () => fournosApi.getJob(name!),
     enabled: !!name,
     refetchInterval: 5000,
+  })
+}
+
+export function useWorkItemConfig() {
+  return useQuery<WorkItemConfig>({
+    queryKey: ['fournos-work-item-config'],
+    queryFn: () => fournosApi.getWorkItemConfig(),
+    staleTime: Infinity,
+    retry: 1,
+  })
+}
+
+export function useUpdateJobWorkItems(name: string | undefined) {
+  const qc = useQueryClient()
+  return useMutation<WorkItemReference[], Error, WorkItemReference[]>({
+    mutationFn: (workItems) => fournosApi.updateJobWorkItems(name!, workItems),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['fournos-job', name] })
+      qc.invalidateQueries({ queryKey: ['fournos-jobs'] })
+      qc.invalidateQueries({ queryKey: ['fournos-history-filter-options'] })
+      toast.success('Work-item associations updated')
+    },
+    onError: (error) => toast.error(error.message || 'Failed to update work items'),
+  })
+}
+
+export function useRunGroups(includeArchived = false) {
+  return useQuery<RunGroupReference[]>({
+    queryKey: ['fournos-run-groups', includeArchived],
+    queryFn: () => fournosApi.listRunGroups(includeArchived),
+    staleTime: 60_000,
+    retry: 1,
+  })
+}
+
+export function useCreateRunGroup() {
+  const qc = useQueryClient()
+  return useMutation<RunGroupReference, Error, RunGroupCreate>({
+    mutationFn: (group) => fournosApi.createRunGroup(group),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['fournos-run-groups'] })
+      toast.success('Run group created')
+    },
+    onError: (error) => toast.error(error.message || 'Failed to create run group'),
+  })
+}
+
+export function useUpdateJobRunGroups(name: string | undefined) {
+  const qc = useQueryClient()
+  return useMutation<RunGroupReference[], Error, string[]>({
+    mutationFn: (groupIds) => fournosApi.updateJobRunGroups(name!, groupIds),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['fournos-job', name] })
+      qc.invalidateQueries({ queryKey: ['fournos-jobs'] })
+      toast.success('Run grouping updated')
+    },
+    onError: (error) => toast.error(error.message || 'Failed to update run grouping'),
   })
 }
 

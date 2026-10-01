@@ -27,7 +27,11 @@ spec:
           restartPolicy: Never
           containers:
           - name: updater
-            image: registry.redhat.io/openshift4/ose-cli:latest
+            # Pin the CLI image referenced by the cluster's openshift/cli
+            # ImageStream. The integrated registry service is not available
+            # on every cluster, so pull the immutable payload image directly.
+            image: quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:e050f03e3d3954fd3e5a6573fde4875f4a21857a2a9bd4397e3f6875eb722902
+            imagePullPolicy: IfNotPresent
             command: ["/bin/sh", "/scripts/check-and-update.sh"]
             env:
             - name: NAMESPACE

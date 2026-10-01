@@ -1,11 +1,12 @@
 import json
+import secrets
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional, List
 from datetime import datetime
 
 from app.core.database import get_db
-from app.core.auth import require_auth, require_admin
+from app.core.auth import actor_label, require_auth, require_admin
 from app.services.reservation_service import ReservationService
 from app.services.slack_notifier import (
     send_new_reservation_notification,
@@ -26,6 +27,26 @@ from app.utils.logger import create_logger
 
 router = APIRouter()
 logger = create_logger("ReservationsAPI")
+
+
+def _require_owner_or_admin(reservation, user: dict, action: str) -> None:
+    """Authorize reservation mutations using immutable creator identity."""
+    if user.get("role") == "admin":
+        return
+
+    creator_subject = reservation.created_by_subject
+    actor_subject = user.get("subject")
+    if (
+        creator_subject
+        and actor_subject
+        and secrets.compare_digest(str(creator_subject), str(actor_subject))
+    ):
+        return
+
+    raise HTTPException(
+        status_code=403,
+        detail=f"Not authorized to {action} this reservation",
+    )
 
 
 def _to_response(r, cluster_name_override: Optional[str] = None) -> ReservationResponse:
@@ -114,7 +135,7 @@ async def create_reservation(
     service = ReservationService(db)
 
     try:
-        reservation = await service.create_reservation(reservation_data)
+        reservation = await service.create_reservation(reservation_data, actor=_user)
         background_tasks.add_task(send_new_reservation_notification, reservation)
         return _to_response(reservation)
     except ValueError as e:
@@ -201,6 +222,11 @@ async def update_reservation(
     service = ReservationService(db)
 
     try:
+        existing = await service.get_reservation(reservation_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Reservation not found")
+        _require_owner_or_admin(existing, _user, "update")
+
         reservation = await service.update_reservation(reservation_id, reservation_data)
         if not reservation:
             raise HTTPException(status_code=404, detail="Reservation not found")
@@ -217,6 +243,11 @@ async def delete_reservation(
     db: AsyncSession = Depends(get_db),
 ):
     service = ReservationService(db)
+    existing = await service.get_reservation(reservation_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+    _require_owner_or_admin(existing, _user, "delete")
+
     deleted = await service.delete_reservation(reservation_id)
 
     if not deleted:
@@ -233,15 +264,10 @@ async def cancel_reservation(
     existing = await service.get_reservation(reservation_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Reservation not found")
-    is_owner = existing.user_name == _user["username"]
-    if _user["role"] != "admin" and not is_owner:
-        raise HTTPException(
-            status_code=403,
-            detail="Not authorized to cancel this reservation",
-        )
+    _require_owner_or_admin(existing, _user, "cancel")
 
     reservation = await service.cancel_reservation(
-        reservation_id, cancelled_by=_user["username"]
+        reservation_id, cancelled_by=actor_label(_user)
     )
 
     if not reservation:
@@ -263,7 +289,7 @@ async def approve_reservation(
     service = ReservationService(db)
     try:
         reservation = await service.approve_reservation(
-            reservation_id, approved_by=_user["username"]
+            reservation_id, approved_by=actor_label(_user)
         )
         if not reservation:
             raise HTTPException(
@@ -287,7 +313,7 @@ async def deny_reservation(
     try:
         reservation = await service.deny_reservation(
             reservation_id,
-            denied_by=_user["username"],
+            denied_by=actor_label(_user),
             reason=body.reason,
         )
         if not reservation:
@@ -316,8 +342,13 @@ async def request_modification(
         raise HTTPException(status_code=400, detail="No changes provided")
 
     try:
+        existing = await service.get_reservation(reservation_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Reservation not found")
+        _require_owner_or_admin(existing, _user, "request changes to")
+
         reservation = await service.request_modification(
-            reservation_id, changes, requested_by=_user["username"]
+            reservation_id, changes, requested_by=actor_label(_user)
         )
         if not reservation:
             raise HTTPException(status_code=404, detail="Reservation not found")
@@ -341,7 +372,7 @@ async def approve_modification(
     service = ReservationService(db)
     try:
         reservation = await service.approve_modification(
-            reservation_id, approved_by=_user["username"]
+            reservation_id, approved_by=actor_label(_user)
         )
         if not reservation:
             raise HTTPException(status_code=404, detail="Reservation not found")
@@ -364,7 +395,7 @@ async def deny_modification(
     try:
         reservation = await service.deny_modification(
             reservation_id,
-            denied_by=_user["username"],
+            denied_by=actor_label(_user),
             reason=body.reason,
         )
         if not reservation:

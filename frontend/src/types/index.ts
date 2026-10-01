@@ -451,6 +451,52 @@ export interface FournosJobSummary {
    * created_at (when the CR was created). Powers the scheduling calendar. */
   scheduled_start_time: string | null
   source: 'live' | 'history'
+  source_repository: string
+  source_pr_number: number | null
+  source_pr_url: string
+  source_head_branch: string
+  source_requested_sha: string
+  source_resolved_sha: string
+  forge_git_version: string
+  forge_image_digest: string
+  forge_provenance_state: string
+  work_items: WorkItemReference[]
+  run_groups: RunGroupReference[]
+}
+
+export interface WorkItemReference {
+  provider: string
+  key: string
+  url: string
+}
+
+export interface WorkItemConfig {
+  enabled: boolean
+  providers: string[]
+}
+
+export type RunGroupType = 'experiment' | 'workload' | 'campaign' | 'cohort'
+
+export interface RunGroupReference {
+  id: string
+  group_type: RunGroupType
+  key: string
+  display_name: string
+  description: string
+  archived: boolean
+}
+
+export interface RunGroupCreate {
+  group_type: RunGroupType
+  key: string
+  display_name: string
+  description?: string
+}
+
+export interface RunGroupUpdate {
+  display_name?: string
+  description?: string
+  archived?: boolean
 }
 
 export interface FournosJobListResponse {
@@ -460,6 +506,51 @@ export interface FournosJobListResponse {
   per_page: number
 }
 
+export interface HistoryViewState {
+  query: string
+  project: string
+  cluster: string
+  status: string
+  requester_scope: 'all' | 'mine'
+  identity: string
+  failure_outcome: string
+  repository: string
+  pr_number: number | null
+  source_sha: string
+  forge: string
+  work_item_provider: string
+  work_item_key: string
+  tags: string[]
+  history_date: string
+  from_time: string
+  to_time: string
+  sort_by: 'name' | 'project' | 'cluster' | 'status' | 'owner' | 'date' | 'duration' | 'triggered_by'
+  sort_dir: 'asc' | 'desc'
+  per_page: number
+}
+
+export interface HistoryPreferenceResponse {
+  schema_version: number
+  state: HistoryViewState
+  updated_at: string | null
+}
+
+export interface HistoryFilterOptionsResponse {
+  identities: string[]
+  repositories: string[]
+  pr_numbers: number[]
+  source_shas: string[]
+  forge: string[]
+  tags: string[]
+  work_item_providers: string[]
+  work_item_keys: string[]
+}
+
+export interface AuthConfig {
+  google_enabled: boolean
+  local_login_enabled: boolean
+}
+
 export interface PipelineStage {
   name: string
   displayName: string
@@ -467,6 +558,25 @@ export interface PipelineStage {
   startTime: string | null
   completionTime: string | null
   finally: boolean
+  outcome?: string
+  reason?: string
+  reasonCode?: string
+  reasonSource?: string
+  failedStep?: string
+  exitCode?: number | null
+}
+
+export interface FailureSummary {
+  outcome: 'failed' | 'cancelled' | 'infrastructure_error' | 'unknown'
+  stage: string
+  stageDisplayName: string
+  step: string
+  reason: string
+  reasonCode: string
+  source: string
+  artifactPath: string
+  executionReason?: string
+  executionSource?: string
 }
 
 export interface TaskProgress {
@@ -503,6 +613,23 @@ export interface ForgeInfo {
   pr_number: string
   pr_title: string
   pr_url: string
+  repository: string
+  head_branch: string
+  requested_sha: string
+  resolved_sha: string
+}
+
+export interface ForgeExecutionProvenance {
+  images: Array<{
+    image: string
+    imageID: string
+    container: string
+  }>
+  gitVersions: Array<{
+    version: string
+    artifactPath: string
+  }>
+  observedAt: string | null
 }
 
 export interface FournosJobDetailResponse {
@@ -520,6 +647,14 @@ export interface FournosJobDetailResponse {
   current_step: CurrentStep | null
   forge_info: ForgeInfo
   task_progress: TaskProgress | null
+  failure_summary: FailureSummary | null
+  failure_enrichment_state: string
+  forge_execution: ForgeExecutionProvenance
+  forge_provenance_state: string
+  work_items: WorkItemReference[]
+  can_edit_work_items: boolean
+  run_groups: RunGroupReference[]
+  can_edit_run_groups: boolean
 }
 
 export interface FournosJobEvent {
@@ -573,6 +708,7 @@ export interface ClusterLock {
 
 export interface CreateClusterLockRequest {
   cluster: string
+  /** Compatibility field; the backend records the authenticated requester. */
   owner: string
   reason: string
   /** Lock is one-time only — omit for "held indefinitely until released". */
@@ -619,7 +755,17 @@ export interface GitHubPR {
   author: string
   head_sha: string
   branch: string
+  repository: string
+  url: string
   draft: boolean
+}
+
+export interface PullRequestSelection {
+  repository: string
+  number: number
+  url: string
+  head_branch: string
+  requested_sha: string
 }
 
 export interface GitHubRelease {
@@ -644,9 +790,11 @@ export interface SubmitJobRequest {
   preset: string
   args?: string[]
   version: string
+  /** Compatibility/display field; the backend records the authenticated requester. */
   owner: string
   exclusive: boolean
   config_overrides: Record<string, string>
+  pull_request?: PullRequestSelection | null
   pull_sha: string
   use_latest_main?: boolean
   priority?: string
@@ -656,6 +804,8 @@ export interface SubmitJobRequest {
   scheduled_start_time?: string | null
   /** Cron expression, UTC — mutually exclusive with `scheduled_start_time`. Makes this a recurring template. */
   schedule?: string
+  work_items?: WorkItemReference[]
+  run_group_ids?: string[]
 }
 
 export interface SubmitJobResponse {
@@ -682,14 +832,18 @@ export interface SubmitMatrixRequest {
   config_overrides: Record<string, string>
   models: SubmitMatrixModelInput[]
   workloads: string[]
+  /** Compatibility/display field; the backend records the authenticated requester. */
   owner: string
   priority: string
   exclusive: boolean
+  pull_request?: PullRequestSelection | null
   pull_sha: string
   use_latest_main?: boolean
   gpu_type: string
   scheduled_start_time?: string | null
   schedule?: string
+  work_items?: WorkItemReference[]
+  run_group_ids?: string[]
 }
 
 export interface SubmitMatrixResultItem {

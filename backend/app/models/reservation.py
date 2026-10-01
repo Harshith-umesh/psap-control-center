@@ -35,6 +35,14 @@ class Reservation(Base):
     user_email = Column(String(255), nullable=True)
     team = Column(String(255), nullable=True)
 
+    # Immutable identity of the authenticated person who created the
+    # reservation. This is intentionally separate from user_name/user_email,
+    # which describe the reservation beneficiary and may be edited.
+    created_by_subject = Column(String(255), nullable=True, index=True)
+    created_by_email = Column(String(255), nullable=True, index=True)
+    created_by_name = Column(String(255), nullable=True)
+    created_by_provider = Column(String(50), nullable=True)
+
     start_time = Column(DateTime, nullable=False, index=True)
     end_time = Column(DateTime, nullable=False, index=True)
 

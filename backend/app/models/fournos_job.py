@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from sqlalchemy import (
     Boolean, Column, DateTime, Float, ForeignKey, Integer, JSON, String, Text,
-    Index, func,
+    Index, UniqueConstraint, func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import relationship
@@ -15,10 +15,11 @@ from sqlalchemy.orm import relationship
 from app.core.database import Base
 
 
-# Keep the PostgreSQL storage types used in production while allowing the
-# documented SQLite local-development database to initialize as well.
-_JSON = JSON().with_variant(JSONB(), "postgresql")
-_STRING_LIST = JSON().with_variant(ARRAY(String), "postgresql")
+# Keep PostgreSQL as the primary type so production queries retain JSONB and
+# ARRAY operators/comparators, while allowing SQLite local development to
+# initialize the same model with portable JSON storage.
+_JSON = JSONB().with_variant(JSON(), "sqlite")
+_STRING_LIST = ARRAY(String).with_variant(JSON(), "sqlite")
 
 
 class FournosJob(Base):
@@ -31,6 +32,26 @@ class FournosJob(Base):
     cluster = Column(String(255), nullable=False, index=True)
     pipeline = Column(String(255), default="")
     owner = Column(String(255), default="", index=True)
+    requester_subject = Column(String(255), default="", index=True)
+    requester_email = Column(String(255), default="", index=True)
+    requester_name = Column(String(255), default="")
+    auth_provider = Column(String(50), default="")
+    source_repository = Column(String(255), default="", index=True)
+    source_pr_number = Column(Integer, nullable=True, index=True)
+    source_pr_url = Column(String(1024), default="")
+    source_head_branch = Column(String(255), default="")
+    source_requested_sha = Column(String(64), default="", index=True)
+    source_resolved_sha = Column(String(64), default="", index=True)
+    # Observed execution evidence, kept separate from the source revision the
+    # requester selected.  A merged-code run normally executes the Forge
+    # commit baked into the container image; MLflow and the pod image digest
+    # are therefore the authoritative record of what actually ran.
+    forge_execution = Column(_JSON, default=dict)
+    forge_provenance_state = Column(
+        String(50), default="pending", nullable=False
+    )
+    forge_provenance_attempts = Column(Integer, default=0, nullable=False)
+    forge_provenance_attempted_at = Column(DateTime(timezone=True), nullable=True)
     status = Column(String(50), default="Pending", index=True)
     message = Column(Text, default="")
     created_at = Column(
@@ -57,6 +78,13 @@ class FournosJob(Base):
     # full-sync pass from creating another Kubernetes API storm.
     stage_snapshot_attempts = Column(Integer, default=0, nullable=False)
     stage_snapshot_attempted_at = Column(DateTime(timezone=True), nullable=True)
+    failure_outcome = Column(String(50), default="", index=True)
+    failure_summary = Column(_JSON, default=dict)
+    failure_enrichment_state = Column(
+        String(50), default="pending", nullable=False
+    )
+    failure_enrichment_attempts = Column(Integer, default=0, nullable=False)
+    failure_enrichment_attempted_at = Column(DateTime(timezone=True), nullable=True)
     error_message = Column(Text, default="")
     triggered_by_schedule = Column(String(255), nullable=True, index=True)
     trigger_type = Column(String(50), default="manual")
@@ -70,6 +98,18 @@ class FournosJob(Base):
         "FournosJobEvent",
         back_populates="job",
         cascade="all, delete-orphan",
+    )
+    work_items = relationship(
+        "FournosJobWorkItem",
+        back_populates="job",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+    group_memberships = relationship(
+        "FournosJobGroupMembership",
+        back_populates="job",
+        cascade="all, delete-orphan",
+        lazy="selectin",
     )
 
     __table_args__ = (
@@ -87,6 +127,10 @@ class FournosJob(Base):
             func.coalesce(completed_at, created_at),
         ),
         Index("ix_fournos_jobs_trigger_type", "trigger_type"),
+        Index(
+            "ix_fournos_jobs_source_pr",
+            "source_repository", "source_pr_number",
+        ),
         # Composite index matching the History query's WHERE + ORDER BY
         # shape (status IN (...) AND is_lock = false AND trigger_type != ...
         # ORDER BY completed_at DESC) so it can be satisfied with an index
@@ -122,3 +166,136 @@ class FournosJobEvent(Base):
 
     def __repr__(self):
         return f"<FournosJobEvent({self.phase} @ {self.timestamp})>"
+
+
+class FournosJobWorkItem(Base):
+    """A safe, read-only reference to work tracked outside Control Center."""
+
+    __tablename__ = "fournos_job_work_items"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    job_id = Column(
+        String(36),
+        ForeignKey("fournos_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    provider = Column(String(50), nullable=False, index=True)
+    key = Column(String(100), nullable=False, index=True)
+    url = Column(String(1024), nullable=False)
+    created_by_subject = Column(String(255), default="")
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    job = relationship("FournosJob", back_populates="work_items")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id", "provider", "key",
+            name="uq_fournos_job_work_item",
+        ),
+        Index(
+            "ix_fournos_job_work_items_provider_key",
+            "provider", "key",
+        ),
+    )
+
+
+class FournosRunGroup(Base):
+    """A reusable, product-neutral grouping for related test runs."""
+
+    __tablename__ = "fournos_run_groups"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    group_type = Column(String(50), nullable=False, index=True)
+    key = Column(String(100), nullable=False)
+    display_name = Column(String(255), nullable=False)
+    description = Column(Text, default="")
+    created_by_subject = Column(String(255), nullable=False, index=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+    archived = Column(Boolean, nullable=False, default=False, index=True)
+
+    memberships = relationship(
+        "FournosJobGroupMembership",
+        back_populates="group",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "group_type", "key", name="uq_fournos_run_group_type_key"
+        ),
+        Index(
+            "ix_fournos_run_groups_type_archived",
+            "group_type", "archived",
+        ),
+    )
+
+
+class FournosJobGroupMembership(Base):
+    """Links one durable run record to a reusable run group."""
+
+    __tablename__ = "fournos_job_group_memberships"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    job_id = Column(
+        String(36),
+        ForeignKey("fournos_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    group_id = Column(
+        String(36),
+        ForeignKey("fournos_run_groups.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    created_by_subject = Column(String(255), default="")
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    job = relationship("FournosJob", back_populates="group_memberships")
+    group = relationship(
+        "FournosRunGroup", back_populates="memberships", lazy="joined"
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id", "group_id", name="uq_fournos_job_group_membership"
+        ),
+        Index(
+            "ix_fournos_job_group_memberships_group_job",
+            "group_id", "job_id",
+        ),
+    )
+
+
+class FournosHistoryPreference(Base):
+    """Latest History view saved for one authenticated principal."""
+
+    __tablename__ = "fournos_history_preferences"
+
+    subject = Column(String(255), primary_key=True)
+    schema_version = Column(Integer, nullable=False, default=1)
+    state = Column(_JSON, nullable=False, default=dict)
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )

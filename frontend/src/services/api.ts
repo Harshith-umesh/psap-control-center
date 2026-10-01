@@ -19,6 +19,10 @@ import type {
   HearthConnectResponse,
   BillingReport,
   CostRefreshStatus,
+  HistoryPreferenceResponse,
+  HistoryFilterOptionsResponse,
+  HistoryViewState,
+  AuthConfig,
 } from '../types'
 import { createLogger } from '../utils/logger'
 import { clearSession } from '../stores/authStore'
@@ -303,8 +307,22 @@ export const hearthApi = {
 }
 
 export const authApi = {
+  config: async (): Promise<AuthConfig> => {
+    const { data } = await api.get('/auth/config')
+    return data
+  },
+
   login: async (username: string, password: string): Promise<AuthSession> => {
     const { data } = await api.post('/auth/login', { username, password })
+    return data
+  },
+
+  loginWithGoogle: (): void => {
+    window.location.assign('/api/v1/auth/google/login')
+  },
+
+  completeGoogleLogin: async (code: string, state: string): Promise<AuthSession> => {
+    const { data } = await api.post('/auth/google/callback', { code, state })
     return data
   },
 
@@ -323,7 +341,28 @@ export interface SlackSettings {
   enabled: boolean
 }
 
+export interface ManagedUser {
+  id: string
+  username: string
+  email: string
+  full_name: string | null
+  role: 'admin' | 'user'
+  is_active: boolean
+  created_at: string
+  updated_at: string
+}
+
 export const settingsApi = {
+  getUsers: async (): Promise<ManagedUser[]> => {
+    const { data } = await api.get('/settings/users')
+    return data
+  },
+
+  updateUserRole: async (userId: string, role: 'admin' | 'user'): Promise<ManagedUser> => {
+    const { data } = await api.patch(`/settings/users/${userId}/role`, { role })
+    return data
+  },
+
   getSlack: async (): Promise<SlackSettings> => {
     const { data } = await api.get('/settings/slack')
     return data
@@ -416,6 +455,17 @@ export const fournosApi = {
     cluster?: string
     status?: string
     owner?: string
+    requester_scope?: 'all' | 'mine'
+    q?: string
+    identity?: string
+    failure_outcome?: string
+    repository?: string
+    pr_number?: number
+    source_sha?: string
+    forge?: string
+    work_item_provider?: string
+    work_item_key?: string
+    tags?: string
     start_time?: string
     end_time?: string
     sort_by?: string
@@ -430,6 +480,26 @@ export const fournosApi = {
     return data
   },
 
+  getHistoryPreference: async (): Promise<HistoryPreferenceResponse> => {
+    const { data } = await api.get('/fournos/history/preferences')
+    return data
+  },
+
+  saveHistoryPreference: async (state: HistoryViewState): Promise<HistoryPreferenceResponse> => {
+    const { data } = await api.put('/fournos/history/preferences', { state })
+    return data
+  },
+
+  resetHistoryPreference: async (): Promise<{ status: string; deleted: boolean }> => {
+    const { data } = await api.delete('/fournos/history/preferences')
+    return data
+  },
+
+  getHistoryFilterOptions: async (): Promise<HistoryFilterOptionsResponse> => {
+    const { data } = await api.get('/fournos/history/filter-options')
+    return data
+  },
+
   getJob: async (name: string) => {
     const { data } = await api.get(`/fournos/jobs/${name}`)
     return data
@@ -437,6 +507,49 @@ export const fournosApi = {
 
   getJobEvents: async (name: string) => {
     const { data } = await api.get(`/fournos/jobs/${name}/events`)
+    return data
+  },
+
+  getWorkItemConfig: async (): Promise<import('../types').WorkItemConfig> => {
+    const { data } = await api.get('/fournos/work-items/config')
+    return data
+  },
+
+  updateJobWorkItems: async (
+    name: string,
+    workItems: import('../types').WorkItemReference[]
+  ): Promise<import('../types').WorkItemReference[]> => {
+    const { data } = await api.put(`/fournos/jobs/${name}/work-items`, { work_items: workItems })
+    return data
+  },
+
+  listRunGroups: async (includeArchived = false): Promise<import('../types').RunGroupReference[]> => {
+    const { data } = await api.get('/fournos/run-groups', {
+      params: includeArchived ? { include_archived: true } : undefined,
+    })
+    return data
+  },
+
+  createRunGroup: async (
+    group: import('../types').RunGroupCreate
+  ): Promise<import('../types').RunGroupReference> => {
+    const { data } = await api.post('/fournos/run-groups', group)
+    return data
+  },
+
+  updateRunGroup: async (
+    id: string,
+    update: import('../types').RunGroupUpdate
+  ): Promise<import('../types').RunGroupReference> => {
+    const { data } = await api.patch(`/fournos/run-groups/${id}`, update)
+    return data
+  },
+
+  updateJobRunGroups: async (
+    name: string,
+    groupIds: string[]
+  ): Promise<import('../types').RunGroupReference[]> => {
+    const { data } = await api.put(`/fournos/jobs/${name}/run-groups`, { group_ids: groupIds })
     return data
   },
 

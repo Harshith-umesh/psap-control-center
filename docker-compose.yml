@@ -12,12 +12,19 @@ services:
     environment:
       - DATABASE_URL=sqlite+aiosqlite:///./data/pasp_control_center.db
       - KUBECONFIG_STORAGE_PATH=/app/kubeconfigs
-      - SECRET_KEY=${SECRET_KEY:-change-this-in-production}
+      - SECRET_KEY=${SECRET_KEY:?SECRET_KEY must be set to a random value of at least 32 characters}
       - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-480}
       - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-change-admin-password}
       - USER_USERNAME=${USER_USERNAME:-user}
       - USER_PASSWORD=${USER_PASSWORD:-change-user-password}
+      - LOCAL_LOGIN_ENABLED=${LOCAL_LOGIN_ENABLED:-true}
+      - GOOGLE_OAUTH_ENABLED=${GOOGLE_OAUTH_ENABLED:-false}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+      - GOOGLE_REDIRECT_URI=${GOOGLE_REDIRECT_URI:-}
+      - GOOGLE_ALLOWED_DOMAIN=${GOOGLE_ALLOWED_DOMAIN:-}
+      - GOOGLE_ADMIN_EMAILS=${GOOGLE_ADMIN_EMAILS:-}
       - HEARTH_ENABLED=${HEARTH_ENABLED:-true}
       - HEARTH_NAMESPACE=${HEARTH_NAMESPACE:-hearth}
       - FOURNOS_NAMESPACE=${FOURNOS_NAMESPACE:-psap-automation}

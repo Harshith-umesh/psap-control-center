@@ -1,0 +1,30 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "bootstrap-sha": "98a235d6e07155f91910d9097cc7f4bfaf276638",
+  "packages": {
+    ".": {
+      "release-type": "simple",
+      "package-name": "psap-control-center",
+      "initial-version": "1.5.0",
+      "include-v-in-tag": true,
+      "extra-files": [
+        {
+          "type": "json",
+          "path": "frontend/package.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "frontend/package-lock.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "frontend/package-lock.json",
+          "jsonpath": "$.packages[''].version"
+        },
+        "backend/app/core/config.py"
+      ]
+    }
+  }
+}

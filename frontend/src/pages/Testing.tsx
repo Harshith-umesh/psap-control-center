@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect, useRef, Fragment, type ComponentType } from 'react'
+import { useState, useMemo, useEffect, useRef, useCallback, Fragment, type ComponentType } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { Menu, Transition } from '@headlessui/react'
 import {
@@ -21,7 +21,7 @@ import {
   EllipsisVerticalIcon,
 } from '@heroicons/react/24/outline'
 import clsx from 'clsx'
-import { isAdmin, isAuthenticated } from '../stores/authStore'
+import { getDisplayName, isAdmin, isAuthenticated } from '../stores/authStore'
 import { useClusters } from '../hooks/useClusters'
 import DynamicSubmitForm from '../components/DynamicSubmitForm'
 import ClusterCombobox from '../components/ClusterCombobox'
@@ -34,8 +34,11 @@ import WizardSteps from '../components/WizardSteps'
 import ReviewRow, { ReviewSection } from '../components/ReviewRow'
 import YamlPreview from '../components/YamlPreview'
 import SearchableSelect from '../components/SearchableSelect'
+import EditableCombobox from '../components/EditableCombobox'
 import { getForgeProjectUiSettings } from '../projects/rhaiis'
 import { buildSingleJobPreview, toYamlPreview, withVersionOverride } from '../utils/fournosJobPreview'
+import { workItemFromInput } from '../utils/workItems'
+import RunGroupSelector from '../components/RunGroupSelector'
 import {
   useFournosJobs,
   useRecurringJobs,
@@ -57,6 +60,12 @@ import {
   useProjectUiSchema,
   useRefreshProjectUiSchema,
   useClusterOverview,
+  useHistoryPreference,
+  useHistoryFilterOptions,
+  useSaveHistoryPreference,
+  useResetHistoryPreference,
+  useWorkItemConfig,
+  useRunGroups,
 } from '../hooks/useFournos'
 import type {
   FournosJobSummary,
@@ -66,6 +75,9 @@ import type {
   Cluster,
   JobScheduling,
   ClusterOverview,
+  GitHubPR,
+  PullRequestSelection,
+  HistoryViewState,
 } from '../types'
 
 const RUNNING_JOB_STATUSES = new Set(['Running', 'Pending', 'Admitted', 'Resolving'])
@@ -112,6 +124,9 @@ const STATUS_COLORS: Record<string, string> = {
 }
 
 const ALL_STATUSES = ['Running', 'Pending', 'Admitted', 'Resolving', 'Succeeded', 'Failed', 'Stopped']
+const HISTORY_STATUSES = ['Succeeded', 'Failed', 'Stopped']
+const HISTORY_STATUS_SET = new Set(HISTORY_STATUSES)
+const HISTORY_FAILURE_SET = new Set(['failed', 'cancelled', 'infrastructure_error', 'unknown'])
 
 /** Today's date in the browser's own timezone, as a "YYYY-MM-DD" string —
  * matches what a native `<input type="date">` shows/expects, no UTC
@@ -146,6 +161,76 @@ const TABS = [
 
 type SortDir = 'asc' | 'desc'
 interface SortState { by: string; dir: SortDir }
+
+const DEFAULT_HISTORY_VIEW: HistoryViewState = {
+  query: '',
+  project: '',
+  cluster: '',
+  status: '',
+  requester_scope: 'all',
+  identity: '',
+  failure_outcome: '',
+  repository: '',
+  pr_number: null,
+  source_sha: '',
+  forge: '',
+  work_item_provider: '',
+  work_item_key: '',
+  tags: [],
+  history_date: '',
+  from_time: '00:00',
+  to_time: '23:59',
+  sort_by: 'date',
+  sort_dir: 'desc',
+  per_page: 50,
+}
+
+const HISTORY_URL_KEYS = [
+  'q', 'project', 'cluster', 'status', 'scope', 'identity', 'failure',
+  'repository', 'pr', 'sha', 'forge', 'work_provider', 'work_item', 'tags', 'date', 'from', 'to',
+  'sort', 'dir', 'per_page', 'page',
+] as const
+
+const HISTORY_SORT_KEYS = new Set([
+  'name', 'project', 'cluster', 'status', 'owner', 'date', 'duration',
+  'triggered_by',
+])
+
+function historyViewFromParams(params: URLSearchParams): HistoryViewState {
+  const parsedPr = Number(params.get('pr'))
+  const parsedPerPage = Number(params.get('per_page'))
+  const sort = params.get('sort') || ''
+  const dir = params.get('dir')
+  const status = params.get('status') || ''
+  const failure = params.get('failure') || ''
+  const sourceSha = params.get('sha') || ''
+  return {
+    query: params.get('q') || '',
+    project: params.get('project') || '',
+    cluster: params.get('cluster') || '',
+    status: HISTORY_STATUS_SET.has(status) ? status : '',
+    requester_scope: params.get('scope') === 'mine' ? 'mine' : 'all',
+    identity: params.get('identity') || '',
+    failure_outcome: HISTORY_FAILURE_SET.has(failure) ? failure : '',
+    repository: params.get('repository') || '',
+    pr_number: Number.isInteger(parsedPr) && parsedPr > 0 ? parsedPr : null,
+    source_sha: /^[0-9a-fA-F]{4,64}$/.test(sourceSha) ? sourceSha : '',
+    forge: params.get('forge') || '',
+    work_item_provider: params.get('work_provider') || '',
+    work_item_key: params.get('work_item') || '',
+    tags: (params.get('tags') || '').split(',').map((tag) => tag.trim()).filter(Boolean).slice(0, 20),
+    history_date: params.get('date') || '',
+    from_time: params.get('from') || '00:00',
+    to_time: params.get('to') || '23:59',
+    sort_by: (HISTORY_SORT_KEYS.has(sort) ? sort : 'date') as HistoryViewState['sort_by'],
+    sort_dir: dir === 'asc' ? 'asc' : 'desc',
+    per_page: [25, 50, 100, 200].includes(parsedPerPage) ? parsedPerPage : 50,
+  }
+}
+
+function hasHistoryUrlState(params: URLSearchParams): boolean {
+  return HISTORY_URL_KEYS.some((key) => params.has(key))
+}
 
 /** Clicking the already-active column flips its direction; clicking a new
  * column starts it off ascending. */
@@ -283,6 +368,7 @@ function JobsTable({
             <SortableTh label={source === 'live' ? 'Age' : 'Date'} sortKey={source === 'live' ? 'age' : 'date'} sort={sort} onSort={onSort} />
             <SortableTh label="Owner" sortKey="owner" sort={sort} onSort={onSort} />
             <SortableTh label="Triggered By" sortKey="triggered_by" sort={sort} onSort={onSort} />
+            {source === 'history' && <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Forge used</th>}
             {source === 'history' && <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">MLflow</th>}
             <th className="px-4 py-3" />
           </tr>
@@ -332,6 +418,22 @@ function JobsTable({
                   '-'
                 )}
               </td>
+              {source === 'history' && (
+                <td className="px-4 py-3 text-xs text-gray-500">
+                  {job.forge_git_version ? (
+                    <div className="space-y-0.5">
+                      <code className="font-medium text-gray-700" title="Forge git version recorded by MLflow">{job.forge_git_version}</code>
+                      {job.forge_image_digest && (
+                        <div className="max-w-28 truncate font-mono text-[10px] text-gray-400" title={job.forge_image_digest}>
+                          {job.forge_image_digest}
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <span title={`Provenance: ${job.forge_provenance_state}`}>-</span>
+                  )}
+                </td>
+              )}
               {source === 'history' && (
                 <td className="px-4 py-3 text-sm text-center">
                   {job.mlflow_url ? (
@@ -383,6 +485,8 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
   const { data: githubSyncStatus } = useGithubSyncStatus()
   const refreshGithubSync = useRefreshGithubSync()
   const submitJob = useSubmitJob()
+  const { data: workItemConfig } = useWorkItemConfig()
+  const { data: runGroups = [] } = useRunGroups()
 
   // "Basics" — common to every project, owned here so there is exactly one
   // wizard/step indicator (DynamicSubmitForm only renders steps 2 and 3,
@@ -392,15 +496,18 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
   const [pipeline, setPipeline] = useState('forge-test-only')
   const [preset, setPreset] = useState('')
   const [version, setVersion] = useState('')
-  const [owner, setOwner] = useState('')
+  const [owner, setOwner] = useState(() => getDisplayName() || '')
   const [priority, setPriority] = useState('manual')
   const [exclusive, setExclusive] = useState(false)
   const [configRaw, setConfigRaw] = useState('')
   const [pullSha, setPullSha] = useState('')
+  const [selectedPR, setSelectedPR] = useState<GitHubPR | null>(null)
   const [buildSourceInput, setBuildSourceInput] = useState('')
   const [useLatestMain, setUseLatestMain] = useState(false)
   const [prSearch, setPrSearch] = useState('')
   const [prDropdownOpen, setPrDropdownOpen] = useState(false)
+  const [workItemInput, setWorkItemInput] = useState('')
+  const [runGroupIds, setRunGroupIds] = useState<string[]>([])
   // step 1 = "what do you want to do" (Lock / Forge Job / Custom Job).
   // For jobType === 'forge': 2 = Basics, 3 = Project Details, 4 = Review & Submit.
   // For jobType === 'lock': 2 = pick a cluster + inspect/manage its locks.
@@ -409,10 +516,18 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
   const [step, setStep] = useState(1)
   const [lockCluster, setLockCluster] = useState('')
   const [lockReason, setLockReason] = useState('')
-  const [lockOwner, setLockOwner] = useState('')
   const [scheduling, setScheduling] = useState<JobScheduling>({ mode: 'now' })
   const [scheduleModalOpen, setScheduleModalOpen] = useState(false)
   const createLock = useCreateClusterLock()
+
+  // Keep the visible owner tied to the authenticated session. The backend
+  // independently derives the same value and ignores client-supplied owners.
+  useEffect(() => {
+    const syncOwner = () => setOwner(getDisplayName() || '')
+    syncOwner()
+    window.addEventListener('auth-change', syncOwner)
+    return () => window.removeEventListener('auth-change', syncOwner)
+  }, [])
 
   // "What's happening on this cluster" popup for the Basics step — only
   // interrupts the user automatically when there's something running or
@@ -474,25 +589,43 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
     setPreset('')
     setVersion('')
     setPullSha('')
+    setSelectedPR(null)
+    setPrSearch('')
     setBuildSourceInput('')
     setUseLatestMain(false)
     const proj = projects?.find((p: ForgeProject) => p.name === name)
     if (proj?.cluster) setCluster(proj.cluster)
   }
 
-  const selectPR = (pr: { number: number; title: string; author: string; head_sha: string; draft: boolean } | null) => {
+  const selectPR = (pr: GitHubPR | null) => {
     if (pr) {
       setPrSearch(`#${pr.number} — ${pr.title} (${pr.author})`)
       setPullSha(pr.head_sha)
+      setSelectedPR(pr)
       setBuildSourceInput('')
       setUseLatestMain(false)
     } else {
       setPrSearch('')
       setPullSha('')
+      setSelectedPR(null)
       setBuildSourceInput('')
+      setUseLatestMain(false)
     }
     setPrDropdownOpen(false)
   }
+
+  const pullRequest: PullRequestSelection | null = selectedPR ? {
+    repository: selectedPR.repository,
+    number: selectedPR.number,
+    url: selectedPR.url,
+    head_branch: selectedPR.branch,
+    requested_sha: selectedPR.head_sha,
+  } : null
+
+  const workItems = useMemo(() => {
+    const item = workItemFromInput(workItemInput)
+    return item ? [item] : []
+  }, [workItemInput])
 
   const configOverrides = useMemo(() => {
     const overrides: Record<string, string> = {}
@@ -520,7 +653,10 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
         priority,
         exclusive,
         config_overrides: overrides,
+        pull_request: pullRequest,
         pull_sha: pullSha,
+        work_items: workItems,
+        run_group_ids: runGroupIds,
         use_latest_main: useLatestMain,
         schedule: scheduling.mode === 'recurring' ? scheduling.scheduleUtc : '',
         scheduled_start_time: scheduling.mode === 'defer' ? scheduling.scheduledStartTimeUtc : null,
@@ -659,16 +795,16 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-900">
-                  Owner<span className="ml-0.5 text-red-500">*</span>
+                  Requested by
                 </label>
                 <input
                   type="text"
-                  value={lockOwner}
-                  onChange={(e) => setLockOwner(e.target.value)}
-                  required
-                  placeholder="your-name"
-                  className="mt-1.5 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm"
+                  value={owner}
+                  readOnly
+                  aria-readonly="true"
+                  className="mt-1.5 block w-full rounded-md border-gray-300 bg-gray-50 text-gray-600 shadow-sm sm:text-sm"
                 />
+                <p className="mt-1 text-xs text-gray-400">From your signed-in account</p>
               </div>
             </div>
 
@@ -679,8 +815,8 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
             <div className="border-t border-gray-100 bg-gray-50/50 px-5 py-5">
               {!lockCluster ? (
                 <p className="py-6 text-center text-sm text-gray-400">Pick a cluster to inspect and schedule its locks.</p>
-              ) : !lockReason.trim() || !lockOwner.trim() ? (
-                <p className="py-6 text-center text-sm text-gray-400">Enter a reason and an owner for the lock to pick a time on the calendar.</p>
+              ) : !lockReason.trim() || !owner.trim() ? (
+                <p className="py-6 text-center text-sm text-gray-400">Enter a reason for the lock to pick a time on the calendar.</p>
               ) : (
                 <>
                   <h4 className="mb-3 text-sm font-semibold text-gray-900">Pick a time</h4>
@@ -690,7 +826,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
                     onApplyLock={async (choice) => {
                       await createLock.mutateAsync({
                         cluster: lockCluster,
-                        owner: lockOwner,
+                        owner,
                         reason: lockReason,
                         scheduled_start_time: choice.startUtc,
                         lock_until: choice.untilUtc,
@@ -776,16 +912,16 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
 
             <div>
               <label className="block text-sm font-medium text-gray-700">
-                Owner<span className="text-red-500 ml-0.5">*</span>
+                Requested by
               </label>
               <input
                 type="text"
                 value={owner}
-                onChange={(e) => setOwner(e.target.value)}
-                required
-                className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm"
-                placeholder="your-name"
+                readOnly
+                aria-readonly="true"
+                className="mt-1 block w-full rounded-md border-gray-300 bg-gray-50 text-gray-600 shadow-sm sm:text-sm"
               />
+              <p className="mt-1 text-xs text-gray-400">From your signed-in account</p>
             </div>
 
             <div>
@@ -860,7 +996,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
             <input
               type="text"
               value={prSearch}
-              onChange={(e) => { setPrSearch(e.target.value); setPrDropdownOpen(true); setPullSha(''); setBuildSourceInput('') }}
+              onChange={(e) => { setPrSearch(e.target.value); setPrDropdownOpen(true); setPullSha(''); setSelectedPR(null); setBuildSourceInput('') }}
               onFocus={() => setPrDropdownOpen(true)}
               disabled={projectUiSettings.requiresBuildSource && useLatestMain}
               className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm disabled:bg-gray-100 disabled:text-gray-400"
@@ -887,6 +1023,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
                     onChange={(e) => {
                       setBuildSourceInput(e.target.value)
                       setPullSha(e.target.value.trim())
+                      setSelectedPR(null)
                       setPrSearch('')
                       setUseLatestMain(false)
                     }}
@@ -905,6 +1042,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
                       const value = e.target.value
                       setBuildSourceInput(value)
                       setPullSha(value)
+                      setSelectedPR(null)
                       setPrSearch('')
                       setUseLatestMain(false)
                     }}
@@ -929,6 +1067,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
                         setUseLatestMain(checked)
                         if (checked) {
                           setPullSha('')
+                          setSelectedPR(null)
                           setBuildSourceInput('')
                           setPrSearch('')
                         }
@@ -967,6 +1106,35 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
             )}
           </div>
 
+          {workItemConfig?.enabled && (
+            <div>
+              <label className="block text-sm font-medium text-gray-700">
+                Jira work item (optional)
+              </label>
+              <input
+                type="text"
+                value={workItemInput}
+                onChange={(e) => setWorkItemInput(e.target.value)}
+                className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm"
+                placeholder="PROJECT-123 or an allowed Jira URL"
+                maxLength={1024}
+              />
+              <p className="mt-1 text-xs text-gray-400">
+                Associates an existing issue; Control Center will not modify Jira.
+              </p>
+            </div>
+          )}
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700">
+              Run grouping (optional)
+            </label>
+            <p className="mb-2 mt-1 text-xs text-gray-400">
+              Associate this run with reusable experiments, workload families, campaigns, or cohorts.
+            </p>
+            <RunGroupSelector selectedIds={runGroupIds} onChange={setRunGroupIds} />
+          </div>
+
           <div className="flex items-center justify-between pt-2">
             <button
               type="button"
@@ -979,7 +1147,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
               type="button"
               disabled={!project || !cluster.trim() || !owner.trim() || !buildSourceValid}
               onClick={() => setStep(3)}
-              title={!owner.trim() ? 'Owner is required' : !buildSourceValid ? `${projectUiSettings.buildSourceLabel} is required` : undefined}
+              title={!owner.trim() ? 'Sign in to submit a job' : !buildSourceValid ? `${projectUiSettings.buildSourceLabel} is required` : undefined}
               className="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:opacity-50"
             >
               Next: Project Details
@@ -1007,7 +1175,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
         <DynamicSubmitForm
           project={project}
           schema={dynamicSchema}
-          basics={{ cluster, clusterGpuType: selectedCluster?.gpu_type || '', pipeline, owner, priority, exclusive, pullSha, useLatestMain, prLabel: prSearch || pullSha, scheduling }}
+          basics={{ cluster, clusterGpuType: selectedCluster?.gpu_type || '', pipeline, owner, priority, exclusive, pullSha, pullRequest, useLatestMain, prLabel: prSearch || pullSha, scheduling, workItems, runGroupIds, runGroups }}
           step={step - 1}
           onBack={() => setStep(step - 1)}
           onNext={() => setStep(step + 1)}
@@ -1074,11 +1242,18 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
               <ReviewRow label="Project" value={project} missing={!project} />
               <ReviewRow label="Cluster" value={cluster} missing={!cluster.trim()} />
               <ReviewRow label="Pipeline" value={pipeline} />
-              {owner && <ReviewRow label="Owner" value={owner} />}
+              {owner && <ReviewRow label="Requested by" value={owner} />}
               <ReviewRow label="Priority" value={priority} />
               {exclusive && <ReviewRow label="Exclusive" value="Yes" />}
               {projectUiSettings.requiresBuildSource && useLatestMain && <ReviewRow label={projectUiSettings.buildSourceLabel} value="Latest main (un-pinned)" />}
               {pullSha && <ReviewRow label={projectUiSettings.buildSourceLabel} value={prSearch || pullSha} mono={!prSearch} />}
+              {workItems.map((item) => (
+                <ReviewRow key={`${item.provider}-${item.key || item.url}`} label="Work item" value={item.key || item.url} />
+              ))}
+              {runGroupIds.map((id) => {
+                const group = runGroups.find((candidate) => candidate.id === id)
+                return group ? <ReviewRow key={id} label={group.group_type} value={group.display_name} /> : null
+              })}
               <ReviewRow
                 label="Schedule"
                 value={
@@ -1143,6 +1318,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
                   priority,
                   exclusive,
                   pullSha: useLatestMain ? 'main' : pullSha,
+                  pullRequest,
                   args: preset ? [preset] : [],
                   configOverrides: withVersionOverride(project, showVersion ? version : '', configOverrides),
                   schedule: scheduling.mode === 'recurring' ? scheduling.scheduleUtc : '',
@@ -1450,21 +1626,38 @@ function SchedulesTab() {
 export default function Testing() {
   const [searchParams, setSearchParams] = useSearchParams()
   const activeTab = searchParams.get('tab') || 'live'
-  const [page, setPage] = useState(1)
-  const [filterProject, setFilterProject] = useState('')
-  const [filterCluster, setFilterCluster] = useState('')
-  const [filterStatus, setFilterStatus] = useState('')
+  const initialHistoryRef = useRef(historyViewFromParams(searchParams))
+  const initialHistory = initialHistoryRef.current
+  const parsedInitialPage = Number(searchParams.get('page'))
+  const [page, setPage] = useState(Number.isInteger(parsedInitialPage) && parsedInitialPage > 0 ? parsedInitialPage : 1)
+  const [filterProject, setFilterProject] = useState(initialHistory.project)
+  const [filterCluster, setFilterCluster] = useState(initialHistory.cluster)
+  const [filterStatus, setFilterStatus] = useState(initialHistory.status)
+  const [requesterScope, setRequesterScope] = useState<'all' | 'mine'>(initialHistory.requester_scope)
+  const [historyQuery, setHistoryQuery] = useState(initialHistory.query)
+  const [historyIdentity, setHistoryIdentity] = useState(initialHistory.identity)
+  const [historyFailure, setHistoryFailure] = useState(initialHistory.failure_outcome)
+  const [historyRepository, setHistoryRepository] = useState(initialHistory.repository)
+  const [historyPrNumber, setHistoryPrNumber] = useState(initialHistory.pr_number ? String(initialHistory.pr_number) : '')
+  const [historySourceSha, setHistorySourceSha] = useState(initialHistory.source_sha)
+  const [historyForge, setHistoryForge] = useState(initialHistory.forge)
+  const [historyWorkItemProvider, setHistoryWorkItemProvider] = useState(initialHistory.work_item_provider)
+  const [historyWorkItemKey, setHistoryWorkItemKey] = useState(initialHistory.work_item_key)
+  const [historyTags, setHistoryTags] = useState(initialHistory.tags.join(', '))
+  const [historyPerPage, setHistoryPerPage] = useState(initialHistory.per_page)
+  const authenticated = isAuthenticated()
+  const { data: historyFilterOptions } = useHistoryFilterOptions(activeTab === 'history')
   // History-only date + local time-of-day range filter. Empty historyDate
   // means "no time filter" — from/to only matter once a date is picked.
-  const [historyDate, setHistoryDate] = useState('')
-  const [historyFromTime, setHistoryFromTime] = useState('00:00')
-  const [historyToTime, setHistoryToTime] = useState('23:59')
+  const [historyDate, setHistoryDate] = useState(initialHistory.history_date)
+  const [historyFromTime, setHistoryFromTime] = useState(initialHistory.from_time)
+  const [historyToTime, setHistoryToTime] = useState(initialHistory.to_time)
   // Live/History are server-paginated, so sorting has to be sent to the API
   // rather than done in-browser (client-side sort would only reorder the
   // current page). Kept as two separate states since their sortable
   // columns differ slightly (Age vs. Date).
   const [liveSort, setLiveSort] = useState<SortState>({ by: 'age', dir: 'desc' })
-  const [historySort, setHistorySort] = useState<SortState>({ by: 'date', dir: 'desc' })
+  const [historySort, setHistorySort] = useState<SortState>({ by: initialHistory.sort_by, dir: initialHistory.sort_dir })
   const activeSort = activeTab === 'live' ? liveSort : historySort
   const setActiveSort = activeTab === 'live' ? setLiveSort : setHistorySort
   const handleSort = (key: string) => {
@@ -1472,6 +1665,218 @@ export default function Testing() {
     setPage(1)
   }
   const tz = browserTimezone()
+  const historyUrlHasState = hasHistoryUrlState(searchParams)
+  const [preferenceApplied, setPreferenceApplied] = useState(
+    !authenticated || historyUrlHasState
+  )
+  const lastSavedStateRef = useRef<string | null>(
+    historyUrlHasState ? JSON.stringify(initialHistory) : null
+  )
+  const previousAuthenticatedRef = useRef(authenticated)
+  const observedUrlRef = useRef(searchParams.toString())
+  const applyingUrlRef = useRef(false)
+  const suppressPreferenceSaveRef = useRef(false)
+  const [debouncedTextFilters, setDebouncedTextFilters] = useState({
+    query: initialHistory.query,
+    identity: initialHistory.identity,
+    repository: initialHistory.repository,
+    sourceSha: initialHistory.source_sha,
+    forge: initialHistory.forge,
+    tags: initialHistory.tags.join(','),
+  })
+
+  const historyViewState = useMemo<HistoryViewState>(() => {
+    const prNumber = Number(historyPrNumber)
+    return {
+      query: historyQuery.trim(),
+      project: filterProject,
+      cluster: filterCluster,
+      status: filterStatus,
+      requester_scope: requesterScope,
+      identity: historyIdentity.trim(),
+      failure_outcome: historyFailure,
+      repository: historyRepository.trim(),
+      pr_number: Number.isInteger(prNumber) && prNumber > 0 ? prNumber : null,
+      source_sha: historySourceSha.trim(),
+      forge: historyForge.trim(),
+      work_item_provider: historyWorkItemProvider.trim(),
+      work_item_key: historyWorkItemKey.trim().toUpperCase(),
+      tags: historyTags.split(',').map((tag) => tag.trim()).filter(Boolean).slice(0, 20),
+      history_date: historyDate,
+      from_time: historyFromTime,
+      to_time: historyToTime,
+      sort_by: historySort.by as HistoryViewState['sort_by'],
+      sort_dir: historySort.dir,
+      per_page: historyPerPage,
+    }
+  }, [
+    historyQuery, filterProject, filterCluster, filterStatus, requesterScope,
+    historyIdentity, historyFailure, historyRepository, historyPrNumber,
+    historySourceSha, historyForge, historyWorkItemProvider, historyWorkItemKey, historyTags, historyDate,
+    historyFromTime, historyToTime, historySort, historyPerPage,
+  ])
+
+  const applyHistoryView = useCallback((state: HistoryViewState) => {
+    setHistoryQuery(state.query)
+    setFilterProject(state.project)
+    setFilterCluster(state.cluster)
+    setFilterStatus(state.status)
+    setRequesterScope(state.requester_scope)
+    setHistoryIdentity(state.identity)
+    setHistoryFailure(state.failure_outcome)
+    setHistoryRepository(state.repository)
+    setHistoryPrNumber(state.pr_number ? String(state.pr_number) : '')
+    setHistorySourceSha(state.source_sha)
+    setHistoryForge(state.forge)
+    setHistoryWorkItemProvider(state.work_item_provider)
+    setHistoryWorkItemKey(state.work_item_key)
+    setHistoryTags(state.tags.join(', '))
+    setHistoryDate(state.history_date)
+    setHistoryFromTime(state.from_time)
+    setHistoryToTime(state.to_time)
+    setHistorySort({ by: state.sort_by, dir: state.sort_dir })
+    setHistoryPerPage(state.per_page)
+    setDebouncedTextFilters({
+      query: state.query,
+      identity: state.identity,
+      repository: state.repository,
+      sourceSha: state.source_sha,
+      forge: state.forge,
+      tags: state.tags.join(','),
+    })
+    setPage(1)
+  }, [])
+
+  const preferenceQuery = useHistoryPreference(
+    authenticated && activeTab === 'history' && !historyUrlHasState && !preferenceApplied
+  )
+  const { mutate: saveHistoryPreference, isPending: preferenceSaving } = useSaveHistoryPreference()
+  const { mutate: resetHistoryPreference, isPending: preferenceResetting } = useResetHistoryPreference()
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => {
+      setDebouncedTextFilters({
+        query: historyQuery.trim(),
+        identity: historyIdentity.trim(),
+        repository: historyRepository.trim(),
+        sourceSha: historySourceSha.trim(),
+        forge: historyForge.trim(),
+        tags: historyViewState.tags.join(','),
+      })
+    }, 300)
+    return () => window.clearTimeout(timeout)
+  }, [historyQuery, historyIdentity, historyRepository, historySourceSha, historyForge, historyViewState.tags])
+
+  useEffect(() => {
+    if (authenticated && !previousAuthenticatedRef.current && activeTab === 'history' && !historyUrlHasState) {
+      lastSavedStateRef.current = null
+      setPreferenceApplied(false)
+    }
+    previousAuthenticatedRef.current = authenticated
+  }, [authenticated, activeTab, historyUrlHasState])
+
+  useEffect(() => {
+    if (activeTab !== 'history' || preferenceApplied) return
+    if (!authenticated || historyUrlHasState) {
+      lastSavedStateRef.current = JSON.stringify(historyViewState)
+      setPreferenceApplied(true)
+      return
+    }
+    if (preferenceQuery.data) {
+      applyHistoryView(preferenceQuery.data.state)
+      lastSavedStateRef.current = JSON.stringify(preferenceQuery.data.state)
+      setPreferenceApplied(true)
+    } else if (preferenceQuery.isError) {
+      lastSavedStateRef.current = JSON.stringify(historyViewState)
+      setPreferenceApplied(true)
+    }
+  }, [
+    activeTab, preferenceApplied, authenticated, historyUrlHasState,
+    preferenceQuery.data, preferenceQuery.isError, applyHistoryView,
+    historyViewState,
+  ])
+
+  useEffect(() => {
+    const currentUrl = searchParams.toString()
+    if (currentUrl === observedUrlRef.current) return
+    observedUrlRef.current = currentUrl
+    if (activeTab !== 'history' || !preferenceApplied) return
+
+    const urlState = historyViewFromParams(searchParams)
+    const urlPage = Number(searchParams.get('page'))
+    const normalizedPage = Number.isInteger(urlPage) && urlPage > 0 ? urlPage : 1
+    if (JSON.stringify(urlState) !== JSON.stringify(historyViewState) || normalizedPage !== page) {
+      applyingUrlRef.current = true
+      applyHistoryView(urlState)
+      setPage(normalizedPage)
+      lastSavedStateRef.current = JSON.stringify(urlState)
+    }
+  }, [searchParams, activeTab, preferenceApplied, historyViewState, page, applyHistoryView])
+
+  useEffect(() => {
+    if (activeTab !== 'history' || !preferenceApplied) return
+    if (applyingUrlRef.current) {
+      applyingUrlRef.current = false
+      return
+    }
+    const next = new URLSearchParams(searchParams)
+    HISTORY_URL_KEYS.forEach((key) => next.delete(key))
+    next.set('tab', 'history')
+    const setWhen = (key: string, value: string, condition = Boolean(value)) => {
+      if (condition) next.set(key, value)
+    }
+    setWhen('q', historyViewState.query)
+    setWhen('project', historyViewState.project)
+    setWhen('cluster', historyViewState.cluster)
+    setWhen('status', historyViewState.status)
+    setWhen('scope', historyViewState.requester_scope, historyViewState.requester_scope === 'mine')
+    setWhen('identity', historyViewState.identity, authenticated && Boolean(historyViewState.identity))
+    setWhen('failure', historyViewState.failure_outcome)
+    setWhen('repository', historyViewState.repository)
+    setWhen('pr', String(historyViewState.pr_number || ''), historyViewState.pr_number !== null)
+    setWhen('sha', historyViewState.source_sha)
+    setWhen('forge', historyViewState.forge)
+    setWhen('work_provider', historyViewState.work_item_provider, authenticated && Boolean(historyViewState.work_item_provider))
+    setWhen('work_item', historyViewState.work_item_key, authenticated && Boolean(historyViewState.work_item_key))
+    setWhen('tags', historyViewState.tags.join(','), historyViewState.tags.length > 0)
+    setWhen('date', historyViewState.history_date)
+    setWhen('from', historyViewState.from_time, Boolean(historyViewState.history_date) && historyViewState.from_time !== '00:00')
+    setWhen('to', historyViewState.to_time, Boolean(historyViewState.history_date) && historyViewState.to_time !== '23:59')
+    setWhen('sort', historyViewState.sort_by, historyViewState.sort_by !== 'date')
+    setWhen('dir', historyViewState.sort_dir, historyViewState.sort_dir !== 'desc')
+    setWhen('per_page', String(historyViewState.per_page), historyViewState.per_page !== 50)
+    setWhen('page', String(page), page > 1)
+    if (next.toString() !== searchParams.toString()) {
+      observedUrlRef.current = next.toString()
+      setSearchParams(next, { replace: true })
+    }
+  }, [activeTab, authenticated, preferenceApplied, historyViewState, page, searchParams, setSearchParams])
+
+  useEffect(() => {
+    if (!authenticated || activeTab !== 'history' || !preferenceApplied || preferenceSaving) return
+    const serialized = JSON.stringify(historyViewState)
+    if (lastSavedStateRef.current === null) {
+      lastSavedStateRef.current = serialized
+      return
+    }
+    if (serialized === lastSavedStateRef.current) return
+    const timeout = window.setTimeout(() => {
+      if (suppressPreferenceSaveRef.current) return
+      saveHistoryPreference(historyViewState, {
+        onSuccess: () => { lastSavedStateRef.current = serialized },
+      })
+    }, 700)
+    return () => window.clearTimeout(timeout)
+  }, [authenticated, activeTab, preferenceApplied, preferenceSaving, historyViewState, saveHistoryPreference])
+
+  useEffect(() => {
+    if (!authenticated) {
+      if (requesterScope === 'mine') setRequesterScope('all')
+      if (historyIdentity) setHistoryIdentity('')
+      if (historyWorkItemProvider) setHistoryWorkItemProvider('')
+      if (historyWorkItemKey) setHistoryWorkItemKey('')
+    }
+  }, [authenticated, requesterScope, historyIdentity, historyWorkItemProvider, historyWorkItemKey])
 
   const { data: clustersData } = useClusters()
   const { data: forgeProjects } = useForgeProjects()
@@ -1500,26 +1905,74 @@ export default function Testing() {
     return { historyStartUtc: startUtc, historyEndUtc: endUtc }
   }, [activeTab, historyDate, historyFromTime, historyToTime, tz])
 
+  const historyReady = activeTab !== 'history' || preferenceApplied
   const { data: jobsData, isLoading, isError, error, refetch } = useFournosJobs({
     tab: activeTab === 'live' || activeTab === 'history' ? activeTab : undefined,
     project: filterProject || undefined,
     cluster: filterCluster || undefined,
     status: filterStatus || undefined,
+    requester_scope: requesterScope,
+    q: activeTab === 'history' ? debouncedTextFilters.query || undefined : undefined,
+    identity: activeTab === 'history' && authenticated ? debouncedTextFilters.identity || undefined : undefined,
+    failure_outcome: activeTab === 'history' ? historyFailure || undefined : undefined,
+    repository: activeTab === 'history' ? debouncedTextFilters.repository || undefined : undefined,
+    pr_number: activeTab === 'history' ? historyViewState.pr_number ?? undefined : undefined,
+    source_sha: activeTab === 'history' && /^[0-9a-fA-F]{4,64}$/.test(debouncedTextFilters.sourceSha) ? debouncedTextFilters.sourceSha : undefined,
+    forge: activeTab === 'history' ? debouncedTextFilters.forge || undefined : undefined,
+    work_item_provider: activeTab === 'history' && authenticated ? historyWorkItemProvider || undefined : undefined,
+    work_item_key: activeTab === 'history' && authenticated ? historyWorkItemKey || undefined : undefined,
+    tags: activeTab === 'history' ? debouncedTextFilters.tags || undefined : undefined,
     start_time: historyStartUtc,
     end_time: historyEndUtc,
     sort_by: activeSort.by || undefined,
     sort_dir: activeSort.dir,
     page,
-    per_page: 50,
-  })
+    per_page: activeTab === 'history' ? historyPerPage : 50,
+  }, (activeTab === 'live' || activeTab === 'history') && historyReady)
 
   const cancelJob = useCancelJob()
   const deleteJob = useDeleteHistoryJob()
   const rerunJob = useRerunJob()
 
   const setTab = (tab: string) => {
-    setSearchParams({ tab })
+    const next = new URLSearchParams(searchParams)
+    next.set('tab', tab)
+    next.delete('page')
+    setSearchParams(next)
     setPage(1)
+  }
+
+  const clearHistoryFilters = () => {
+    setHistoryQuery('')
+    setFilterProject('')
+    setFilterCluster('')
+    setFilterStatus('')
+    setRequesterScope('all')
+    setHistoryIdentity('')
+    setHistoryFailure('')
+    setHistoryRepository('')
+    setHistoryPrNumber('')
+    setHistorySourceSha('')
+    setHistoryForge('')
+    setHistoryWorkItemProvider('')
+    setHistoryWorkItemKey('')
+    setHistoryTags('')
+    setHistoryDate('')
+    setHistoryFromTime('00:00')
+    setHistoryToTime('23:59')
+    setPage(1)
+  }
+
+  const resetSavedHistoryView = () => {
+    suppressPreferenceSaveRef.current = true
+    resetHistoryPreference(undefined, {
+      onSuccess: () => {
+        applyHistoryView(DEFAULT_HISTORY_VIEW)
+        lastSavedStateRef.current = JSON.stringify(DEFAULT_HISTORY_VIEW)
+        suppressPreferenceSaveRef.current = false
+      },
+      onError: () => { suppressPreferenceSaveRef.current = false },
+    })
   }
 
   return (
@@ -1566,6 +2019,20 @@ export default function Testing() {
       {(activeTab === 'live' || activeTab === 'history') && (
         <div className="flex flex-wrap items-center gap-3 rounded-lg border border-gray-200 bg-gray-50/60 px-3 py-2.5">
           <span className="text-xs font-medium uppercase tracking-wide text-gray-400">Filters</span>
+          {activeTab === 'history' && (
+            <label className="relative w-64">
+              <MagnifyingGlassIcon className="pointer-events-none absolute left-2.5 top-2 h-4 w-4 text-gray-400" />
+              <input
+                type="search"
+                value={historyQuery}
+                maxLength={200}
+                onChange={(e) => { setHistoryQuery(e.target.value); setPage(1) }}
+                placeholder="Search run history"
+                aria-label="Search run history"
+                className="w-full rounded-md border-gray-300 py-1.5 pl-8 pr-3 text-sm shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+              />
+            </label>
+          )}
           <SearchableSelect
             value={filterProject}
             onChange={(v) => { setFilterProject(v); setPage(1) }}
@@ -1573,6 +2040,26 @@ export default function Testing() {
             placeholder="All projects"
             className="w-44"
           />
+          {authenticated && (
+            <div className="inline-flex rounded-md border border-gray-300 bg-white p-0.5" role="group" aria-label="Requester filter">
+              {(['all', 'mine'] as const).map((scope) => (
+                <button
+                  key={scope}
+                  type="button"
+                  onClick={() => { setRequesterScope(scope); setPage(1) }}
+                  aria-pressed={requesterScope === scope}
+                  className={clsx(
+                    'rounded px-2.5 py-1 text-xs font-medium transition-colors',
+                    requesterScope === scope
+                      ? 'bg-indigo-50 text-indigo-700'
+                      : 'text-gray-500 hover:bg-gray-50 hover:text-gray-700'
+                  )}
+                >
+                  {scope === 'all' ? 'All jobs' : 'My jobs'}
+                </button>
+              ))}
+            </div>
+          )}
           <SearchableSelect
             value={filterCluster}
             onChange={(v) => { setFilterCluster(v); setPage(1) }}
@@ -1583,7 +2070,7 @@ export default function Testing() {
           <SearchableSelect
             value={filterStatus}
             onChange={(v) => { setFilterStatus(v); setPage(1) }}
-            options={ALL_STATUSES}
+            options={activeTab === 'history' ? HISTORY_STATUSES : ALL_STATUSES}
             placeholder="All statuses"
             className="w-44"
           />
@@ -1630,11 +2117,107 @@ export default function Testing() {
               )}
             </>
           )}
-          {(filterProject || filterCluster || filterStatus || historyDate) && (
+          {activeTab === 'history' && (
+            <details className="w-full border-t border-gray-200 pt-2">
+              <summary className="cursor-pointer select-none text-xs font-medium text-gray-600 hover:text-gray-800">
+                Filter list
+              </summary>
+              <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                {authenticated && (
+                  <EditableCombobox
+                    value={historyIdentity}
+                    maxLength={255}
+                    onChange={(value) => { setHistoryIdentity(value); setPage(1) }}
+                    options={historyFilterOptions?.identities || []}
+                    placeholder="Owner or requester"
+                    ariaLabel="Owner or requester"
+                  />
+                )}
+                <select
+                  value={historyFailure}
+                  onChange={(e) => { setHistoryFailure(e.target.value); setPage(1) }}
+                  aria-label="Failure outcome"
+                  className="rounded-md border-gray-300 text-sm shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                >
+                  <option value="">All failure outcomes</option>
+                  <option value="failed">Failed</option>
+                  <option value="cancelled">Cancelled</option>
+                  <option value="infrastructure_error">Infrastructure error</option>
+                  <option value="unknown">Unknown</option>
+                </select>
+                <EditableCombobox
+                  value={historyRepository}
+                  maxLength={255}
+                  onChange={(value) => { setHistoryRepository(value); setPage(1) }}
+                  options={historyFilterOptions?.repositories || []}
+                  placeholder="Repository (owner/name)"
+                  ariaLabel="Source repository"
+                />
+                <EditableCombobox
+                  value={historyPrNumber}
+                  onChange={(value) => { setHistoryPrNumber(value.replace(/\D/g, '')); setPage(1) }}
+                  options={(historyFilterOptions?.pr_numbers || []).map(String)}
+                  inputMode="numeric"
+                  placeholder="PR number"
+                  ariaLabel="Pull request number"
+                />
+                <EditableCombobox
+                  value={historySourceSha}
+                  maxLength={64}
+                  onChange={(value) => {
+                    setHistorySourceSha(value.replace(/[^0-9a-fA-F]/g, '').slice(0, 64))
+                    setPage(1)
+                  }}
+                  options={historyFilterOptions?.source_shas || []}
+                  placeholder="Requested/submitted SHA"
+                  ariaLabel="Source commit SHA"
+                />
+                <EditableCombobox
+                  value={historyForge}
+                  maxLength={255}
+                  onChange={(value) => { setHistoryForge(value); setPage(1) }}
+                  options={historyFilterOptions?.forge || []}
+                  placeholder="Forge version or image digest"
+                  ariaLabel="Forge version or image digest"
+                />
+                {authenticated && (
+                  <EditableCombobox
+                    value={historyWorkItemProvider}
+                    maxLength={50}
+                    onChange={(value) => { setHistoryWorkItemProvider(value.toLowerCase()); setPage(1) }}
+                    options={historyFilterOptions?.work_item_providers || ['jira']}
+                    placeholder="Work-item provider"
+                    ariaLabel="Work-item provider"
+                  />
+                )}
+                {authenticated && (
+                  <EditableCombobox
+                    value={historyWorkItemKey}
+                    maxLength={100}
+                    onChange={(value) => { setHistoryWorkItemKey(value.toUpperCase()); setPage(1) }}
+                    options={historyFilterOptions?.work_item_keys || []}
+                    placeholder="Work-item key"
+                    ariaLabel="Work-item key"
+                  />
+                )}
+                <EditableCombobox
+                  value={historyTags}
+                  onChange={(value) => { setHistoryTags(value); setPage(1) }}
+                  options={historyFilterOptions?.tags || []}
+                  multiple
+                  placeholder="Tags (comma-separated)"
+                  ariaLabel="Tags"
+                />
+              </div>
+            </details>
+          )}
+          {(
+            (activeTab === 'live' && (filterProject || filterCluster || filterStatus || requesterScope === 'mine')) ||
+            (activeTab === 'history' && (filterProject || filterCluster || filterStatus || historyDate || requesterScope === 'mine' || historyQuery || historyIdentity || historyFailure || historyRepository || historyPrNumber || historySourceSha || historyForge || historyWorkItemProvider || historyWorkItemKey || historyTags))
+          ) && (
             <button
-              onClick={() => {
-                setFilterProject(''); setFilterCluster(''); setFilterStatus('')
-                setHistoryDate(''); setHistoryFromTime('00:00'); setHistoryToTime('23:59')
+              onClick={activeTab === 'history' ? clearHistoryFilters : () => {
+                setFilterProject(''); setFilterCluster(''); setFilterStatus(''); setRequesterScope('all'); setPage(1)
               }}
               className="inline-flex items-center gap-1 text-xs font-medium text-gray-400 hover:text-gray-600"
               title="Clear filters"
@@ -1642,8 +2225,31 @@ export default function Testing() {
               <XMarkIcon className="h-3.5 w-3.5" /> Clear
             </button>
           )}
-          <span className="ml-auto text-xs text-gray-400">
+          {activeTab === 'history' && authenticated && (
+            <button
+              type="button"
+              onClick={resetSavedHistoryView}
+              disabled={preferenceResetting || preferenceSaving}
+              className="text-xs font-medium text-gray-400 hover:text-gray-600 disabled:opacity-50"
+            >
+              {preferenceResetting ? 'Resetting...' : 'Reset saved view'}
+            </button>
+          )}
+          {activeTab === 'history' && (
+            <label className="ml-auto flex items-center gap-1 text-xs text-gray-400">
+              Rows
+              <select
+                value={historyPerPage}
+                onChange={(e) => { setHistoryPerPage(Number(e.target.value)); setPage(1) }}
+                className="rounded border-gray-300 py-1 pl-1.5 pr-6 text-xs"
+              >
+                {[25, 50, 100, 200].map((value) => <option key={value} value={value}>{value}</option>)}
+              </select>
+            </label>
+          )}
+          <span className={clsx('text-xs text-gray-400', activeTab !== 'history' && 'ml-auto')}>
             {jobsData?.total ?? 0} {activeTab === 'live' ? 'active' : 'archived'} jobs
+            {activeTab === 'history' && authenticated && preferenceSaving ? ' · Saving view…' : ''}
           </span>
         </div>
       )}
@@ -1698,7 +2304,7 @@ export default function Testing() {
         )}
 
         {activeTab === 'history' && !isError && (
-          isLoading ? (
+          (isLoading || !historyReady) ? (
             <div className="text-center py-12 text-gray-400">Loading history...</div>
           ) : (
             <>
@@ -1710,11 +2316,11 @@ export default function Testing() {
                 onDelete={(name) => { if (confirm(`Delete job "${name}" from history?`)) deleteJob.mutate(name) }}
                 onRerun={(name) => rerunJob.mutate(name)}
               />
-              {(jobsData?.total ?? 0) > 50 && (
+              {(jobsData?.total ?? 0) > historyPerPage && (
                 <div className="flex items-center justify-between px-4 py-3 border-t border-gray-200">
                   <button disabled={page <= 1} onClick={() => setPage(p => p - 1)} className="text-sm text-gray-500 disabled:opacity-40">Previous</button>
-                  <span className="text-sm text-gray-500">Page {page} of {Math.ceil((jobsData?.total ?? 0) / 50)}</span>
-                  <button disabled={(jobsData?.jobs.length ?? 0) < 50} onClick={() => setPage(p => p + 1)} className="text-sm text-gray-500 disabled:opacity-40">Next</button>
+                  <span className="text-sm text-gray-500">Page {page} of {Math.ceil((jobsData?.total ?? 0) / historyPerPage)}</span>
+                  <button disabled={(jobsData?.jobs.length ?? 0) < historyPerPage} onClick={() => setPage(p => p + 1)} className="text-sm text-gray-500 disabled:opacity-40">Next</button>
                 </div>
               )}
             </>

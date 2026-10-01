@@ -1,5 +1,7 @@
 from fastapi import APIRouter
 
+from app.core.config import settings
+
 router = APIRouter()
 
 
@@ -12,6 +14,6 @@ async def health_check():
 async def root():
     return {
         "name": "PASP Control Center",
-        "version": "1.0.0",
+        "version": settings.VERSION,
         "description": "Performance and Scale for AI Platforms - Cluster Management & Reservation System"
     }

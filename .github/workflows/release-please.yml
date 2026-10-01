@@ -1,0 +1,97 @@
+name: Release Please
+
+"on":
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: release-please-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      version: ${{ steps.release.outputs.version }}
+      major: ${{ steps.release.outputs.major }}
+      minor: ${{ steps.release.outputs.minor }}
+      sha: ${{ steps.release.outputs.sha }}
+    steps:
+      - name: Create or update release PR
+        id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          target-branch: main
+
+  publish-release-images:
+    needs: release
+    if: needs.release.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout released revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.sha }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm ci && npm test && npm run build
+
+      - name: Log in to Quay.io
+        uses: docker/login-action@v3
+        with:
+          registry: quay.io
+          username: ${{ secrets.QUAY_CONTROL_CENTER_USERNAME }}
+          password: ${{ secrets.QUAY_CONTROL_CENTER_PASSWORD }}
+
+      - name: Build and push versioned backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          platforms: linux/amd64
+          tags: |
+            quay.io/redhat-performance/psap-control-center-backend:v${{ needs.release.outputs.version }}
+            quay.io/redhat-performance/psap-control-center-backend:v${{ needs.release.outputs.major }}.${{ needs.release.outputs.minor }}
+            quay.io/redhat-performance/psap-control-center-backend:v${{ needs.release.outputs.major }}
+
+      - name: Create frontend Dockerfile
+        run: |
+          printf '%s\n' \
+            'FROM nginxinc/nginx-unprivileged:alpine' \
+            'COPY dist /usr/share/nginx/html' \
+            'COPY nginx.conf /etc/nginx/conf.d/default.conf' \
+            'EXPOSE 8080' \
+            'CMD ["nginx", "-g", "daemon off;"]' \
+            > /tmp/Dockerfile.frontend
+
+      - name: Build and push versioned frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: /tmp/Dockerfile.frontend
+          push: true
+          platforms: linux/amd64
+          tags: |
+            quay.io/redhat-performance/psap-control-center-frontend:v${{ needs.release.outputs.version }}
+            quay.io/redhat-performance/psap-control-center-frontend:v${{ needs.release.outputs.major }}.${{ needs.release.outputs.minor }}
+            quay.io/redhat-performance/psap-control-center-frontend:v${{ needs.release.outputs.major }}
