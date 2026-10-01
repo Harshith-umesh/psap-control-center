@@ -11,6 +11,23 @@ import type { PullRequestSelection } from '../types'
 const NAMESPACE = 'fournos-jobs'
 const API_VERSION = 'fournos.dev/v1'
 
+export function mergeMatrixConfigOverrides(
+  pipelineOverrides: Record<string, unknown>,
+  formOverrides: Record<string, string>,
+): Record<string, string> {
+  const normalizedPipeline = Object.fromEntries(
+    Object.entries(pipelineOverrides).map(([key, value]) => [
+      key,
+      Array.isArray(value)
+        ? JSON.stringify(value)
+        : typeof value === 'boolean'
+          ? value ? 'true' : 'false'
+          : value == null ? '' : String(value),
+    ]),
+  )
+  return { ...normalizedPipeline, ...formOverrides }
+}
+
 /** Mirrors fournos_k8s_client.sanitize_job_name(prefix). */
 function sanitizeJobName(prefix: string): string {
   const now = new Date()

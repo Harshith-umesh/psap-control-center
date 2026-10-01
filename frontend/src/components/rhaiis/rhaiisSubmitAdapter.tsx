@@ -88,7 +88,45 @@ const CLUSTER_GPU_TYPES: Record<string, string> = {
   zeus: 'h200',
   'old-zeus': 'h200',
   b200: 'b200',
-  mi355x: 'amd',
+  mi355x: 'mi355x',
+}
+
+const GPU_PRODUCT_PATTERNS: Array<[RegExp, string]> = [
+  [/mi[-_\s]?355x/i, 'mi355x'],
+  [/\bb[-_\s]?200\b/i, 'b200'],
+  [/\bh[-_\s]?200\b/i, 'h200'],
+  [/\bgh[-_\s]?200\b/i, 'gh200'],
+  [/\bh[-_\s]?100\b/i, 'h100'],
+  [/\ba[-_\s]?100\b/i, 'a100'],
+  [/\bl[-_\s]?40s\b/i, 'l40s'],
+  [/\ba[-_\s]?10\b/i, 'a10'],
+  [/\bv[-_\s]?100\b/i, 'v100'],
+  [/\bt[-_\s]?4\b/i, 't4'],
+]
+
+export function canonicalFournosGpuType(value: string | undefined): string {
+  const raw = value?.trim() || ''
+  if (!raw) return ''
+  for (const [pattern, shortName] of GPU_PRODUCT_PATTERNS) {
+    if (pattern.test(raw)) return shortName
+  }
+  const normalized = raw.toLowerCase()
+  if (['amd', 'nvidia', 'intel'].includes(normalized)) return ''
+  return /^[a-z0-9]+$/.test(normalized) ? normalized : ''
+}
+
+function setTensorParallelOverride(
+  overrides: Record<string, string>,
+  engineValue: unknown,
+  tpSize: number,
+): void {
+  const engine = String(engineValue || 'vllm').trim().toLowerCase()
+  const paths: Record<string, string> = {
+    vllm: 'rhaiis.engines.vllm.args.tensor-parallel-size',
+    sglang: 'rhaiis.engines.sglang.args.tp-size',
+    trtllm: 'rhaiis.engines.trtllm.args.tp_size',
+  }
+  overrides[paths[engine] || paths.vllm] = stringifyValue(tpSize)
 }
 
 function stringifyValue(value: unknown): string {
@@ -170,7 +208,9 @@ const rhaiisSubmitAdapter: ProjectSubmitAdapter = {
     const selectedModelTp = modelTpSize(modelField, values.model) || 1
     const tpSize = Math.max(Number(values.tp_size) || selectedModelTp, 1)
     return {
-      gpuType: basics.clusterGpuType || CLUSTER_GPU_TYPES[basics.cluster.trim().toLowerCase()] || '',
+      gpuType: canonicalFournosGpuType(basics.clusterGpuType)
+        || CLUSTER_GPU_TYPES[basics.cluster.trim().toLowerCase()]
+        || '',
       selectedModelTp,
       tpSize,
       gpuCount: Math.max(Number(values.gpu_count) || 1, tpSize),
@@ -226,11 +266,11 @@ const rhaiisSubmitAdapter: ProjectSubmitAdapter = {
       const customId = String(values.custom_model_id || '').trim()
       if (customName) overrides['models.custom.name'] = customName
       if (customId) overrides['models.custom.hf_model_id'] = customId
-      overrides['rhaiis.engines.vllm.args.tensor-parallel-size'] = stringifyValue(derived.tpSize)
+      setTensorParallelOverride(overrides, values.engine, derived.tpSize)
     } else if (selectedModel) {
       overrides['tests.rhaiis.model_key'] = stringifyValue(rawOptionValue(modelField, selectedModel))
       if (Number(values.tp_size) && Number(values.tp_size) !== derived.selectedModelTp) {
-        overrides['rhaiis.engines.vllm.args.tensor-parallel-size'] = stringifyValue(derived.tpSize)
+        setTensorParallelOverride(overrides, values.engine, derived.tpSize)
       }
     }
 
@@ -245,7 +285,7 @@ const rhaiisSubmitAdapter: ProjectSubmitAdapter = {
         const customConcurrencies = String(values.custom_workload_concurrencies || '').trim()
         if (customData) overrides['workloads.custom.data'] = customData
         if (customConcurrencies) {
-          overrides['workloads.custom.concurrencies'] = stringifyValue(
+          overrides['workloads.custom.rates'] = stringifyValue(
             customConcurrencies.split(',').map((item) => Number(item.trim()) || 0)
           )
         }
@@ -295,7 +335,7 @@ const rhaiisSubmitAdapter: ProjectSubmitAdapter = {
       !!String(values.custom_workload_data || '').trim()
       && !!String(values.custom_workload_concurrencies || '').trim()
     )
-    const sizingValid = derived.gpuCount >= derived.tpSize
+    const sizingValid = !!derived.gpuType && derived.gpuCount >= derived.tpSize
     const slackValid = activeMode.id !== 'single'
       || values.slack !== true
       || !!String(values.slack_member_id || '').trim()
