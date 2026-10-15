@@ -5,7 +5,7 @@ import os
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "PSAP Control Center"
-    VERSION: str = "1.6.0"  # x-release-please-version
+    VERSION: str = "1.7.0"  # x-release-please-version
     API_V1_PREFIX: str = "/api/v1"
     
     DATABASE_URL: str = "sqlite+aiosqlite:///./psap_control_center.db"
