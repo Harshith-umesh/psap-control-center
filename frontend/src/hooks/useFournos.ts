@@ -3,6 +3,7 @@ import toast from 'react-hot-toast'
 import { fournosApi } from '../services/api'
 import type {
   FournosJobListResponse,
+  FournosLiveJobSummaryResponse,
   FournosJobDetailResponse,
   FournosJobEvent,
   RecurringJob,
@@ -27,6 +28,10 @@ import type {
   WorkItemReference,
   RunGroupCreate,
   RunGroupReference,
+  CptRunGroup,
+  CptRunListResponse,
+  StopCptRunGroupResponse,
+  UpdateCptRunVersionResponse,
 } from '../types'
 
 // ─── Jobs ──────────────────────────────────────────────────────────────
@@ -60,6 +65,17 @@ export function useFournosJobs(params: {
     queryFn: () => fournosApi.listJobs(params),
     enabled,
     refetchInterval: params.tab === 'live' ? 5000 : false,
+    retry: 1,
+  })
+}
+
+export function useFournosLiveJobSummary(enabled = true) {
+  return useQuery<FournosLiveJobSummaryResponse>({
+    queryKey: ['fournos-live-job-summary'],
+    queryFn: () => fournosApi.getLiveJobSummary(),
+    enabled,
+    staleTime: 10_000,
+    refetchInterval: 30_000,
     retry: 1,
   })
 }
@@ -111,6 +127,26 @@ export function useFournosJob(name: string | undefined) {
     queryFn: () => fournosApi.getJob(name!),
     enabled: !!name,
     refetchInterval: 5000,
+  })
+}
+
+export function useInferenceLogsAvailability(name: string | undefined, enabled: boolean) {
+  return useQuery({
+    queryKey: ['fournos-inference-logs-availability', name],
+    queryFn: () => fournosApi.getInferenceLogsAvailability(name!),
+    enabled: !!name && enabled,
+    refetchInterval: 10_000,
+    retry: false,
+  })
+}
+
+export function useInferenceServerLogs(name: string | undefined, enabled: boolean) {
+  return useQuery({
+    queryKey: ['fournos-inference-logs', name],
+    queryFn: () => fournosApi.getInferenceServerLogs(name!),
+    enabled: !!name && enabled,
+    refetchInterval: 10_000,
+    retry: false,
   })
 }
 
@@ -197,6 +233,18 @@ export function useRerunJob() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['fournos-jobs'] })
     },
+  })
+}
+
+export function useEditSubmitJob(name: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (spec: Record<string, unknown>) => fournosApi.editSubmitJob(name, spec),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['fournos-jobs'] })
+      toast.success('Edited job submitted')
+    },
+    onError: (error: Error) => toast.error(error.message || 'Failed to submit edited job'),
   })
 }
 
@@ -455,6 +503,63 @@ export function useSubmitMatrix() {
     mutationFn: (req) => fournosApi.submitMatrix(req),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['fournos-jobs'] })
+      qc.invalidateQueries({ queryKey: ['fournos-cpt-runs'] })
     },
+  })
+}
+
+export function useCptRuns(params: {
+  project?: string
+  version?: string
+  accelerator?: string
+  cluster?: string
+  owner?: string
+  show_stopped?: boolean
+} = {}) {
+  return useQuery<CptRunListResponse>({
+    queryKey: ['fournos-cpt-runs', params],
+    queryFn: () => fournosApi.getCptRuns(params),
+    refetchInterval: 10_000,
+    retry: 1,
+  })
+}
+
+export function useCptRunGroup(groupId: string) {
+  return useQuery<CptRunGroup>({
+    queryKey: ['fournos-cpt-run-group', groupId],
+    queryFn: () => fournosApi.getCptRunGroup(groupId),
+    enabled: !!groupId,
+    refetchInterval: 10_000,
+    retry: 1,
+  })
+}
+
+export function useStopCptRunGroup() {
+  const qc = useQueryClient()
+  return useMutation<StopCptRunGroupResponse, Error, string>({
+    mutationFn: (groupId: string) => fournosApi.stopCptRunGroup(groupId),
+    onSuccess: (result) => {
+      qc.invalidateQueries({ queryKey: ['fournos-cpt-runs'] })
+      qc.invalidateQueries({ queryKey: ['fournos-jobs'] })
+      if (result.failed > 0) {
+        toast.error(`Stop requested for ${result.requested} job(s); ${result.failed} could not be stopped`)
+      } else {
+        toast.success(`Stop requested for ${result.requested} active CPT job(s)`)
+      }
+    },
+    onError: (error: Error) => toast.error(error.message || 'Failed to stop CPT jobs'),
+  })
+}
+
+export function useUpdateCptRunVersion() {
+  const qc = useQueryClient()
+  return useMutation<UpdateCptRunVersionResponse, Error, { runId: string; versionLabel: string }>({
+    mutationFn: ({ runId, versionLabel }: { runId: string; versionLabel: string }) =>
+      fournosApi.updateCptRunVersion(runId, versionLabel),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['fournos-cpt-runs'] })
+      toast.success('CPT version label updated')
+    },
+    onError: (error: Error) => toast.error(error.message || 'Failed to update CPT version label'),
   })
 }

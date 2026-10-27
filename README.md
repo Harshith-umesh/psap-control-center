@@ -101,6 +101,27 @@ calendar slots require a signed-in user. Cancelling or rerunning jobs, deleting
 history, triggering or deleting schedules, and releasing locks require an
 administrator.
 
+### Importing existing Fournos history
+
+Control Center's Kubernetes watcher captures FournosJobs going forward. To
+backfill jobs and CPT submissions already archived by Fournos UI, run this
+from the backend environment:
+
+`python -m app.services.fournos_history_backfill`
+
+Set `DATABASE_URL` to the Control Center database and
+`FOURNOS_ARCHIVE_DATABASE_URL` to the Fournos UI database. Use a
+read-only source database account with SELECT access to `jobs`, `cpt_runs`,
+and `cpt_run_jobs`. The import is idempotent, preserves Control Center job
+records, and retains CPT entries whose FournosJob could not be created.
+
+For ongoing capture, configure Control Center's `FOURNOS_NAMESPACE` to the
+same namespace used by the Fournos UI deployment. The watcher performs an
+initial sync, watches job changes, and periodically re-syncs the namespace.
+Fournos UI CPT submissions include grouping metadata in their FournosJob
+annotations so Control Center can track new runs without querying the
+dashboard database continuously.
+
 ## Quick Start
 
 ### Docker Compose

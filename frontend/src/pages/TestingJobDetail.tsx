@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef, Fragment } from 'react'
-import { useParams, Link } from 'react-router-dom'
+import { useParams, Link, useNavigate, useSearchParams } from 'react-router-dom'
 import {
   ArrowLeftIcon,
   PlayIcon,
@@ -8,13 +8,8 @@ import {
   DocumentTextIcon,
   ChevronRightIcon,
   ServerIcon,
-  Square3Stack3DIcon,
-  UserIcon,
-  CalendarIcon,
-  CubeIcon,
-  CodeBracketIcon,
-  ClockIcon,
   ExclamationTriangleIcon,
+  PencilSquareIcon,
 } from '@heroicons/react/24/outline'
 import {
   CheckCircleIcon,
@@ -30,9 +25,13 @@ import {
   useRerunJob,
   useUpdateJobWorkItems,
   useUpdateJobRunGroups,
+  useEditSubmitJob,
+  useInferenceLogsAvailability,
+  useInferenceServerLogs,
 } from '../hooks/useFournos'
 import type { PipelineStage, FournosPod } from '../types'
 import { workItemFromInput } from '../utils/workItems'
+import { buildFournosJobYaml } from '../utils/fournosJobPreview'
 import RunGroupSelector from '../components/RunGroupSelector'
 
 function formatDuration(startStr: string | null, endStr: string | null): string {
@@ -43,6 +42,19 @@ function formatDuration(startStr: string | null, endStr: string | null): string 
   if (s < 60) return `${s}s`
   if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`
+}
+
+function formatDurationSeconds(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds))
+  if (total < 60) return `${total}s`
+  if (total < 3600) return `${Math.floor(total / 60)}m ${total % 60}s`
+  return `${Math.floor(total / 3600)}h ${Math.floor((total % 3600) / 60)}m`
+}
+
+function formatConfigValue(value: unknown): string {
+  if (typeof value === 'string') return value
+  const serialized = JSON.stringify(value)
+  return serialized === undefined ? String(value) : serialized
 }
 
 // ─── Pipeline Timeline ──────────────────────────────────────────────────
@@ -326,20 +338,49 @@ function jobLoadErrorMessage(error: unknown): string {
 export default function TestingJobDetail() {
   const { name } = useParams<{ name: string }>()
   const { data, isLoading, error, refetch } = useFournosJob(name)
+  const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
   const cancelJob = useCancelJob()
   const rerunJob = useRerunJob()
+  const editSubmitJob = useEditSubmitJob(name || '')
   const updateRunGroups = useUpdateJobRunGroups(name)
   const updateWorkItems = useUpdateJobWorkItems(name)
   const [workItemDraft, setWorkItemDraft] = useState('')
   const [selectedPod, setSelectedPod] = useState('')
   const [autoSelected, setAutoSelected] = useState(false)
-  const [activeTab, setActiveTab] = useState<'timeline' | 'pods' | 'spec'>('timeline')
+  const [editSubmitOpen, setEditSubmitOpen] = useState(false)
+  const [editSpecText, setEditSpecText] = useState('')
+  const [editSpecError, setEditSpecError] = useState('')
+
+  useEffect(() => {
+    if (searchParams.get('edit') !== '1' || !data) return
+    const editableSpec = { ...data.job.spec }
+    delete editableSpec.schedule
+    delete editableSpec.scheduledStartTime
+    delete editableSpec.shutdown
+    setEditSpecText(JSON.stringify(editableSpec, null, 2))
+    setEditSpecError('')
+    setEditSubmitOpen(true)
+    setSearchParams((current) => {
+      const next = new URLSearchParams(current)
+      next.delete('edit')
+      return next
+    }, { replace: true })
+  }, [data, searchParams, setSearchParams])
 
   const pods = useMemo(() => data?.pods ?? [], [data?.pods])
   const phase = (data?.job.status as Record<string, unknown> | undefined)?.phase as string | undefined
-  // Once a job is archived to history its pods are long gone from the
-  // cluster — no point offering a tab that can only ever say "no pods".
+  // Once a job is archived to history its pods are long gone from the cluster.
   const isHistorical = data?.job.source === 'history'
+  const inferenceAvailability = useInferenceLogsAvailability(
+    name,
+    Boolean(data && !isHistorical && data.forge_info.project === 'rhaiis'),
+  )
+  const [inferenceLogsOpen, setInferenceLogsOpen] = useState(false)
+  const inferenceLogs = useInferenceServerLogs(
+    name,
+    inferenceLogsOpen && inferenceAvailability.data?.available === true,
+  )
 
   useEffect(() => {
     if (autoSelected || selectedPod || !pods.length) return
@@ -350,11 +391,6 @@ export default function TestingJobDetail() {
       setAutoSelected(true)
     }
   }, [pods, phase, autoSelected, selectedPod])
-
-  useEffect(() => {
-    if (isHistorical && activeTab === 'pods') setActiveTab('timeline')
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isHistorical])
 
   if (isLoading) {
     return (
@@ -395,59 +431,191 @@ export default function TestingJobDetail() {
   const status = job.status as Record<string, unknown>
   const displayPhase = (status.phase as string) || 'Unknown'
   const isRunning = ['Running', 'Pending', 'Admitted', 'Resolving'].includes(displayPhase)
+  const durationLabel = typeof job.duration_seconds === 'number'
+    ? formatDurationSeconds(job.duration_seconds)
+    : meta.creationTimestamp
+      ? formatDuration(meta.creationTimestamp as string, (status.completionTime as string) || null)
+      : ''
+  const jobYaml = buildFournosJobYaml(job)
+  const hardware = spec.hardware && typeof spec.hardware === 'object'
+    ? spec.hardware as Record<string, unknown>
+    : {}
+  const secretRefs = Array.isArray(spec.secretRefs) ? spec.secretRefs : []
 
-  const PHASE_BANNER: Record<string, string> = {
-    Running: 'from-blue-500 to-indigo-600',
-    Succeeded: 'from-green-500 to-emerald-600',
-    Failed: 'from-red-500 to-rose-600',
-    Stopped: 'from-yellow-400 to-amber-500',
-    Pending: 'from-gray-400 to-gray-500',
-    Resolving: 'from-purple-500 to-fuchsia-600',
-    Admitted: 'from-indigo-500 to-purple-600',
+  const PHASE_BADGE: Record<string, string> = {
+    Running: 'bg-blue-50 text-blue-700 ring-blue-200',
+    Succeeded: 'bg-green-50 text-green-700 ring-green-200',
+    Failed: 'bg-red-50 text-red-700 ring-red-200',
+    Stopped: 'bg-gray-100 text-gray-600 ring-gray-200',
+    Pending: 'bg-gray-100 text-gray-600 ring-gray-200',
+    Resolving: 'bg-purple-50 text-purple-700 ring-purple-200',
+    Admitted: 'bg-indigo-50 text-indigo-700 ring-indigo-200',
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <Link to="/testing" className="inline-flex items-center gap-1 text-sm text-gray-500 hover:text-gray-700">
-        <ArrowLeftIcon className="h-4 w-4" /> Back to Testing
+        <ArrowLeftIcon className="h-4 w-4" /> All Jobs
       </Link>
 
-      {/* Header banner */}
-      <div className={clsx('rounded-2xl bg-gradient-to-r p-5 text-white shadow-sm', PHASE_BANNER[displayPhase] || 'from-gray-500 to-gray-600')}>
+      <div className="rounded-lg border border-gray-200 bg-white px-5 py-4 shadow-sm">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="inline-flex items-center gap-1.5 rounded-full bg-white/20 px-2.5 py-1 text-xs font-semibold backdrop-blur-sm">
-                {isRunning && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-white" />}
+            <h1 className="break-all text-xl font-semibold text-gray-900">{name}</h1>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <span className={clsx('inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ring-inset', PHASE_BADGE[displayPhase] || 'bg-gray-100 text-gray-600 ring-gray-200')}>
+                {isRunning && <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-current" />}
                 {displayPhase}
               </span>
-              {forge_info.project && (
-                <span className="inline-flex items-center gap-1 rounded-full bg-white/10 px-2.5 py-1 text-xs font-medium">
-                  <Square3Stack3DIcon className="h-3.5 w-3.5" /> {forge_info.project}
-                </span>
-              )}
-              {job.source === 'history' && <span className="text-xs text-white/70">(from history)</span>}
+              {job.source === 'history' && <span className="rounded-full bg-gray-100 px-2.5 py-1 text-xs font-medium text-gray-600">Archived</span>}
+              {durationLabel && <span className="text-xs text-gray-500">{durationLabel}</span>}
+              {forge_info.project && <span className="rounded-full bg-indigo-50 px-2.5 py-1 text-xs font-medium text-indigo-700">{forge_info.project}</span>}
             </div>
-            <h1 className="mt-2 truncate font-mono text-lg font-bold sm:text-xl">{name}</h1>
-            {forge_info.args?.length > 0 && (
-              <p className="mt-1 truncate text-sm text-white/80">{forge_info.args.join(' ')}</p>
-            )}
+            {forge_info.args?.length > 0 && <p className="mt-2 break-all text-sm text-gray-500">{forge_info.args.join(' ')}</p>}
           </div>
+        </div>
 
-          {isAdmin() && (
-            <div className="flex shrink-0 gap-2">
-              {isRunning && (
-                <button onClick={() => { if (confirm(`Cancel "${name}"?`)) cancelJob.mutate(name!) }} className="inline-flex items-center gap-1 rounded-md bg-white/15 px-3 py-1.5 text-sm font-medium text-white backdrop-blur-sm hover:bg-white/25">
-                  <StopIcon className="h-4 w-4" /> Cancel
-                </button>
-              )}
-              <button onClick={() => rerunJob.mutate(name!)} disabled={rerunJob.isPending} className="inline-flex items-center gap-1 rounded-md bg-white px-3 py-1.5 text-sm font-medium text-gray-900 shadow-sm hover:bg-white/90 disabled:opacity-60">
-                <PlayIcon className="h-4 w-4" /> Re-run
+        {isAdmin() && (
+          <div className="mt-4 flex flex-wrap gap-2 border-t border-gray-100 pt-3" aria-label="Job actions">
+            {isRunning && (
+              <button onClick={() => { if (confirm(`Cancel "${name}"?`)) cancelJob.mutate(name!) }} className="inline-flex items-center gap-1.5 rounded-md border border-red-200 bg-white px-3 py-1.5 text-sm font-medium text-red-700 hover:bg-red-50">
+                <StopIcon className="h-4 w-4" /> Cancel Job
               </button>
+            )}
+            <button onClick={() => rerunJob.mutate(name!)} disabled={rerunJob.isPending} className="inline-flex items-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-60">
+              <PlayIcon className="h-4 w-4" /> Run Again
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                const editableSpec = { ...spec }
+                delete editableSpec.schedule
+                delete editableSpec.scheduledStartTime
+                delete editableSpec.shutdown
+                setEditSpecText(JSON.stringify(editableSpec, null, 2))
+                setEditSpecError('')
+                setEditSubmitOpen((open) => !open)
+              }}
+              className="inline-flex items-center gap-1.5 rounded-md border border-gray-300 bg-white px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-50"
+            >
+              <PencilSquareIcon className="h-4 w-4" /> Edit &amp; Submit
+            </button>
+          </div>
+        )}
+      </div>
+
+      {job.source === 'history' && ['Succeeded', 'Failed', 'Stopped'].includes(displayPhase) && (
+        <div className={clsx(
+          'rounded-lg border px-4 py-3 text-sm',
+          displayPhase === 'Succeeded' ? 'border-green-200 bg-green-50 text-green-800' : displayPhase === 'Failed' ? 'border-red-200 bg-red-50 text-red-800' : 'border-gray-200 bg-gray-50 text-gray-700'
+        )}>
+          <span className="font-semibold">Execution {displayPhase.toLowerCase()}</span>
+          {durationLabel && <span> after {durationLabel}</span>}
+          {displayPhase === 'Failed' && typeof status.message === 'string' && status.message && <p className="mt-1 text-sm font-normal">{status.message}</p>}
+        </div>
+      )}
+
+      {(job.mlflow_url || job.ci_artifacts_url) && (
+        <div className="flex flex-wrap gap-2" aria-label="Job results">
+          {job.mlflow_url && <a href={job.mlflow_url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-2 rounded-md border border-gray-200 bg-white px-3 py-2 text-sm font-medium text-indigo-600 hover:bg-indigo-50"><span aria-hidden="true">📊</span> MLflow Results</a>}
+          {job.ci_artifacts_url && <a href={job.ci_artifacts_url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-2 rounded-md border border-gray-200 bg-white px-3 py-2 text-sm font-medium text-indigo-600 hover:bg-indigo-50"><span aria-hidden="true">📁</span> CI Artifacts</a>}
+        </div>
+      )}
+
+      {editSubmitOpen && isAdmin() && (
+        <form
+          className="rounded-xl border border-indigo-200 bg-white p-4 shadow-sm sm:p-5"
+          onSubmit={async (event) => {
+            event.preventDefault()
+            setEditSpecError('')
+            let editedSpec: unknown
+            try {
+              editedSpec = JSON.parse(editSpecText)
+            } catch {
+              setEditSpecError('Enter a valid JSON object before submitting.')
+              return
+            }
+            if (!editedSpec || typeof editedSpec !== 'object' || Array.isArray(editedSpec)) {
+              setEditSpecError('The FournosJob spec must be a JSON object.')
+              return
+            }
+            try {
+              const result = await editSubmitJob.mutateAsync(editedSpec as Record<string, unknown>)
+              setEditSubmitOpen(false)
+              if (result.redirect) navigate(result.redirect)
+            } catch (submitError) {
+              setEditSpecError(submitError instanceof Error ? submitError.message : 'Could not submit the edited job.')
+            }
+          }}
+        >
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-semibold text-gray-900">Edit and submit as a new job</h2>
+              <p className="mt-1 max-w-3xl text-xs leading-5 text-gray-500">
+                Edit the JSON FournosJob spec below, then submit it as a separate run. The current job is unchanged; owner is set to your signed-in identity and the default TTL is 12h. Scheduling fields are omitted so this creates a one-off run.
+              </p>
+            </div>
+            <button type="button" onClick={() => setEditSubmitOpen(false)} className="text-sm text-gray-500 hover:text-gray-700">Close</button>
+          </div>
+          <textarea
+            value={editSpecText}
+            onChange={(event) => setEditSpecText(event.target.value)}
+            spellCheck={false}
+            aria-label="Edited FournosJob spec JSON"
+            className="mt-3 min-h-96 w-full rounded-md border-gray-300 font-mono text-xs shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+          />
+          {editSpecError && <p role="alert" className="mt-2 text-sm text-red-600">{editSpecError}</p>}
+          <div className="mt-3 flex justify-end">
+            <button type="submit" disabled={editSubmitJob.isPending} className="rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-700 disabled:opacity-50">
+              {editSubmitJob.isPending ? 'Submitting…' : 'Submit edited job'}
+            </button>
+          </div>
+        </form>
+      )}
+
+      {inferenceAvailability.data?.available && (
+        <section className="overflow-hidden rounded-xl border-2 border-indigo-200 bg-white shadow-sm">
+          <button
+            type="button"
+            aria-expanded={inferenceLogsOpen}
+            onClick={() => setInferenceLogsOpen((open) => !open)}
+            className="flex w-full flex-wrap items-center justify-between gap-3 bg-indigo-50 px-4 py-3 text-left hover:bg-indigo-100 sm:px-5"
+          >
+            <span className="flex items-center gap-3">
+              <span className="flex h-10 w-10 items-center justify-center rounded-lg bg-indigo-600 text-white">
+                <ServerIcon className="h-5 w-5" />
+              </span>
+              <span>
+                <span className="block text-sm font-semibold text-indigo-950">{inferenceLogsOpen ? 'Hide' : 'View'} inference server logs</span>
+                <span className="mt-0.5 block text-xs text-indigo-700">Live RHAIIS predictor output · latest 300 lines · refreshes while open</span>
+              </span>
+            </span>
+            <span className="rounded-md bg-indigo-600 px-3 py-1.5 text-xs font-semibold text-white">{inferenceLogsOpen ? 'Close logs' : 'Open logs'}</span>
+          </button>
+          {inferenceLogsOpen && (
+            <div className="border-t border-indigo-100 p-4">
+              {inferenceLogs.isLoading ? (
+                <p className="text-sm text-gray-500">Loading inference-server logs…</p>
+              ) : inferenceLogs.error ? (
+                <p role="alert" className="text-sm text-amber-700">Inference-server logs are temporarily unavailable.</p>
+              ) : inferenceLogs.data ? (
+                <>
+                  <div className="mb-2 flex flex-wrap items-center gap-2 text-xs text-gray-500">
+                    {inferenceLogs.data.pod && <code>{inferenceLogs.data.pod}</code>}
+                    <span>{inferenceLogs.data.container}</span>
+                    <span>{inferenceLogs.data.phase}</span>
+                  </div>
+                  {inferenceLogs.data.message ? (
+                    <p className="text-sm text-gray-500">{inferenceLogs.data.message}</p>
+                  ) : (
+                    <pre className="max-h-[32rem] overflow-auto rounded-lg bg-gray-950 p-3 font-mono text-xs leading-5 text-gray-100">{inferenceLogs.data.logs || 'No inference-server log output yet.'}</pre>
+                  )}
+                </>
+              ) : null}
             </div>
           )}
-        </div>
-      </div>
+        </section>
+      )}
 
       {failure_summary && (
         <div className={clsx(
@@ -482,28 +650,55 @@ export default function TestingJobDetail() {
         </div>
       )}
 
-      {/* Summary cards */}
-      <div className="grid grid-cols-2 gap-4 sm:grid-cols-5">
-        {[
-          { label: 'Namespace', value: (meta.namespace as string) || '-', icon: CubeIcon },
-          { label: 'Cluster', value: (spec.cluster as string) || '-', icon: ServerIcon },
-          { label: 'Pipeline', value: (spec.pipeline as string) || '-', icon: Square3Stack3DIcon },
-          { label: 'Owner', value: (spec.owner as string) || (isAuthenticated() ? '-' : 'Sign in to view'), icon: UserIcon },
-          { label: 'Created', value: meta.creationTimestamp ? new Date(meta.creationTimestamp as string).toLocaleString() : '-', icon: CalendarIcon },
-        ].map(({ label, value, icon: Icon }) => (
-          <div key={label} className="card flex items-start gap-3 p-4">
-            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-gray-100 text-gray-500">
-              <Icon className="h-5 w-5" />
-            </span>
-            <div className="min-w-0">
-              <p className="text-xs text-gray-500">{label}</p>
-              <p className="truncate text-sm font-semibold text-gray-900" title={value}>{value}</p>
-            </div>
+      <section className="rounded-lg border border-gray-200 bg-white p-5 shadow-sm">
+        {stages.length > 0 ? (
+          <PipelineTimeline stages={stages} />
+        ) : (
+          <div>
+            <h2 className="text-sm font-semibold text-gray-900">Pipeline Timeline</h2>
+            <p className="mt-2 text-sm text-gray-400">No pipeline stages to show yet.</p>
           </div>
-        ))}
-      </div>
+        )}
+      </section>
 
-      {/* Forge info & MLflow */}
+      {/* Keep the configuration and YAML together, as on the FourNos dashboard. */}
+      <section className="overflow-hidden rounded-lg border border-gray-200 bg-white shadow-sm">
+        <div className="border-b border-gray-200 px-4 py-3 text-sm font-semibold text-gray-900">Test Configuration</div>
+        <div className="p-4">
+          <dl className="grid grid-cols-1 gap-x-8 gap-y-3 text-sm sm:grid-cols-[minmax(9rem,12rem)_minmax(0,1fr)]">
+            <dt className="text-gray-500">Display Name</dt><dd className="break-all text-gray-800">{String(spec.displayName || '-')}</dd>
+            <dt className="text-gray-500">Owner</dt><dd className="text-gray-800">{String(spec.owner || (isAuthenticated() ? '-' : 'Sign in to view'))}</dd>
+            <dt className="text-gray-500">Pipeline</dt><dd className="text-gray-800"><code>{String(spec.pipeline || '-')}</code></dd>
+            <dt className="text-gray-500">Cluster</dt><dd className="text-gray-800"><code>{String(spec.cluster || '-')}</code></dd>
+            <dt className="text-gray-500">Exclusive</dt><dd className="text-gray-800">{spec.exclusive ? 'Yes' : 'No'}</dd>
+            <dt className="text-gray-500">Project</dt><dd className="text-gray-800"><span className="rounded bg-indigo-50 px-2 py-0.5 font-medium text-indigo-700">{forge_info.project || '-'}</span></dd>
+            <dt className="text-gray-500">Args (Presets)</dt><dd className="break-all text-gray-800"><code>{forge_info.args.join(', ') || 'none'}</code></dd>
+            {Object.keys(hardware).length > 0 && <><dt className="text-gray-500">Hardware</dt><dd className="break-all text-gray-800"><code>{formatConfigValue(hardware)}</code></dd></>}
+            {spec.priority != null && <><dt className="text-gray-500">Priority</dt><dd className="text-gray-800">{String(spec.priority)}</dd></>}
+            {spec.ttl != null && <><dt className="text-gray-500">TTL</dt><dd className="text-gray-800">{String(spec.ttl)}</dd></>}
+            {Object.keys(forge_info.config_overrides || {}).length > 0 && (
+              <>
+                <dt className="text-gray-500">Config Overrides</dt>
+                <dd className="min-w-0 space-y-1 text-gray-800">
+                  {Object.entries(forge_info.config_overrides).map(([key, value]) => (
+                    <div key={key} className="break-all"><code>{key}: {formatConfigValue(value)}</code></div>
+                  ))}
+                </dd>
+              </>
+            )}
+            {forge_info.pr_url && <><dt className="text-gray-500">Pull Request</dt><dd className="text-gray-800"><a href={forge_info.pr_url} target="_blank" rel="noopener noreferrer" className="text-indigo-600 hover:underline">#{forge_info.pr_number}: {forge_info.pr_title}</a></dd></>}
+            {secretRefs.length > 0 && <><dt className="text-gray-500">Secrets</dt><dd className="break-all text-gray-800">{secretRefs.map(String).join(', ')}</dd></>}
+            {meta.creationTimestamp && <><dt className="text-gray-500">Created</dt><dd className="text-gray-800">{new Date(meta.creationTimestamp as string).toLocaleString()}</dd></>}
+          </dl>
+
+          <details className="mt-4 overflow-hidden rounded-lg border border-gray-200">
+            <summary className="cursor-pointer bg-gray-50 px-4 py-2.5 text-sm font-semibold text-indigo-700 hover:bg-gray-100">View FournosJob YAML</summary>
+            <pre className="m-0 max-h-[36rem] overflow-auto border-t border-gray-200 bg-gray-950 p-4 font-mono text-xs leading-relaxed text-gray-100">{jobYaml}</pre>
+          </details>
+        </div>
+      </section>
+
+      {/* Additional Forge provenance and dashboard associations */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 xl:grid-cols-5">
         {(forge_info.pr_url || forge_info.repository || forge_info.requested_sha) && (
           <div className="card p-4">
@@ -566,16 +761,6 @@ export default function TestingJobDetail() {
           <p className="mt-2 text-xs text-gray-400">
             Evidence: {(data.forge_provenance_state || 'pending').replace(/_/g, ' ')}
           </p>
-        </div>
-        <div className="card p-4">
-          <p className="text-xs text-gray-500 mb-1">MLflow</p>
-          {job.mlflow_url ? (
-            <a href={job.mlflow_url} target="_blank" rel="noopener noreferrer" className="text-sm text-indigo-600 hover:text-indigo-800 hover:underline">
-              View MLflow Run
-            </a>
-          ) : (
-            <p className="text-sm text-gray-300">-</p>
-          )}
         </div>
         {isAuthenticated() && (
           <div className="card p-4">
@@ -660,72 +845,28 @@ export default function TestingJobDetail() {
         </div>
       </div>
 
-      {/* Tab bar */}
-      <div className="border-b border-gray-200">
-        <nav className="-mb-px flex space-x-8">
-          {[
-            { id: 'timeline' as const, label: 'Pipeline Timeline', icon: ClockIcon },
-            ...(isHistorical ? [] : [{ id: 'pods' as const, label: `Pods (${pods.length})`, icon: CubeIcon }]),
-            { id: 'spec' as const, label: 'FournosJob Spec', icon: CodeBracketIcon },
-          ].map((tab) => (
-            <button
-              key={tab.id}
-              onClick={() => setActiveTab(tab.id)}
-              className={clsx(
-                'whitespace-nowrap border-b-2 py-3 px-1 text-sm font-medium flex items-center gap-1.5',
-                activeTab === tab.id
-                  ? 'border-indigo-500 text-indigo-600'
-                  : 'border-transparent text-gray-500 hover:border-gray-300 hover:text-gray-700'
-              )}
-            >
-              <tab.icon className="h-4 w-4" />
-              {tab.label}
-            </button>
-          ))}
-        </nav>
-      </div>
-
-      {/* Pipeline Timeline tab */}
-      {activeTab === 'timeline' && (
-        stages.length > 0 ? (
-          <div className="card p-5">
-            <PipelineTimeline stages={stages} />
-          </div>
-        ) : (
-          <div className="card p-8 text-center text-sm text-gray-400">No pipeline stages to show yet.</div>
-        )
-      )}
-
-      {/* Pods tab — live jobs only, see isHistorical */}
-      {activeTab === 'pods' && !isHistorical && (
-        pods.length > 0 ? (
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-            <div className="card p-4">
-              <PodsPanel pods={pods} onSelectPod={setSelectedPod} selectedPod={selectedPod} />
+      {!isHistorical && (
+        <section className="rounded-lg border border-gray-200 bg-white p-4 shadow-sm">
+          <h2 className="mb-3 text-sm font-semibold text-gray-900">Pod Logs</h2>
+          {pods.length > 0 ? (
+            <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+              <div className="rounded-lg border border-gray-100 p-3">
+                <PodsPanel pods={pods} onSelectPod={setSelectedPod} selectedPod={selectedPod} />
+              </div>
+              <div className="min-h-48 rounded-lg border border-gray-100 p-3 lg:col-span-2">
+                {selectedPod ? (
+                  <LogViewer jobName={name!} podName={selectedPod} />
+                ) : (
+                  <div className="flex h-48 items-center justify-center text-sm text-gray-400">Select a pod to view logs.</div>
+                )}
+              </div>
             </div>
-            <div className="card p-4 lg:col-span-2">
-              {selectedPod ? (
-                <LogViewer jobName={name!} podName={selectedPod} />
-              ) : (
-                <div className="flex items-center justify-center h-48 text-sm text-gray-400">
-                  Select a pod to view logs
-                </div>
-              )}
-            </div>
-          </div>
-        ) : (
-          <div className="card p-8 text-center text-sm text-gray-400">No pods for this job yet.</div>
-        )
+          ) : (
+            <p className="py-4 text-sm text-gray-400">No pods for this job yet.</p>
+          )}
+        </section>
       )}
 
-      {/* Spec tab */}
-      {activeTab === 'spec' && (
-        <div className="card">
-          <pre className="p-4 text-xs overflow-x-auto bg-gray-50 font-mono text-gray-600 rounded-xl">
-            {JSON.stringify(spec, null, 2)}
-          </pre>
-        </div>
-      )}
     </div>
   )
 }

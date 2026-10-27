@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -468,6 +469,67 @@ def test_legacy_sha_only_submission_remains_supported():
     assert fields["source_resolved_sha"] == sha
 
 
+def test_watcher_archives_cpt_identity_from_fournos_dashboard_annotations():
+    fjob = {
+        "metadata": {
+            "name": "rhaiis-cpt-mi355x-test",
+            "creationTimestamp": "2026-10-20T12:30:00Z",
+            "annotations": {
+                "fournos.dev/cpt-run-id": "run-123",
+                "fournos.dev/cpt-pipeline-key": "cpt-rhaiis-3.6-mi355x",
+                "fournos.dev/cpt-configured-model-count": "5",
+                "fournos.dev/cpt-model-name": "Model A",
+                "fournos.dev/cpt-model-preset": "model-a",
+                "fournos.dev/cpt-run-metadata": json.dumps({
+                    "project": "rhaiis",
+                    "pipeline_key": "cpt-rhaiis-3.6-mi355x",
+                    "version_label": "RHAIIS-3.6-fast2",
+                    "cluster": "mi355x",
+                    "accelerator": "amd",
+                    "engine": "vllm",
+                    "engine_version": "vllm:v0.26.0",
+                    "fournos_pipeline": "forge-full",
+                    "forge_source": "abc123",
+                    "owner": "tester",
+                    "configured_model_count": 5,
+                    "model_key": "model-a",
+                    "model_name": "Model A",
+                    "model_preset": "model-a",
+                    "workloads": ["profile1", "profile4"],
+                }),
+            },
+        },
+        "spec": {
+            "cluster": "mi355x",
+            "pipeline": "forge-full",
+            "owner": "tester",
+            "env": {"PULL_PULL_SHA": "abc123"},
+            "executionEngine": {
+                "forge": {
+                    "project": "rhaiis",
+                    "args": ["amd", "vllm", "mi355x", "model-a"],
+                    "configOverrides": {
+                        "tests.rhaiis.version": "RHAIIS-3.6-fast2",
+                        "tests.rhaiis.workload_keys": ["profile1", "profile4"],
+                        "rhaiis.engines.vllm.images.amd": "vllm:v0.26.0",
+                    },
+                }
+            },
+        },
+        "status": {"phase": "Running", "conditions": []},
+    }
+
+    fields = watcher._extract_forge_fields(fjob)
+
+    assert fields["cpt_run_id"] == "run-123"
+    assert fields["cpt_run_metadata"]["pipeline_key"] == "cpt-rhaiis-3.6-mi355x"
+    assert fields["cpt_run_metadata"]["configured_model_count"] == 5
+    assert fields["cpt_run_metadata"]["version_label"] == "RHAIIS-3.6-fast2"
+    assert fields["cpt_run_metadata"]["workloads"] == ["profile1", "profile4"]
+    assert fields["cpt_run_metadata"]["engine_version"] == "vllm:v0.26.0"
+    assert fields["cpt_run_metadata"]["forge_source"] == "abc123"
+
+
 def test_submission_persists_pr_provenance_before_kubernetes_create(monkeypatch):
     sha = "c" * 40
     repository = "openshift-psap/forge"
@@ -513,6 +575,7 @@ def test_submission_persists_pr_provenance_before_kubernetes_create(monkeypatch)
     request = SubmitJobRequest(
         project="example",
         cluster="cluster-a",
+        priority="nightly",
         pull_request=PullRequestSelection(
             repository=repository,
             number=789,
@@ -538,6 +601,7 @@ def test_submission_persists_pr_provenance_before_kubernetes_create(monkeypatch)
     assert persisted["source_requested_sha"] == sha
     assert persisted["source_resolved_sha"] == sha
     assert created_body["spec"]["env"]["PULL_PULL_SHA"] == sha
+    assert created_body["spec"]["priority"] == "nightly"
     assert persisted["fjob_spec"]["env"] == created_body["spec"]["env"]
 
 
@@ -581,11 +645,34 @@ def test_matrix_recurring_submission_preserves_pr_provenance(monkeypatch):
     )
 
     request = SubmitMatrixRequest(
-        project="example",
-        cluster="cluster-a",
-        models=[SubmitMatrixModelInput(key="model-a")],
-        workloads=["workload-a"],
+        project="rhaiis",
+        cluster="mi355x",
+        args=["amd", "vllm", "mi355x"],
+        models=[
+            SubmitMatrixModelInput(
+                key="model-a",
+                label="Model A",
+                workloads=["profile1", "profile4"],
+            ),
+            SubmitMatrixModelInput(
+                key="model-b",
+                label="Model B",
+                workloads=["profile1"],
+            ),
+            # Older clients omit the per-model field and keep the global behavior.
+            SubmitMatrixModelInput(key="model-legacy"),
+            # A selected model with no selected supported profiles is not submitted.
+            SubmitMatrixModelInput(key="model-no-match", workloads=["profile2"]),
+        ],
+        workloads=["profile1", "profile4", "profile5"],
+        matrix_pipeline_key="cpt-rhaiis-3.6-mi355x",
+        version_label="RHAIIS-test",
+        accelerator="amd",
+        engine="vllm",
+        engine_version="vllm:test",
+        configured_model_count=4,
         schedule="0 2 * * *",
+        pull_sha=sha,
         pull_request=PullRequestSelection(
             repository=repository,
             number=321,
@@ -606,12 +693,42 @@ def test_matrix_recurring_submission_preserves_pr_provenance(monkeypatch):
     response = asyncio.run(fournos_api.submit_matrix(request, user=user))
 
     assert response["status"] == "ok"
-    assert len(created) == len(persisted) == 1
-    assert created[0]["spec"]["schedule"] == "0 2 * * *"
-    assert created[0]["spec"]["env"]["PULL_PULL_SHA"] == sha
-    assert persisted[0]["trigger_type"] == "recurring-parent"
-    assert persisted[0]["source_pr_number"] == 321
-    assert persisted[0]["fjob_spec"]["env"] == created[0]["spec"]["env"]
+    assert len(created) == len(persisted) == 3
+    assert all("priority" not in body["spec"] for body in created)
+    assert [
+        body["spec"]["executionEngine"]["forge"]["args"][-2:]
+        for body in created
+    ] == [
+        ["profile1", "profile4"],
+        ["model-b", "profile1"],
+        ["profile4", "profile5"],
+    ]
+    # Model A and B get only their supported profile intersection; legacy
+    # clients still receive the globally selected list.
+    assert created[0]["spec"]["executionEngine"]["forge"]["configOverrides"][
+        "tests.rhaiis.workload_keys"
+    ] == '["profile1", "profile4"]'
+    assert created[1]["spec"]["executionEngine"]["forge"]["configOverrides"][
+        "tests.rhaiis.workload_keys"
+    ] == '["profile1"]'
+    assert created[2]["spec"]["executionEngine"]["forge"]["configOverrides"][
+        "tests.rhaiis.workload_keys"
+    ] == '["profile1", "profile4", "profile5"]'
+    assert [
+        item["cpt_run_metadata"]["workloads"] for item in persisted
+    ] == [
+        ["profile1", "profile4"],
+        ["profile1"],
+        ["profile1", "profile4", "profile5"],
+    ]
+    assert all(body["spec"]["schedule"] == "0 2 * * *" for body in created)
+    assert all(body["spec"]["env"]["PULL_PULL_SHA"] == sha for body in created)
+    assert all(item["trigger_type"] == "recurring-parent" for item in persisted)
+    assert all(item["source_pr_number"] == 321 for item in persisted)
+    assert all(
+        item["fjob_spec"]["env"] == body["spec"]["env"]
+        for item, body in zip(persisted, created)
+    )
 
 
 def test_job_detail_exposes_recorded_pr_association_and_selected_commit():

@@ -13,10 +13,14 @@ import threading
 import urllib.request
 from collections import deque
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, List, Optional
+from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
+from kubernetes.client.rest import ApiException
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from app.core.auth import (
@@ -32,10 +36,13 @@ from app.core.auth import (
 )
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
+from app.models.fournos_job import FournosCptRunJobArchive, FournosJob
 from app.schemas.fournos import (
     ClusterLockResponse,
     ClusterOverviewResponse,
+    FournosLiveJobSummaryResponse,
     CreateClusterLockRequest,
+    EditJobSubmitRequest,
     FournosJobSummary,
     FournosJobDetailResponse,
     GitHubPR,
@@ -69,6 +76,9 @@ from app.services import github_sync_service
 from app.services import slot_hold_service as slot_holds
 from app.schemas.ui_schema import ProjectUiSchemaResponse
 from app.services import fournos_db_service as db_svc
+from app.services import cpt_run_views
+from app.services.job_name_search import compile_job_name_pattern
+from app.services import rhaiis_inference_logs
 from app.services import fournos_k8s_client as k8s
 from app.services import pipeline_definitions
 from app.services import project_adapters
@@ -396,6 +406,7 @@ def _live_job_to_summary(
     spec = job.get("spec", {})
     status = job.get("status", {})
     forge = spec.get("executionEngine", {}).get("forge", {})
+    hardware = spec.get("hardware") or {}
     schedule_parent = meta.get("labels", {}).get(k8s.LABEL_RECURRING_PARENT, "")
 
     return {
@@ -403,10 +414,14 @@ def _live_job_to_summary(
         "project": forge.get("project", ""),
         "preset": " ".join(forge.get("args", [])),
         "cluster": spec.get("cluster", ""),
+        "gpu_type": hardware.get("gpuType") or hardware.get("gpu_type") or None,
+        "gpu_count": hardware.get("gpuCount", hardware.get("gpu_count")),
         "pipeline": spec.get("pipeline", ""),
         "owner": spec.get("owner", "") if include_owner else "",
         "status": status.get("phase", "Pending"),
         "message": status.get("message", ""),
+        "current_step": None,
+        "task_progress": _parse_task_progress(status.get("message", "")),
         "created_at": meta.get("creationTimestamp", ""),
         "completed_at": None,
         "duration_seconds": None,
@@ -418,6 +433,34 @@ def _live_job_to_summary(
         "work_items": work_items or [],
         **extract_source_request_fields(spec),
     }
+
+
+async def _attach_live_job_progress(summaries: list[dict]) -> None:
+    """Best-effort lookup of active Tekton task steps for the live table."""
+    candidates = [
+        summary
+        for summary in summaries
+        if summary.get("status") in ("Running", "Admitted")
+    ]
+    semaphore = asyncio.Semaphore(8)
+
+    async def _current_step(summary: dict) -> Optional[dict]:
+        async with semaphore:
+            try:
+                return await asyncio.to_thread(
+                    k8s.get_current_step_for_job, summary["name"]
+                )
+            except Exception:
+                logger.debug(
+                    "Unable to determine current pipeline step for %s",
+                    summary.get("name", ""),
+                    exc_info=True,
+                )
+                return None
+
+    steps = await asyncio.gather(*(_current_step(item) for item in candidates))
+    for summary, step in zip(candidates, steps):
+        summary["current_step"] = step
 
 
 def _forge_execution_summary(execution: Optional[dict]) -> dict:
@@ -551,10 +594,14 @@ def _db_job_to_fjob_dict(job) -> dict:
     }
 
 
-def _get_live_jobs_sync() -> list:
+def _get_live_jobs_sync(*, raise_on_error: bool = False) -> list:
     from dateutil.parser import parse
 
-    jobs = k8s.list_fournos_jobs()
+    jobs = (
+        k8s.list_fournos_jobs(raise_on_error=True)
+        if raise_on_error
+        else k8s.list_fournos_jobs()
+    )
     parent_subjects = {
         job.get("metadata", {}).get("name", ""): _live_job_requester_subject(job)
         for job in jobs
@@ -596,8 +643,8 @@ def _get_live_jobs_sync() -> list:
     return visible
 
 
-async def _get_live_jobs() -> list:
-    return await asyncio.to_thread(_get_live_jobs_sync)
+async def _get_live_jobs(*, raise_on_error: bool = False) -> list:
+    return await asyncio.to_thread(_get_live_jobs_sync, raise_on_error=raise_on_error)
 
 
 # _merge_pipeline_stages moved to pipeline_definitions.merge_pipeline_stages
@@ -790,6 +837,7 @@ async def list_jobs(
         total = len(summaries)
         offset = (page - 1) * per_page
         summaries = summaries[offset: offset + per_page]
+        await _attach_live_job_progress(summaries)
     else:
         created_after = _parse_iso_utc(start_time)
         created_before = _parse_iso_utc(end_time)
@@ -828,6 +876,69 @@ async def list_jobs(
         "page": page,
         "per_page": per_page,
     }
+
+
+@router.get("/jobs/live-summary", response_model=FournosLiveJobSummaryResponse)
+async def live_jobs_summary():
+    """Return aggregate active-job counts for the Overview page."""
+    terminal_phases = {"Succeeded", "Failed", "Stopped", "Cancelled", "Completed"}
+    queued_phases = {"Pending", "Resolving", "Admitted"}
+    by_status: dict[str, int] = {}
+    by_cluster: dict[str, dict[str, int]] = {}
+    for job in await _get_live_jobs():
+        phase = str((job.get("status") or {}).get("phase") or "Pending")
+        if phase in terminal_phases:
+            continue
+        by_status[phase] = by_status.get(phase, 0) + 1
+
+        cluster = str((job.get("spec") or {}).get("cluster") or "").strip() or "Unassigned"
+        counts = by_cluster.setdefault(cluster, {"queued": 0, "running": 0, "active": 0})
+        counts["active"] += 1
+        if phase in queued_phases:
+            counts["queued"] += 1
+        elif phase == "Running":
+            counts["running"] += 1
+
+    return {
+        "total": sum(by_status.values()),
+        "by_status": by_status,
+        "by_cluster": by_cluster,
+    }
+
+
+@router.get("/jobs/name-search")
+async def search_job_names(q: str = Query(..., min_length=1, max_length=128)):
+    """Return matching live and archived FournosJob names for autocomplete."""
+    try:
+        matcher = compile_job_name_pattern(q)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+    items: list[dict[str, str]] = []
+    seen: set[str] = set()
+    live_jobs = await asyncio.to_thread(k8s.list_fournos_jobs)
+    for job in live_jobs:
+        metadata = job.get("metadata") or {}
+        name = str(metadata.get("name") or "")
+        if name and name not in seen and matcher.search(name):
+            seen.add(name)
+            items.append({
+                "name": name,
+                "status": str((job.get("status") or {}).get("phase") or "Live"),
+                "source": "Live",
+            })
+            if len(items) >= 20:
+                return {"items": items}
+
+    async with AsyncSessionLocal() as session:
+        archived = await db_svc.search_jobs_by_name_pattern(
+            session, q, limit=20 - len(items)
+        )
+    for job in archived:
+        if job["name"] and job["name"] not in seen:
+            seen.add(job["name"])
+            items.append({**job, "source": "History"})
+    return {"items": items}
 
 
 @router.get(
@@ -1293,6 +1404,63 @@ async def get_job(job_name: str, request: Request):
     }
 
 
+def _rhaiis_inference_logs_job_eligible(job: dict) -> bool:
+    return (
+        (job.get("status") or {}).get("phase") == "Running"
+        and _extract_forge_info(job).get("project") == "rhaiis"
+        and rhaiis_inference_logs.get_inference_service_reference(job) is not None
+    )
+
+
+def _is_rhaiis_testing_step(step: dict | None) -> bool:
+    if not step:
+        return False
+    name = str(step.get("displayName") or step.get("name") or "")
+    tokens = re.findall(r"[a-z0-9]+", name.lower())
+    return "test" in tokens or "testing" in tokens
+
+
+async def _rhaiis_inference_logs_available(job_name: str, job: dict | None = None) -> bool:
+    if job is None:
+        job = await asyncio.to_thread(k8s.get_fournos_job, job_name)
+    if not job or not _rhaiis_inference_logs_job_eligible(job):
+        return False
+    try:
+        step = await asyncio.to_thread(k8s.get_current_step_for_job, job_name)
+    except Exception:
+        logger.debug("Could not determine current RHAIIS test step for %s", job_name, exc_info=True)
+        return False
+    return _is_rhaiis_testing_step(step)
+
+
+@router.get("/jobs/{job_name}/inference-logs/availability")
+async def inference_logs_availability(job_name: str, _=Depends(require_auth)):
+    return {"available": await _rhaiis_inference_logs_available(job_name)}
+
+
+@router.get("/jobs/{job_name}/inference-logs")
+async def get_rhaiis_inference_logs(
+    job_name: str, response: Response, _=Depends(require_auth)
+):
+    response.headers["Cache-Control"] = "no-store"
+    job = await asyncio.to_thread(k8s.get_fournos_job, job_name)
+    if not job:
+        raise HTTPException(404, "FournosJob not found")
+    if not _rhaiis_inference_logs_job_eligible(job):
+        raise HTTPException(409, "Inference logs are available only while the RHAIIS run is active")
+    if not await _rhaiis_inference_logs_available(job_name, job):
+        raise HTTPException(409, "Inference logs are available only during the RHAIIS testing step")
+    try:
+        return await asyncio.to_thread(
+            rhaiis_inference_logs.get_inference_server_logs,
+            job,
+            k8s.get_secret,
+            tail_lines=300,
+        )
+    except rhaiis_inference_logs.InferenceLogsError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+
+
 @router.get("/jobs/{job_name}/events", response_model=List[JobEventResponse])
 async def get_job_events(job_name: str):
     async with AsyncSessionLocal() as session:
@@ -1347,7 +1515,11 @@ async def rerun_job(job_name: str, user=Depends(require_admin)):
     forge = spec.get("executionEngine", {}).get("forge", {})
     project = forge.get("project", "unknown")
     spec.pop("shutdown", None)
+    spec.setdefault("ttl", settings.FOURNOS_DEFAULT_JOB_TTL)
     spec["owner"] = _verified_owner(user)
+    cpt_run_id, cpt_run_metadata = cpt_run_views.build_new_cpt_attempt(
+        source_db_job, spec, spec["owner"]
+    )
 
     new_name = k8s.sanitize_job_name("forge-{}".format(project))
     body = {
@@ -1358,7 +1530,13 @@ async def rerun_job(job_name: str, user=Depends(require_admin)):
         "metadata": {
             "name": new_name,
             "namespace": settings.FOURNOS_NAMESPACE,
-            "annotations": requester_annotations(user),
+            "annotations": {
+                **requester_annotations(user),
+                **(
+                    {"psap-control-center.openshift-psap.org/cpt-run-id": cpt_run_id}
+                    if cpt_run_id else {}
+                ),
+            },
         },
         "spec": spec,
     }
@@ -1386,6 +1564,8 @@ async def rerun_job(job_name: str, user=Depends(require_admin)):
                 status=initial_status,
                 config_overrides=forge.get("configOverrides", {}),
                 fjob_spec=spec,
+                cpt_run_id=cpt_run_id,
+                cpt_run_metadata=cpt_run_metadata,
                 trigger_type=(
                     "recurring-parent" if spec.get("schedule")
                     else "deferred" if spec.get("scheduledStartTime")
@@ -1431,6 +1611,134 @@ async def rerun_job(job_name: str, user=Depends(require_admin)):
                 cleanup_exc,
             )
         raise HTTPException(500, str(exc))
+
+
+@router.post("/jobs/{job_name}/edit-submit", response_model=SubmitJobResponse)
+async def edit_and_submit_job(
+    job_name: str,
+    req: EditJobSubmitRequest,
+    user=Depends(require_admin),
+):
+    """Create a new one-off job from an edited copy of an existing Forge spec."""
+    source_spec = req.spec
+    if not isinstance(source_spec, dict):
+        raise HTTPException(400, "A FournosJob spec object is required")
+    spec = dict(source_spec)
+    execution_engine = spec.get("executionEngine") or {}
+    forge = execution_engine.get("forge") if isinstance(execution_engine, dict) else None
+    if not isinstance(forge, dict) or not str(forge.get("project") or "").strip():
+        raise HTTPException(400, "Edit & submit currently supports Forge jobs only")
+    cluster = str(spec.get("cluster") or "").strip()
+    pipeline = str(spec.get("pipeline") or "").strip()
+    if not cluster or not pipeline:
+        raise HTTPException(400, "Cluster and pipeline are required")
+    if spec.get("schedule") or spec.get("scheduledStartTime"):
+        raise HTTPException(
+            400,
+            "Edit & submit creates a one-off job; use the scheduling controls separately.",
+        )
+    if not isinstance(forge.get("args", []), list) or not isinstance(
+        forge.get("configOverrides", {}), dict
+    ):
+        raise HTTPException(400, "Forge args and configOverrides must be valid lists/objects")
+
+    source_db_job = None
+    async with AsyncSessionLocal() as session:
+        source_db_job = await db_svc.get_job_by_name(session, job_name)
+        source_work_items = (
+            db_svc.serialize_work_items(source_db_job) if source_db_job else []
+        )
+        source_run_group_ids = (
+            [membership.group_id for membership in source_db_job.group_memberships or []]
+            if source_db_job else []
+        )
+    source_live_job = await asyncio.to_thread(k8s.get_fournos_job, job_name)
+    if source_db_job is None and source_live_job is None:
+        raise HTTPException(404, "Source FournosJob not found")
+
+    owner = _verified_owner(user)
+    project = str(forge["project"]).strip()
+    spec.pop("shutdown", None)
+    spec["owner"] = owner
+    spec.setdefault("ttl", settings.FOURNOS_DEFAULT_JOB_TTL)
+    cpt_run_id, cpt_run_metadata = cpt_run_views.build_new_cpt_attempt(
+        source_db_job, spec, owner
+    )
+    new_name = k8s.sanitize_job_name("forge-{}".format(project))
+    body = {
+        "apiVersion": "{}/{}".format(
+            settings.FOURNOS_API_GROUP, settings.FOURNOS_API_VERSION
+        ),
+        "kind": "FournosJob",
+        "metadata": {
+            "name": new_name,
+            "namespace": settings.FOURNOS_NAMESPACE,
+            "annotations": {
+                **requester_annotations(user),
+                **(
+                    {"psap-control-center.openshift-psap.org/cpt-run-id": cpt_run_id}
+                    if cpt_run_id else {}
+                ),
+            },
+        },
+        "spec": spec,
+    }
+    args = [str(item) for item in forge.get("args", [])]
+    config_overrides = forge.get("configOverrides", {})
+    source_fields = extract_source_request_fields(spec)
+    initial_status = "Pending"
+    try:
+        async with AsyncSessionLocal() as session, session.begin():
+            db_job = await db_svc.upsert_job(
+                session,
+                name=new_name,
+                project=project,
+                preset=" ".join(args),
+                cluster=cluster,
+                pipeline=pipeline,
+                owner=owner,
+                requester_subject=user.get("subject", ""),
+                requester_email=user.get("email", ""),
+                requester_name=user.get("name", ""),
+                auth_provider=user.get("auth_provider", ""),
+                status=initial_status,
+                config_overrides=config_overrides,
+                fjob_spec=spec,
+                cpt_run_id=cpt_run_id,
+                cpt_run_metadata=cpt_run_metadata,
+                trigger_type="manual",
+                **source_fields,
+            )
+            if source_work_items:
+                await db_svc.replace_work_items(
+                    session, db_job, source_work_items,
+                    created_by_subject=str(user.get("subject") or ""),
+                )
+            if source_run_group_ids:
+                await db_svc.replace_run_groups(
+                    session, db_job, source_run_group_ids,
+                    created_by_subject=str(user.get("subject") or ""),
+                    allow_archived=True,
+                )
+    except Exception as exc:
+        logger.error("Could not persist edited submission %s: %s", new_name, exc)
+        raise HTTPException(500, "Failed to persist edited job submission") from exc
+
+    try:
+        created = await asyncio.to_thread(k8s.create_fournos_job, body)
+        created_name = created.get("metadata", {}).get("name", new_name)
+    except Exception as exc:
+        try:
+            async with AsyncSessionLocal() as session, session.begin():
+                await db_svc.delete_job_by_name(session, new_name)
+        except Exception as cleanup_exc:
+            logger.error("Failed to remove provisional edited job %s: %s", new_name, cleanup_exc)
+        raise HTTPException(500, "Failed to create FournosJob: {}".format(exc)) from exc
+    return {
+        "status": "ok",
+        "job_name": created_name,
+        "redirect": "/testing/jobs/{}".format(created_name),
+    }
 
 
 @router.delete("/history/{job_name}")
@@ -1638,8 +1946,8 @@ async def submit_job(req: SubmitJobRequest, user=Depends(require_auth)):
         "displayName": display_name,
         "owner": owner,
         "pipeline": req.pipeline,
+        "ttl": settings.FOURNOS_DEFAULT_JOB_TTL,
         "exclusive": req.exclusive,
-        "priority": req.priority,
         "executionEngine": {
             "forge": {
                 "project": req.project,
@@ -1648,6 +1956,8 @@ async def submit_job(req: SubmitJobRequest, user=Depends(require_auth)):
             }
         },
     }
+    if req.priority and req.priority.strip():
+        spec["priority"] = req.priority.strip()
     if req.gpu_type.strip():
         spec["hardware"] = {
             "gpuType": req.gpu_type.strip(),
@@ -1751,6 +2061,214 @@ async def submit_job(req: SubmitJobRequest, user=Depends(require_auth)):
     }
 
 
+# ─── routes: matrix/CPT tracking ────────────────────────────────────────
+
+async def _load_cpt_run_groups() -> list[dict[str, Any]]:
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(FournosJob)
+            .where(FournosJob.cpt_run_id.is_not(None))
+            .order_by(FournosJob.created_at.desc())
+        )
+        jobs = result.scalars().all()
+        archive_result = await session.execute(
+            select(FournosCptRunJobArchive).order_by(
+                FournosCptRunJobArchive.created_at.desc()
+            )
+        )
+        archive_jobs = archive_result.scalars().all()
+
+    tracked_pairs = {(job.name, job.cpt_run_id) for job in jobs}
+    for archived in archive_jobs:
+        # A live watcher record wins for real jobs; archive-only rows fill in
+        # failed submissions and jobs that were absent when the backfill ran.
+        if archived.job_name and (archived.job_name, archived.run_id) in tracked_pairs:
+            continue
+        metadata = dict(archived.cpt_run_metadata or {})
+        jobs.append(SimpleNamespace(
+            name=archived.job_name or "",
+            job_name=archived.job_name,
+            cpt_run_id=archived.run_id,
+            cpt_run_metadata=metadata,
+            submission_status=archived.submission_status,
+            status=archived.status,
+            message=archived.message,
+            created_at=archived.created_at,
+            owner=metadata.get("owner", ""),
+            preset=archived.model_preset,
+            stop_requested_at=archived.stop_requested_at,
+            cpt_stop_message=archived.stop_message,
+        ))
+    return cpt_run_views.build_cpt_run_groups(list(jobs))
+
+
+@router.get("/cpt-runs")
+async def list_cpt_runs(
+    project: str = Query("", max_length=255),
+    version: str = Query("", max_length=128),
+    accelerator: str = Query("", max_length=100),
+    cluster: str = Query("", max_length=255),
+    owner: str = Query("", max_length=255),
+    show_stopped: bool = False,
+):
+    groups = await _load_cpt_run_groups()
+    matching = cpt_run_views.filter_cpt_run_groups(
+        groups,
+        project=project,
+        version=version,
+        accelerator=accelerator,
+        cluster=cluster,
+        owner=owner,
+        show_stopped=show_stopped,
+    )
+    return {
+        "projects": sorted({group["project"] for group in groups if group["project"]}),
+        "groups": matching,
+        "hidden_stopped_count": sum(
+            group["status"] == "Stopped"
+            for group in cpt_run_views.filter_cpt_run_groups(
+                groups,
+                project=project,
+                version=version,
+                accelerator=accelerator,
+                cluster=cluster,
+                owner=owner,
+                show_stopped=True,
+            )
+        ),
+        "filter_options": {
+            "versions": sorted({group["version_label"] for group in groups if group["version_label"]}, key=str.casefold),
+            "accelerators": sorted({group["accelerator"] for group in groups if group["accelerator"]}, key=str.casefold),
+            "clusters": sorted({group["cluster"] for group in groups if group["cluster"]}, key=str.casefold),
+            "owners": sorted({owner for group in groups for owner in group["owners"] if owner}, key=str.casefold),
+        },
+    }
+
+
+@router.get("/cpt-runs/{group_id}")
+async def get_cpt_run_group(group_id: str):
+    groups = await _load_cpt_run_groups()
+    group = next((item for item in groups if item["id"] == group_id), None)
+    if group is None:
+        raise HTTPException(404, "CPT run group not found")
+    return group
+
+
+@router.post("/cpt-runs/groups/{group_id}/stop")
+async def stop_cpt_run_group(group_id: str, _=Depends(require_admin)):
+    """Request stop for active matrix children and record the request promptly."""
+    groups = await _load_cpt_run_groups()
+    group = next((item for item in groups if item["id"] == group_id), None)
+    if group is None:
+        raise HTTPException(404, "CPT run group not found")
+
+    now = datetime.now(timezone.utc)
+    results: list[dict[str, str]] = []
+    semaphore = asyncio.Semaphore(8)
+
+    async def stop_one(job_name: str) -> dict[str, str]:
+        async with semaphore:
+            try:
+                await asyncio.to_thread(k8s.shutdown_fournos_job, job_name)
+                was_missing = False
+            except ApiException as exc:
+                if exc.status != 404:
+                    return {"job_name": job_name, "status": "error", "message": str(exc)}
+                was_missing = True
+            except Exception as exc:
+                return {"job_name": job_name, "status": "error", "message": str(exc)}
+
+            async with AsyncSessionLocal() as session, session.begin():
+                db_job = await db_svc.get_job_by_name(session, job_name)
+                if db_job is not None and db_job.cpt_run_id is not None:
+                    db_job.cpt_stop_requested_at = now
+                    db_job.cpt_stop_message = "Stop requested from the CPT Jobs page."
+                    if was_missing:
+                        db_job.status = "Stopped"
+                        db_job.completed_at = db_job.completed_at or now
+                        db_job.message = "FournosJob was already absent from Kubernetes."
+                else:
+                    archive_result = await session.execute(
+                        select(FournosCptRunJobArchive).where(
+                            FournosCptRunJobArchive.job_name == job_name
+                        )
+                    )
+                    archive_jobs = archive_result.scalars().all()
+                    if not archive_jobs:
+                        return {"job_name": job_name, "status": "missing", "message": "CPT tracking row not found"}
+                    for archive_job in archive_jobs:
+                        archive_job.stop_requested_at = now
+                        archive_job.stop_message = "Stop requested from the CPT Jobs page."
+                        if was_missing:
+                            archive_job.status = "Stopped"
+                            archive_job.message = "FournosJob was already absent from Kubernetes."
+                await session.flush()
+            return {
+                "job_name": job_name,
+                "status": "stopped" if was_missing else "stop requested",
+                "message": "",
+            }
+
+    results = await asyncio.gather(*(stop_one(name) for name in group["active_jobs"]))
+    return {
+        "status": "ok",
+        "requested": sum(item["status"] in {"stopped", "stop requested"} for item in results),
+        "failed": sum(
+            item["status"] not in {"stopped", "stop requested"}
+            for item in results
+        ),
+        "jobs": results,
+    }
+
+
+@router.post("/cpt-runs/{run_id}/version")
+async def update_cpt_run_version(run_id: str, request: Request, _=Depends(require_admin)):
+    """Correct the display version for one tracked matrix submission."""
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(400, "A JSON request body is required") from exc
+    version_label = payload.get("version_label") if isinstance(payload, dict) else None
+    if not isinstance(version_label, str) or not version_label.strip():
+        raise HTTPException(400, "Version label cannot be empty")
+    version_label = version_label.strip()
+    if len(version_label) > 128:
+        raise HTTPException(400, "Version label must be 128 characters or fewer")
+
+    async with AsyncSessionLocal() as session, session.begin():
+        result = await session.execute(
+            select(FournosJob).where(FournosJob.cpt_run_id == run_id)
+        )
+        jobs = result.scalars().all()
+        archive_result = await session.execute(
+            select(FournosCptRunJobArchive).where(
+                FournosCptRunJobArchive.run_id == run_id
+            )
+        )
+        archive_jobs = archive_result.scalars().all()
+        if not jobs and not archive_jobs:
+            raise HTTPException(404, "CPT submission not found")
+        for job in jobs:
+            metadata = dict(job.cpt_run_metadata or {})
+            metadata["version_label"] = version_label
+            job.cpt_run_metadata = metadata
+        for archive_job in archive_jobs:
+            metadata = dict(archive_job.cpt_run_metadata or {})
+            metadata["version_label"] = version_label
+            archive_job.cpt_run_metadata = metadata
+        await session.flush()
+
+    groups = await _load_cpt_run_groups()
+    group = next((item for item in groups if any(
+        attempt["id"] == run_id for attempt in item["attempts"]
+    )), None)
+    return {
+        "status": "ok",
+        "version_label": version_label,
+        "group_id": group["id"] if group else "",
+    }
+
+
 # ─── routes: matrix (pipeline/CPT-style) submission ─────────────────────
 #
 # Generic across every project that declares a `kind: matrix` mode in its
@@ -1758,11 +2276,19 @@ async def submit_job(req: SubmitJobRequest, user=Depends(require_auth)):
 
 @router.post("/submit-matrix", response_model=SubmitMatrixResponse)
 async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
-    """Submit a matrix pipeline — creates one FournosJob per model, each
-    carrying all of the selected workloads plus the shared args/overrides.
+    """Submit one FournosJob per selected model with supported workloads.
+
+    Model-specific workload availability is intersected with the request's
+    globally selected workload columns. Older clients that omit availability
+    retain the previous all-models-by-all-workloads behavior.
     """
     if not req.models or not req.workloads:
         raise HTTPException(400, "models and workloads are required")
+    if req.project.strip().lower() == "rhaiis" and req.matrix_pipeline_key.strip():
+        if not req.version_label.strip():
+            raise HTTPException(400, "Version label is required for RHAIIS CPT submissions")
+        if not req.engine_version.strip():
+            raise HTTPException(400, "Engine image/version is required for RHAIIS CPT submissions")
 
     owner = _verified_owner(user)
     try:
@@ -1785,13 +2311,26 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
     source_env, source_fields = await _resolve_source_request(
         req.pull_request, resolved_pull_sha
     )
+    selected_models: list[tuple[Any, list[str]]] = []
+    for model_item in req.models:
+        available = set(model_item.workloads or req.workloads)
+        model_workloads = [
+            workload for workload in req.workloads if workload in available
+        ]
+        if model_workloads:
+            selected_models.append((model_item, model_workloads))
+    if not selected_models:
+        raise HTTPException(
+            400, "No selected models support any of the selected workloads"
+        )
+
     model_prefixes = [
         re.sub(
             r"[^a-z0-9-]",
             "-",
             "{}-{}".format(req.project, model_item.key).lower(),
         )
-        for model_item in req.models
+        for model_item, _ in selected_models
     ]
     job_names = [k8s.sanitize_job_name(prefix) for prefix in model_prefixes]
     if (
@@ -1802,8 +2341,34 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
             400, "models must produce unique Kubernetes job names"
         )
     results = []
-    for model_item, job_name in zip(req.models, job_names):
-        args = list(req.args) + [model_item.key] + list(req.workloads)
+    cpt_run_id = str(uuid4()) if req.matrix_pipeline_key.strip() else None
+    run_started_at = datetime.now(timezone.utc).isoformat()
+    cpt_run_base = {
+        "project": req.project,
+        "pipeline_key": req.matrix_pipeline_key.strip(),
+        "version_label": req.version_label.strip() or "Unspecified",
+        "cluster": req.cluster,
+        "accelerator": req.accelerator.strip(),
+        "engine": req.engine.strip(),
+        "engine_version": req.engine_version.strip(),
+        "fournos_pipeline": req.pipeline,
+        "forge_source": (
+            source_fields.get("source_requested_sha")
+            or source_fields.get("source_resolved_sha")
+            or resolved_pull_sha
+            or ("main" if req.use_latest_main else "Unknown")
+        ),
+        "owner": owner,
+        "configured_model_count": (
+            req.configured_model_count
+            if req.configured_model_count is not None
+            else len(req.models)
+        ),
+        "workloads": list(req.workloads),
+        "started_at": run_started_at,
+    }
+    for (model_item, model_workloads), job_name in zip(selected_models, job_names):
+        args = list(req.args) + [model_item.key] + model_workloads
 
         job_overrides: dict[str, Any] = dict(req.config_overrides)
         job_overrides.update({k: v for k, v in model_item.overrides.items()})
@@ -1811,19 +2376,25 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
             req.project, job_overrides
         )
         project_adapters.add_matrix_workload_override(
-            req.project, job_overrides, req.workloads
+            req.project, job_overrides, model_workloads
         )
 
         display_name = "{}-{}-{}".format(req.project, model_item.key, req.cluster)
         env = dict(source_env)
+        cpt_run_metadata = {
+            **cpt_run_base,
+            "model_key": model_item.key,
+            "model_name": model_item.label.strip() or model_item.key,
+            "workloads": list(model_workloads),
+        } if cpt_run_id else {}
 
         spec: dict[str, Any] = {
             "cluster": req.cluster,
             "displayName": display_name,
             "owner": owner,
             "pipeline": req.pipeline,
+            "ttl": settings.FOURNOS_DEFAULT_JOB_TTL,
             "exclusive": req.exclusive,
-            "priority": req.priority,
             "executionEngine": {
                 "forge": {
                     "project": req.project,
@@ -1832,6 +2403,8 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
                 }
             },
         }
+        if req.priority and req.priority.strip():
+            spec["priority"] = req.priority.strip()
         if req.gpu_type.strip() or model_item.gpu_count:
             spec["hardware"] = {
                 "gpuType": req.gpu_type.strip() or "unknown",
@@ -1847,7 +2420,13 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
             "metadata": {
                 "name": job_name,
                 "namespace": settings.FOURNOS_NAMESPACE,
-                "annotations": requester_annotations(user),
+                "annotations": {
+                    **requester_annotations(user),
+                    **(
+                        {"psap-control-center.openshift-psap.org/cpt-run-id": cpt_run_id}
+                        if cpt_run_id else {}
+                    ),
+                },
             },
             "spec": spec,
         }
@@ -1865,7 +2444,7 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
                     session,
                     name=job_name,
                     project=req.project,
-                    preset="{} {}".format(model_item.key, " ".join(req.workloads)),
+                    preset="{} {}".format(model_item.key, " ".join(model_workloads)),
                     cluster=req.cluster,
                     pipeline=req.pipeline,
                     owner=owner,
@@ -1876,6 +2455,8 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
                     status=initial_status,
                     config_overrides=job_overrides,
                     fjob_spec=body.get("spec", {}),
+                    cpt_run_id=cpt_run_id,
+                    cpt_run_metadata=cpt_run_metadata,
                     trigger_type=(
                         "recurring-parent" if req.schedule
                         else "deferred" if req.scheduled_start_time
@@ -1921,7 +2502,14 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
         except Exception as exc:
             try:
                 async with AsyncSessionLocal() as session, session.begin():
-                    await db_svc.delete_job_by_name(session, job_name)
+                    if cpt_run_id:
+                        db_job = await db_svc.get_job_by_name(session, job_name)
+                        if db_job is not None:
+                            db_job.status = "Failed"
+                            db_job.message = "FournosJob submission failed: {}".format(exc)
+                            db_job.completed_at = datetime.now(timezone.utc)
+                    else:
+                        await db_svc.delete_job_by_name(session, job_name)
             except Exception as cleanup_exc:
                 logger.error(
                     "Failed to remove provisional matrix job %s: %s",
@@ -1934,7 +2522,12 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
                 "error": str(exc),
             })
 
-    return {"status": "ok", "jobs": results, "total": len(results)}
+    return {
+        "status": "ok",
+        "jobs": results,
+        "total": len(results),
+        "cpt_run_id": cpt_run_id,
+    }
 
 
 # ─── routes: projects ───────────────────────────────────────────────────
@@ -2402,13 +2995,13 @@ async def delete_cluster_lock(name: str, _=Depends(require_admin)):
 
 @router.get("/clusters/{cluster}/overview", response_model=ClusterOverviewResponse)
 async def cluster_overview(cluster: str, request: Request):
-    """Backs the "Defer / Recurring / Lock cluster" popup on the Submit
-    page: what's running on this cluster now, what recurs on it, and what
-    locks (active or scheduled) it has — all live from the fournos
-    namespace, so it's always consistent with the Live Jobs and Schedules
+    """Backs the Submit page's live cluster activity and scheduling views.
+
+    Current jobs are read live from the Fournos namespace, so the queue and
+    running-job summary stays consistent with the Live Jobs and Schedules
     tabs.
     """
-    all_jobs = await _get_live_jobs()
+    all_jobs = await _get_live_jobs(raise_on_error=True)
     current = [
         j for j in all_jobs if j.get("spec", {}).get("cluster") == cluster
     ]
@@ -2416,12 +3009,14 @@ async def cluster_overview(cluster: str, request: Request):
     recurring = [j for j in recurring if j.get("spec", {}).get("cluster") == cluster]
     locks = await asyncio.to_thread(k8s.list_cluster_locks, None, cluster)
     include_owner = get_current_user(request) is not None
+    current_summaries = [
+        _live_job_to_summary(j, include_owner=include_owner) for j in current
+    ]
+    await _attach_live_job_progress(current_summaries)
 
     return {
         "cluster": cluster,
-        "current_jobs": [
-            _live_job_to_summary(j, include_owner=include_owner) for j in current
-        ],
+        "current_jobs": current_summaries,
         "recurring_jobs": _sort_latest(
             [
                 _recurring_job_to_response(j, include_owner=include_owner)

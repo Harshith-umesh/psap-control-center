@@ -576,6 +576,41 @@ async def list_jobs(
     return jobs, total
 
 
+async def search_jobs_by_name_pattern(
+    session: AsyncSession, pattern: str, *, limit: int = 20
+) -> list[dict[str, str]]:
+    """Return newest archived job names matching a case-insensitive regex."""
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        stmt = (
+            select(FournosJob.name, FournosJob.status)
+            .where(FournosJob.name.op("~*")(pattern))
+            .order_by(FournosJob.created_at.desc())
+            .limit(limit)
+        )
+        result = await session.execute(stmt)
+        return [
+            {"name": name, "status": status or "Unknown"}
+            for name, status in result.all()
+        ]
+
+    # SQLite local development has no PostgreSQL regex operator. Job names
+    # are short; inspect a bounded recent window and apply the validated
+    # pattern in Python rather than silently changing regex semantics.
+    from app.services.job_name_search import compile_job_name_pattern
+
+    matcher = compile_job_name_pattern(pattern)
+    result = await session.execute(
+        select(FournosJob.name, FournosJob.status)
+        .order_by(FournosJob.created_at.desc())
+        .limit(5000)
+    )
+    return [
+        {"name": name, "status": status or "Unknown"}
+        for name, status in result.all()
+        if matcher.search(name or "")
+    ][:limit]
+
+
 async def get_history_preference(
     session: AsyncSession, subject: str
 ) -> Optional[FournosHistoryPreference]:

@@ -93,6 +93,14 @@ class FournosJob(Base):
     # can collide with real deferred jobs) so the History tab can exclude
     # locks the same way it excludes recurring-parent templates.
     is_lock = Column(Boolean, default=False, index=True)
+    # Matrix/CPT submissions are tracked separately from ordinary FournosJobs.
+    # Every child carries the submission id and a snapshot of its dimensions so
+    # the CPT view can aggregate old and new attempts even after the live FJob
+    # has been archived from Kubernetes.
+    cpt_run_id = Column(String(36), nullable=True, index=True)
+    cpt_run_metadata = Column(_JSON, nullable=False, default=dict)
+    cpt_stop_requested_at = Column(DateTime(timezone=True), nullable=True)
+    cpt_stop_message = Column(Text, default="")
 
     events = relationship(
         "FournosJobEvent",
@@ -139,10 +147,45 @@ class FournosJob(Base):
             "ix_fournos_jobs_history",
             "status", "is_lock", "trigger_type", "completed_at",
         ),
+        Index("ix_fournos_jobs_cpt_run_created", "cpt_run_id", "created_at"),
     )
 
     def __repr__(self):
         return f"<FournosJob({self.name} status={self.status})>"
+
+
+class FournosCptRunJobArchive(Base):
+    """CPT submission rows retained by the FourNos dashboard.
+
+    Most entries point at a FournosJob and are enriched by the regular job
+    watcher. Rows with no job name are still useful: they represent models
+    whose FournosJob could not be created and must remain visible as failed
+    submissions in the CPT matrix.
+    """
+
+    __tablename__ = "fournos_cpt_run_job_archive"
+
+    id = Column(String(36), primary_key=True)
+    run_id = Column(String(36), nullable=False, index=True)
+    position = Column(Integer, nullable=False, default=0)
+    job_name = Column(String(255), nullable=True, index=True)
+    model_name = Column(String(512), default="")
+    model_preset = Column(String(512), default="")
+    workloads = Column(_JSON, nullable=False, default=list)
+    submission_status = Column(String(50), default="Submitting")
+    status = Column(String(50), default="Pending", index=True)
+    message = Column(Text, default="")
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+    cpt_run_metadata = Column(_JSON, nullable=False, default=dict)
+    stop_requested_at = Column(DateTime(timezone=True), nullable=True)
+    stop_message = Column(Text, default="")
+
+    __table_args__ = (
+        Index("ix_fournos_cpt_archive_run_created", "run_id", "created_at"),
+    )
 
 
 class FournosJobEvent(Base):

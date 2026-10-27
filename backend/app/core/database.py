@@ -92,6 +92,10 @@ _MIGRATIONS = [
     ("fournos_jobs", "source_head_branch", "VARCHAR(255)"),
     ("fournos_jobs", "source_requested_sha", "VARCHAR(64)"),
     ("fournos_jobs", "source_resolved_sha", "VARCHAR(64)"),
+    ("fournos_jobs", "cpt_run_id", "VARCHAR(36)"),
+    ("fournos_jobs", "cpt_run_metadata", "JSONB NOT NULL DEFAULT '{}'"),
+    ("fournos_jobs", "cpt_stop_requested_at", "TIMESTAMP WITH TIME ZONE"),
+    ("fournos_jobs", "cpt_stop_message", "TEXT NOT NULL DEFAULT ''"),
     ("fournos_jobs", "forge_execution", "JSONB"),
     ("fournos_jobs", "forge_provenance_state", "VARCHAR(50) NOT NULL DEFAULT 'pending'"),
     ("fournos_jobs", "forge_provenance_attempts", "INTEGER NOT NULL DEFAULT 0"),
@@ -152,6 +156,11 @@ _INDEXES = [
     ("ix_fournos_jobs_source_pr_number", "fournos_jobs", "source_pr_number"),
     ("ix_fournos_jobs_source_requested_sha", "fournos_jobs", "source_requested_sha"),
     ("ix_fournos_jobs_source_resolved_sha", "fournos_jobs", "source_resolved_sha"),
+    (
+        "ix_fournos_jobs_cpt_run_created",
+        "fournos_jobs",
+        "cpt_run_id, created_at",
+    ),
     ("ix_fournos_jobs_failure_outcome", "fournos_jobs", "failure_outcome"),
     (
         "ix_fournos_jobs_source_pr",
@@ -301,6 +310,7 @@ async def init_db():
     from app.models.instance_type_rate import InstanceTypeRate  # noqa: F401
     from app.models.cost_snapshot import CostSnapshot  # noqa: F401
     from app.models.fournos_job import (  # noqa: F401
+        FournosCptRunJobArchive,
         FournosHistoryPreference,
         FournosJob,
         FournosJobEvent,

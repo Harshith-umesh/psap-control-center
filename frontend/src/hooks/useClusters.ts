@@ -6,10 +6,11 @@ import { createLogger } from '../utils/logger'
 
 const logger = createLogger('Clusters')
 
-export function useClusters(activeOnly = false) {
+export function useClusters(activeOnly = false, enabled = true) {
   return useQuery({
     queryKey: ['clusters', { activeOnly }],
     queryFn: () => clusterApi.list(activeOnly),
+    enabled,
   })
 }
 

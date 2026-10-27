@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     FOURNOS_API_VERSION: str = "v1"
     FOURNOS_JOB_PLURAL: str = "fournosjobs"
     FOURNOS_K8S_TIMEOUT: int = 30
+    FOURNOS_DEFAULT_JOB_TTL: str = "12h"
+    TARGET_CLUSTER_SECRETS_NAMESPACE: str = "psap-secrets"
+    # Optional read-only source used by the one-time Fournos history backfill.
+    FOURNOS_ARCHIVE_DATABASE_URL: Optional[str] = None
 
     # Tekton CRD settings
     TEKTON_API_GROUP: str = "tekton.dev"

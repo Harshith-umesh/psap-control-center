@@ -193,8 +193,15 @@ the configured namespaces:
 - In `FOURNOS_NAMESPACE` (default: `psap-automation`), read access to
   `fournosjobs.fournos.dev`, `pipelineruns.tekton.dev`,
   `taskruns.tekton.dev`, Pods, and the Pod log subresource.
+- Set `FOURNOS_NAMESPACE` to the same value configured on the Fournos UI
+  deployment; the Control Center watcher archives jobs from this namespace.
 - Testing actions additionally require the corresponding `create`, `patch`, or
   `delete` permission on `fournosjobs.fournos.dev`.
+- RHAIIS inference-server logs additionally require `get` access to the
+  target-cluster kubeconfig Secrets in `TARGET_CLUSTER_SECRETS_NAMESPACE`
+  (default: `psap-secrets`). The log API is authenticated and reads only the
+  Secret named `kubeconfig-<cluster>` for a currently running RHAIIS job; it
+  never returns credential data to the browser.
 
 Use the same kubeconfig that will be supplied to Control Center to verify the
 timeline permissions:
@@ -245,6 +252,42 @@ terminal runs. Control Center also cannot preserve durable stage snapshots in
 that state. The connected user usually cannot grant this permission to itself;
 the Role and RoleBinding must be created by an appropriately authorized
 management-cluster user.
+
+For inference-server logs, grant only `get` on the specific kubeconfig Secrets
+the Control Center should be allowed to use. Replace the example names and
+subject with the target clusters and management-cluster identity configured in
+Control Center. No `list` permission is needed:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: psap-control-center-target-kubeconfig-reader
+  namespace: psap-secrets
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["kubeconfig-hera", "kubeconfig-mi355x"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: psap-control-center-target-kubeconfig-reader
+  namespace: psap-secrets
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: psap-control-center-target-kubeconfig-reader
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: <management-cluster-user>
+```
+
+This permission is separate from permissions on each target cluster. The
+credentials stored in each Secret must themselves have the minimum KServe
+InferenceService and Pod/log read access required for the selected cluster.
 
 ## CI/CD: Automatic Build & Deploy
 

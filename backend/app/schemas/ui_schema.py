@@ -175,6 +175,10 @@ class UiMatrixConfig(BaseModel):
     workloads_key: str = "__workloads"
     label_key: str = "__description"
     tp_key: str = "__tp"
+    engine_key: str = "__engine"
+    accelerator_key: str = "__accelerator"
+    gpu_type_key: str = "__gpu_type"
+    clusters_key: str = "__clusters"
 
 
 class UiPipelineModel(BaseModel):
@@ -182,6 +186,9 @@ class UiPipelineModel(BaseModel):
     label: str = ""
     overrides: Dict[str, Any] = Field(default_factory=dict)
     tp: Optional[int] = None
+    # Optional model-specific workload availability. When absent, the
+    # pipeline-wide workload list applies to this model.
+    workloads: Optional[List[str]] = None
 
 
 class UiPipeline(BaseModel):
@@ -196,6 +203,10 @@ class UiPipeline(BaseModel):
     models: List[UiPipelineModel] = Field(default_factory=list)
     workloads: List[str] = Field(default_factory=list)
     overrides: Dict[str, Any] = Field(default_factory=dict)
+    engine: Optional[str] = None
+    accelerator: Optional[str] = None
+    gpu_type: Optional[str] = None
+    clusters: List[str] = Field(default_factory=list)
 
 
 class UiMode(BaseModel):

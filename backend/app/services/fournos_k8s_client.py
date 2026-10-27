@@ -108,11 +108,28 @@ def is_connected() -> bool:
     return _custom_api is not None
 
 
+def get_secret(name: str, namespace: str) -> Optional[dict]:
+    """Read a management-cluster Secret, e.g. a target-cluster kubeconfig."""
+    _ensure_loaded()
+    if _core_api is None:
+        raise RuntimeError("Kubernetes client not available")
+    try:
+        secret = _core_api.read_namespaced_secret(name=name, namespace=namespace)
+        return secret.to_dict()
+    except ApiException as exc:
+        if exc.status == 404:
+            return None
+        logger.error("Failed to read Secret %s/%s: %s", namespace, name, exc.reason)
+        raise
+
+
 # -- FournosJob CRUD --
 
-def list_fournos_jobs(namespace: Optional[str] = None) -> list:
+def list_fournos_jobs(namespace: Optional[str] = None, *, raise_on_error: bool = False) -> list:
     _ensure_loaded()
     if _custom_api is None:
+        if raise_on_error:
+            raise RuntimeError("Kubernetes custom-object client is not configured")
         return []
     ns = namespace or settings.FOURNOS_NAMESPACE
     try:
@@ -125,6 +142,8 @@ def list_fournos_jobs(namespace: Optional[str] = None) -> list:
         return result.get("items", [])
     except ApiException as exc:
         logger.error("Failed to list FournosJobs: %s", exc.reason)
+        if raise_on_error:
+            raise
         return []
 
 

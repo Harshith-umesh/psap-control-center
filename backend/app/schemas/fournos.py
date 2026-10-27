@@ -28,10 +28,14 @@ class FournosJobSummary(BaseModel):
     project: str = ""
     preset: str = ""
     cluster: str = ""
+    gpu_type: Optional[str] = None
+    gpu_count: Optional[int] = None
     pipeline: str = ""
     owner: str = ""
     status: str = "Pending"
     message: str = ""
+    current_step: Optional[Dict[str, Any]] = None
+    task_progress: Optional[Dict[str, Any]] = None
     created_at: Optional[str] = None
     completed_at: Optional[str] = None
     duration_seconds: Optional[float] = None
@@ -214,6 +218,18 @@ class JobListResponse(BaseModel):
     per_page: int
 
 
+class FournosClusterQueueSummary(BaseModel):
+    queued: int = 0
+    running: int = 0
+    active: int = 0
+
+
+class FournosLiveJobSummaryResponse(BaseModel):
+    total: int = 0
+    by_status: Dict[str, int] = Field(default_factory=dict)
+    by_cluster: Dict[str, FournosClusterQueueSummary] = Field(default_factory=dict)
+
+
 class HistoryViewState(BaseModel):
     """Validated, versioned state for one user's latest History view."""
 
@@ -243,7 +259,7 @@ class HistoryViewState(BaseModel):
         "duration", "triggered_by",
     ] = "date"
     sort_dir: Literal["asc", "desc"] = "desc"
-    per_page: Literal[25, 50, 100, 200] = 50
+    per_page: Literal[25, 50, 100, 200] = 100
 
     @field_validator(
         "query", "project", "cluster", "status", "identity",
@@ -407,7 +423,7 @@ class SubmitJobRequest(BaseModel):
     # opt-in to the moving main branch. The backend validates this rather
     # than relying only on the browser form.
     use_latest_main: bool = False
-    priority: str = "manual"
+    priority: Optional[str] = None
     gpu_type: str = ""
     gpu_count: int = 1
     # Scheduling — mirrors FournosJob's own spec.schedule / scheduledStartTime
@@ -439,8 +455,13 @@ class SubmitJobResponse(BaseModel):
 
 class SubmitMatrixModelInput(BaseModel):
     key: str
+    label: str = ""
     overrides: Dict[str, Any] = Field(default_factory=dict)
     gpu_count: Optional[int] = None
+    # Workloads supported by this model. The endpoint intersects these with
+    # the request's globally selected workloads. Omitted/empty preserves the
+    # legacy behavior where every model receives the global list.
+    workloads: Optional[List[str]] = None
 
 
 class SubmitMatrixRequest(BaseModel):
@@ -453,9 +474,17 @@ class SubmitMatrixRequest(BaseModel):
     config_overrides: Dict[str, str] = Field(default_factory=dict)
     models: List[SubmitMatrixModelInput]
     workloads: List[str]
+    # Explicit CPT/matrix identity. Empty pipeline key leaves a matrix
+    # submission out of the CPT tracker for backward-compatible clients.
+    matrix_pipeline_key: str = Field("", max_length=255)
+    version_label: str = Field("", max_length=128)
+    accelerator: str = Field("", max_length=100)
+    engine: str = Field("", max_length=100)
+    engine_version: str = Field("", max_length=512)
+    configured_model_count: Optional[int] = Field(None, ge=0, le=10000)
     # Accepted for backward-compatible clients; ignored by the API.
     owner: str = "fournos-dashboard"
-    priority: str = "manual"
+    priority: Optional[str] = None
     exclusive: bool = False
     pull_request: Optional[PullRequestSelection] = None
     pull_sha: str = ""
@@ -483,6 +512,11 @@ class SubmitMatrixResponse(BaseModel):
     status: str = "ok"
     jobs: List[SubmitMatrixResultItem]
     total: int
+    cpt_run_id: Optional[str] = None
+
+
+class EditJobSubmitRequest(BaseModel):
+    spec: Dict[str, Any]
 
 
 # -- Recurring jobs --

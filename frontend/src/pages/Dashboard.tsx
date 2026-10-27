@@ -1,9 +1,7 @@
 import { Link } from 'react-router-dom'
 import {
   ServerStackIcon,
-  CalendarDaysIcon,
   CpuChipIcon,
-  UserGroupIcon,
   CheckCircleIcon,
   FireIcon,
   LockClosedIcon,
@@ -12,8 +10,8 @@ import {
 } from '@heroicons/react/24/outline'
 import { useQueries } from '@tanstack/react-query'
 import { useClusters } from '../hooks/useClusters'
-import { useReservations } from '../hooks/useReservations'
 import { useHearthClusters } from '../hooks/useHearth'
+import { useFournosLiveJobSummary } from '../hooks/useFournos'
 import { clusterApi } from '../services/api'
 import { format } from 'date-fns'
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
@@ -22,19 +20,28 @@ import GpuDonutChart from '../components/GpuDonutChart'
 
 export default function Dashboard() {
   const { data: clustersData, isLoading: clustersLoading } = useClusters()
-  const { data: reservationsData, isLoading: reservationsLoading } = useReservations()
+  const {
+    data: liveJobSummary,
+    isLoading: liveJobSummaryLoading,
+    isError: liveJobSummaryError,
+  } = useFournosLiveJobSummary()
   
   const { data: hearthData } = useHearthClusters()
   const hearthClusters = hearthData?.clusters || []
   const hearthAvailable = hearthData?.available ?? false
 
   const clusters = clustersData?.clusters || []
-  const reservations = reservationsData?.reservations || []
+  const liveJobStatuses = liveJobSummary?.by_status || {}
+  const waitingJobs = ['Pending', 'Resolving', 'Admitted'].reduce(
+    (total, status) => total + (liveJobStatuses[status] || 0),
+    0,
+  )
+  const otherActiveJobs = Math.max(
+    0,
+    (liveJobSummary?.total || 0) - (liveJobStatuses.Running || 0) - waitingJobs,
+  )
 
   const healthyClusters = clusters.filter((c) => c.status === 'healthy').length
-  const activeReservations = reservations.filter((r) => r.status === 'active').length
-  const gpuReservations = reservations.filter((r) => r.status === 'active' && r.reservation_type === 'gpu')
-  const totalReservedGpus = gpuReservations.reduce((sum, r) => sum + (r.gpu_count || 0), 0)
 
   const healthyClusterIds = clusters.filter((c) => c.status === 'healthy').map((c) => c.id)
   const gpuStatusQueries = useQueries({
@@ -111,45 +118,25 @@ export default function Dashboard() {
       color: 'bg-green-500',
       href: '/clusters',
     },
-    {
-      name: 'Active Reservations',
-      value: activeReservations,
-      icon: UserGroupIcon,
-      color: 'bg-orange-500',
-      href: '/reservations',
-    },
   ]
-
-  // Separate active, upcoming (scheduled), and past reservations
-  const activeReservationsList = reservations.filter((r) => r.status === 'active')
-  const upcomingReservations = reservations
-    .filter((r) => r.status === 'scheduled')
-    .sort((a, b) => new Date(a.start_time).getTime() - new Date(b.start_time).getTime())
-  const pastReservations = reservations
-    .filter((r) => r.status === 'completed' || r.status === 'cancelled' || r.status === 'denied')
-    .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime())
 
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900 font-display">Dashboard</h1>
+          <h1 className="text-2xl font-bold text-gray-900 font-display">Overview</h1>
           <p className="mt-1 text-sm text-gray-500">
-            Overview of your cluster infrastructure and reservations
+            Cluster infrastructure, GPU capacity, and active workload at a glance
           </p>
         </div>
         <div className="flex gap-3">
           <Link to="/clusters" className="btn-secondary">
             View Clusters
           </Link>
-          <Link to="/calendar" className="btn-primary">
-            <CalendarDaysIcon className="h-4 w-4 mr-2" />
-            Open Calendar
-          </Link>
         </div>
       </div>
 
-      <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
         {stats.map((stat) => (
           <Link
             key={stat.name}
@@ -163,7 +150,7 @@ export default function Dashboard() {
               <div className="ml-4">
                 <p className="text-sm font-medium text-gray-500">{stat.name}</p>
                 <p className="text-2xl font-semibold text-gray-900">
-                  {clustersLoading || reservationsLoading ? '...' : stat.value}
+                  {clustersLoading ? '...' : stat.value}
                 </p>
               </div>
             </div>
@@ -241,31 +228,52 @@ export default function Dashboard() {
         )}
       </div>
 
-      {/* GPU Reservation Summary */}
-      {totalReservedGpus > 0 && (
-        <div className="card p-4 bg-gradient-to-r from-purple-50 to-blue-50 relative overflow-hidden">
-          <div className="absolute inset-0 z-10 flex items-center justify-center bg-white/80 backdrop-blur-sm">
-            <p className="text-sm text-gray-600 text-center px-4">
-              Reservations disabled — coordinate on <span className="font-semibold text-gray-900">#PSAP-clusters</span>
+      <section className="card p-6" aria-labelledby="active-jobs-heading">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <h2 id="active-jobs-heading" className="text-lg font-semibold text-gray-900">
+              Active Fournos Jobs
+            </h2>
+            <p className="mt-1 text-sm text-gray-500">
+              A count-only snapshot. Open Live Jobs for individual runs, progress, and actions.
             </p>
           </div>
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <CpuChipIcon className="h-6 w-6 text-purple-600" />
-              <div>
-                <p className="text-sm font-medium text-gray-700">GPU Reservations Active</p>
-                <p className="text-xs text-gray-500">{gpuReservations.length} reservation{gpuReservations.length !== 1 ? 's' : ''} using partial GPUs</p>
-              </div>
-            </div>
-            <div className="text-right">
-              <p className="text-2xl font-bold text-purple-700">{totalReservedGpus}</p>
-              <p className="text-xs text-gray-500">GPUs reserved of {totalGpus} total</p>
-            </div>
-          </div>
+          <Link to="/testing?tab=live" className="text-sm font-medium text-primary-600 hover:text-primary-700">
+            View live jobs →
+          </Link>
         </div>
-      )}
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+        {liveJobSummaryError ? (
+          <p className="mt-5 rounded-md bg-amber-50 px-4 py-3 text-sm text-amber-800">
+            The live job summary is temporarily unavailable. You can still check the Live Jobs page.
+          </p>
+        ) : (
+          <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
+            {[
+              { label: 'Active jobs', value: liveJobSummary?.total },
+              { label: 'Running', value: liveJobStatuses.Running || 0 },
+              { label: 'Waiting to start', value: waitingJobs },
+            ].map((item) => (
+              <div key={item.label} className="rounded-lg border border-gray-200 bg-gray-50 px-4 py-3">
+                <p className="text-sm font-medium text-gray-500">{item.label}</p>
+                <p className="mt-1 text-2xl font-semibold text-gray-900">
+                  {liveJobSummaryLoading ? '…' : item.value ?? 0}
+                </p>
+                {item.label === 'Waiting to start' && (
+                  <p className="mt-0.5 text-xs text-gray-400">Pending, resolving, or admitted</p>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        {!liveJobSummaryError && otherActiveJobs > 0 && (
+          <p className="mt-3 text-xs text-gray-500">
+            {otherActiveJobs} additional active {otherActiveJobs === 1 ? 'job is' : 'jobs are'} in another phase.
+          </p>
+        )}
+      </section>
+
+      <div className="grid grid-cols-1 gap-6">
         <div className="card">
           <div className="px-6 py-4 border-b border-gray-200">
             <h2 className="text-lg font-semibold text-gray-900">Cluster Status</h2>
@@ -288,6 +296,10 @@ export default function Dashboard() {
                 )?.data as GpuAllocationStatus | undefined
                 const clusterTotal = gpuData?.total_gpus ?? parseInt(cluster.gpu_count || '0')
                 const clusterUsed = gpuData?.allocated_gpus ?? 0
+                const gpuNodeCount = gpuData?.gpu_types.reduce(
+                  (total, gpuType) => total + gpuType.node_count,
+                  0,
+                )
                 const cost = costByCluster[cluster.id]
 
                 return (
@@ -309,7 +321,7 @@ export default function Dashboard() {
                       <div>
                         <p className="font-medium text-gray-900">{cluster.name}</p>
                         <p className="text-sm text-gray-500">
-                          {cluster.node_count || '?'} nodes · {clusterUsed}/{clusterTotal} GPUs
+                          {gpuNodeCount ?? '?'} GPU nodes · {clusterUsed}/{clusterTotal} GPUs
                           {cluster.gpu_type && <span className="ml-1">({cluster.gpu_type})</span>}
                           {cost && !cost.error && cost.total_cost != null && (
                             <span className="ml-1">
@@ -349,97 +361,6 @@ export default function Dashboard() {
           )}
         </div>
 
-        <div className="card relative overflow-hidden">
-          <div className="absolute inset-0 z-10 flex items-center justify-center bg-white/80 backdrop-blur-sm">
-            <div className="text-center px-4">
-              <CalendarDaysIcon className="h-10 w-10 mx-auto text-gray-400 mb-2" />
-              <p className="text-sm text-gray-600">
-                Reservations disabled — coordinate on <span className="font-semibold text-gray-900">#PSAP-clusters</span>
-              </p>
-            </div>
-          </div>
-          <div className="px-6 py-4 border-b border-gray-200 bg-green-50">
-            <div className="flex items-center gap-2">
-              <span className="relative flex h-3 w-3">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
-                <span className="relative inline-flex rounded-full h-3 w-3 bg-green-500"></span>
-              </span>
-              <h2 className="text-lg font-semibold text-gray-900">Active Reservations</h2>
-            </div>
-          </div>
-          <div className="divide-y divide-gray-200">
-            {reservationsLoading ? (
-              <div className="px-6 py-8 text-center text-gray-500">Loading reservations...</div>
-            ) : activeReservationsList.length === 0 ? (
-              <div className="px-6 py-8 text-center">
-                <CalendarDaysIcon className="mx-auto h-12 w-12 text-gray-400" />
-                <p className="mt-2 text-sm text-gray-500">No active reservations</p>
-                <Link to="/reservations" className="mt-3 inline-block text-sm text-primary-600 hover:text-primary-700">
-                  Create a reservation
-                </Link>
-              </div>
-            ) : (
-              activeReservationsList.slice(0, 5).map((reservation) => (
-                <div
-                  key={reservation.id}
-                  className="flex items-center justify-between px-6 py-4"
-                >
-                  <div className="flex items-center gap-3">
-                    <div
-                      className="h-12 w-1 rounded-full"
-                      style={{ backgroundColor: reservation.color }}
-                    />
-                    <div>
-                      <p className="font-medium text-gray-900">
-                        {reservation.title}
-                        {reservation.reservation_type === 'gpu' && (
-                          <span className="ml-2 inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-purple-100 text-purple-800">
-                            {reservation.gpu_count} GPU
-                          </span>
-                        )}
-                      </p>
-                      <p className="text-sm text-gray-500">
-                        {reservation.cluster_name || 'Unknown'}
-                      </p>
-                      <p className="text-xs text-gray-400">
-                        {reservation.user_name}{reservation.team && ` · ${reservation.team}`}
-                        {reservation.enforcement_namespace && (
-                          <span className="ml-1 font-mono">
-                            ({reservation.enforcement_namespace})
-                            {reservation.enforcement_status && (
-                              <span className={`ml-1 px-1 py-0.5 rounded text-[9px] font-medium ${
-                                reservation.enforcement_status === 'provisioned' ? 'bg-green-100 text-green-800' :
-                                reservation.enforcement_status === 'error' ? 'bg-orange-100 text-orange-800' :
-                                'bg-gray-100 text-gray-600'
-                              }`}>
-                                {reservation.enforcement_status}
-                              </span>
-                            )}
-                          </span>
-                        )}
-                      </p>
-                    </div>
-                  </div>
-                  <div className="text-right text-sm">
-                    <p className="text-gray-600">
-                      {format(new Date(reservation.start_time), 'MMM d, h:mm a')}
-                    </p>
-                    <p className="text-gray-500">
-                      to {format(new Date(reservation.end_time), 'MMM d, h:mm a')}
-                    </p>
-                  </div>
-                </div>
-              ))
-            )}
-          </div>
-          {activeReservationsList.length > 5 && (
-            <div className="px-6 py-3 bg-gray-50 border-t border-gray-200">
-              <Link to="/reservations" className="text-sm text-primary-600 hover:text-primary-700">
-                View all active reservations →
-              </Link>
-            </div>
-          )}
-        </div>
       </div>
 
       {/* Hearth GPU Cluster Status */}
@@ -546,198 +467,6 @@ export default function Dashboard() {
         </div>
       )}
 
-      {/* Upcoming Reservations */}
-      <div className="card relative overflow-hidden">
-        <div className="absolute inset-0 z-10 flex items-center justify-center bg-white/80 backdrop-blur-sm">
-          <div className="text-center px-4">
-            <CalendarDaysIcon className="h-10 w-10 mx-auto text-gray-400 mb-2" />
-            <p className="text-sm text-gray-600">
-              Reservations disabled — coordinate on <span className="font-semibold text-gray-900">#PSAP-clusters</span>
-            </p>
-          </div>
-        </div>
-        <div className="px-6 py-4 border-b border-gray-200">
-          <h2 className="text-lg font-semibold text-gray-900">Upcoming Reservations</h2>
-          <p className="text-sm text-gray-500 mt-1">Scheduled reservations for the next 7 days</p>
-        </div>
-        <div className="overflow-x-auto">
-          <table className="min-w-full divide-y divide-gray-200">
-            <thead className="bg-gray-50">
-              <tr>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Reservation
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Cluster
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  User
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Time
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Status
-                </th>
-              </tr>
-            </thead>
-            <tbody className="bg-white divide-y divide-gray-200">
-              {reservationsLoading ? (
-                <tr>
-                  <td colSpan={5} className="px-6 py-8 text-center text-gray-500">
-                    Loading...
-                  </td>
-                </tr>
-              ) : upcomingReservations.length === 0 ? (
-                <tr>
-                  <td colSpan={5} className="px-6 py-8 text-center text-gray-500">
-                    No upcoming reservations scheduled
-                  </td>
-                </tr>
-              ) : (
-                upcomingReservations.slice(0, 10).map((reservation) => (
-                  <tr key={reservation.id} className="hover:bg-gray-50">
-                    <td className="px-6 py-4 whitespace-nowrap">
-                      <div className="flex items-center gap-3">
-                        <div
-                          className="h-8 w-1 rounded-full"
-                          style={{ backgroundColor: reservation.color }}
-                        />
-                        <span className="font-medium text-gray-900">{reservation.title}</span>
-                      </div>
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                      {reservation.cluster_name || 'Unknown'}
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap">
-                      <div>
-                        <p className="text-sm text-gray-900">{reservation.user_name}</p>
-                        {reservation.team && (
-                          <p className="text-xs text-gray-500">{reservation.team}</p>
-                        )}
-                      </div>
-                    </td>
-                    <td className="px-6 py-4 text-sm text-gray-500">
-                      <div>
-                        <p className="text-gray-900">{format(new Date(reservation.start_time), 'MMM d, yyyy h:mm a')}</p>
-                        <p className="text-xs">to {format(new Date(reservation.end_time), 'MMM d, yyyy h:mm a')}</p>
-                      </div>
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap">
-                      <span className="badge badge-info">
-                        scheduled
-                      </span>
-                    </td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* Past Reservations */}
-      <div className="card relative overflow-hidden">
-        <div className="absolute inset-0 z-10 flex items-center justify-center bg-white/80 backdrop-blur-sm">
-          <div className="text-center px-4">
-            <CalendarDaysIcon className="h-10 w-10 mx-auto text-gray-400 mb-2" />
-            <p className="text-sm text-gray-600">
-              Reservations disabled — coordinate on <span className="font-semibold text-gray-900">#PSAP-clusters</span>
-            </p>
-          </div>
-        </div>
-        <div className="px-6 py-4 border-b border-gray-200">
-          <h2 className="text-lg font-semibold text-gray-900">Past Reservations</h2>
-          <p className="text-sm text-gray-500 mt-1">Completed reservations from the last 30 days</p>
-        </div>
-        <div className="overflow-x-auto">
-          <table className="min-w-full divide-y divide-gray-200">
-            <thead className="bg-gray-50">
-              <tr>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Reservation
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Cluster
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  User
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Date
-                </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Status
-                </th>
-              </tr>
-            </thead>
-            <tbody className="bg-white divide-y divide-gray-200">
-              {reservationsLoading ? (
-                <tr>
-                  <td colSpan={5} className="px-6 py-8 text-center text-gray-500">
-                    Loading...
-                  </td>
-                </tr>
-              ) : pastReservations.length === 0 ? (
-                <tr>
-                  <td colSpan={5} className="px-6 py-8 text-center text-gray-500">
-                    No past reservations
-                  </td>
-                </tr>
-              ) : (
-                pastReservations.slice(0, 10).map((reservation) => (
-                  <tr key={reservation.id} className="hover:bg-gray-50">
-                    <td className="px-6 py-4 whitespace-nowrap">
-                      <div className="flex items-center gap-3">
-                        <div
-                          className="h-8 w-1 rounded-full opacity-50"
-                          style={{ backgroundColor: reservation.color }}
-                        />
-                        <span className="font-medium text-gray-600">{reservation.title}</span>
-                      </div>
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                      {reservation.cluster_name || 'Unknown'}
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap">
-                      <div>
-                        <p className="text-sm text-gray-600">{reservation.user_name}</p>
-                        {reservation.team && (
-                          <p className="text-xs text-gray-400">{reservation.team}</p>
-                        )}
-                      </div>
-                    </td>
-                    <td className="px-6 py-4 text-sm text-gray-500">
-                      <div>
-                        <p className="text-gray-600">{format(new Date(reservation.start_time), 'MMM d, yyyy h:mm a')}</p>
-                        <p className="text-xs text-gray-400">to {format(new Date(reservation.end_time), 'MMM d, yyyy h:mm a')}</p>
-                      </div>
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap">
-                      <span
-                        className={`badge ${
-                          reservation.status === 'completed'
-                            ? 'badge-success'
-                            : 'badge-error'
-                        }`}
-                      >
-                        {reservation.status}
-                      </span>
-                    </td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
-        {pastReservations.length > 10 && (
-          <div className="px-6 py-3 border-t border-gray-200 bg-gray-50">
-            <Link to="/reservations" className="text-sm text-primary-600 hover:text-primary-700">
-              View all past reservations →
-            </Link>
-          </div>
-        )}
-      </div>
     </div>
   )
 }

@@ -126,6 +126,10 @@ def test_history_view_state_normalizes_and_rejects_unknown_fields():
         HistoryViewState(failure_outcome="success")
 
 
+def test_history_view_defaults_to_100_rows():
+    assert HistoryViewState().per_page == 100
+
+
 def test_history_preference_is_keyed_by_authenticated_subject(monkeypatch):
     monkeypatch.setattr(db_service.settings, "DATABASE_URL", "sqlite://")
     lookup = MagicMock()

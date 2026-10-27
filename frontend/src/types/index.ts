@@ -444,10 +444,14 @@ export interface FournosJobSummary {
   project: string
   preset: string
   cluster: string
+  gpu_type?: string | null
+  gpu_count?: number | null
   pipeline: string
   owner: string
   status: string
   message: string
+  current_step: CurrentStep | null
+  task_progress: TaskProgress | null
   created_at: string | null
   completed_at: string | null
   duration_seconds: number | null
@@ -511,6 +515,12 @@ export interface FournosJobListResponse {
   total: number
   page: number
   per_page: number
+}
+
+export interface FournosLiveJobSummaryResponse {
+  total: number
+  by_status: Record<string, number>
+  by_cluster: Record<string, { queued: number; running: number; active: number }>
 }
 
 export interface HistoryViewState {
@@ -827,8 +837,11 @@ export interface SubmitJobResponse {
 
 export interface SubmitMatrixModelInput {
   key: string
+  label?: string
   overrides: Record<string, unknown>
   gpu_count?: number | null
+  /** Supported workloads, intersected with SubmitMatrixRequest.workloads. */
+  workloads?: string[] | null
 }
 
 export interface SubmitMatrixRequest {
@@ -839,6 +852,12 @@ export interface SubmitMatrixRequest {
   config_overrides: Record<string, string>
   models: SubmitMatrixModelInput[]
   workloads: string[]
+  matrix_pipeline_key?: string
+  version_label?: string
+  accelerator?: string
+  engine?: string
+  engine_version?: string
+  configured_model_count?: number
   /** Compatibility/display field; the backend records the authenticated requester. */
   owner: string
   priority: string
@@ -864,6 +883,106 @@ export interface SubmitMatrixResponse {
   status: string
   jobs: SubmitMatrixResultItem[]
   total: number
+  cpt_run_id?: string | null
+}
+
+export interface CptProfileResult {
+  profile: string
+  status: string
+  job_name: string | null
+  message: string
+  run_id: string
+  created_at: string
+  source: string
+}
+
+export interface CptRunModel {
+  model_key: string
+  model_name: string
+  status: string
+  submitted: boolean
+  attempt_count: number
+  cells: Record<string, CptProfileResult>
+  latest_job_name: string | null
+  latest_created_at: string
+}
+
+export interface CptRunAttempt {
+  id: string
+  status: string
+  job_count: number
+  succeeded_jobs: number
+  failed_jobs: number
+  stopped_jobs: number
+  model_names: string[]
+  created_at: string
+  owner: string
+  source: string
+  jobs: Array<{ name: string | null; model: string; status: string }>
+}
+
+export interface CptRunGroup {
+  id: string
+  project: string
+  pipeline_key: string
+  version_label: string
+  cluster: string
+  accelerator: string
+  engine: string
+  engine_version: string
+  fournos_pipeline: string
+  status: string
+  attempt_count: number
+  models: CptRunModel[]
+  profiles: string[]
+  configured_model_count: number | null
+  submitted_model_count: number
+  not_submitted_model_count: number
+  passed_profile_count: number
+  failed_profile_count: number
+  stopped_profile_count: number
+  active_profile_count: number
+  total_profile_count: number
+  sources: string[]
+  source_label: string
+  owners: string[]
+  owner_label: string
+  latest_created_at: string
+  attempts: CptRunAttempt[]
+  active_jobs: string[]
+}
+
+export interface CptRunListResponse {
+  projects: string[]
+  groups: CptRunGroup[]
+  hidden_stopped_count: number
+  filter_options: {
+    versions: string[]
+    accelerators: string[]
+    clusters: string[]
+    owners: string[]
+  }
+}
+
+export interface StopCptRunGroupResponse {
+  status: string
+  requested: number
+  failed: number
+  jobs: Array<{ job_name: string; status: string; message: string }>
+}
+
+export interface UpdateCptRunVersionResponse {
+  status: string
+  version_label: string
+  group_id: string
+}
+
+export interface InferenceServerLogs {
+  pod: string | null
+  phase: string
+  container: string
+  logs: string
+  message: string
 }
 
 // ─── Generic project UI schema (projects/<name>/ui/submit.yaml) ───────
@@ -928,6 +1047,8 @@ export interface UiPipelineModel {
   label: string
   overrides: Record<string, unknown>
   tp?: number | null
+  /** Workloads supported by this model; absent means use the pipeline list. */
+  workloads?: string[] | null
 }
 
 export interface UiPipeline {
@@ -936,6 +1057,10 @@ export interface UiPipeline {
   models: UiPipelineModel[]
   workloads: string[]
   overrides: Record<string, unknown>
+  engine?: string | null
+  accelerator?: string | null
+  gpu_type?: string | null
+  clusters?: string[]
 }
 
 export interface UiMode {

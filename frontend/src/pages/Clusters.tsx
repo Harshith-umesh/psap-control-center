@@ -26,7 +26,7 @@ import { clusterApi } from '../services/api'
 import { format } from 'date-fns'
 import toast from 'react-hot-toast'
 import clsx from 'clsx'
-import type { GpuAllocationStatus, ClusterCost } from '../types'
+import type { GpuAllocationStatus } from '../types'
 import GpuDonutChart from '../components/GpuDonutChart'
 import ClusterRefreshIndicator from '../components/ClusterRefreshIndicator'
 import { isAdmin, isAuthenticated } from '../stores/authStore'
@@ -181,20 +181,6 @@ export default function Clusters() {
   })
   const gpuHistoryByCluster = clusters.reduce<Record<string, Array<{ name: string; namespace: string; gpu_count: number; node?: string; finished_at: string }>>>((acc, c, i) => {
     acc[c.id] = (gpuHistoryQueries[i]?.data as { pods: typeof acc[string] } | undefined)?.pods || []
-    return acc
-  }, {})
-
-  const costQueries = useQueries({
-    queries: clusters.map((c) => ({
-      queryKey: ['clusterCost', c.id],
-      queryFn: () => clusterApi.getCost(c.id),
-      enabled: c.provider === 'ibm',
-      staleTime: 60_000,
-    })),
-  })
-  const costsByCluster = clusters.reduce<Record<string, ClusterCost[]>>((acc, c, i) => {
-    const costs = costQueries[i]?.data as ClusterCost[] | undefined
-    acc[c.id] = costs || []
     return acc
   }, {})
 
@@ -456,6 +442,10 @@ export default function Clusters() {
                   const gpuData = gpuStatusByCluster[cluster.id]
                   const cTotal = gpuData?.total_gpus ?? parseInt(cluster.gpu_count || '0')
                   const cUsed = gpuData?.allocated_gpus ?? 0
+                  const gpuNodeCount = gpuData?.gpu_types.reduce(
+                    (total, gpuType) => total + gpuType.node_count,
+                    0,
+                  )
                   return (
                     <div className="mt-4 flex items-center gap-4">
                       {cTotal > 0 && (
@@ -463,11 +453,15 @@ export default function Clusters() {
                       )}
                       <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm flex-1">
                         <div>
-                          <p className="text-gray-500">Nodes</p>
+                          <p className="text-gray-500">Cluster nodes</p>
                           <p className="font-semibold text-gray-900">{cluster.node_count || 'N/A'}</p>
                         </div>
                         <div>
-                          <p className="text-gray-500">GPUs</p>
+                          <p className="text-gray-500" title="Nodes with at least one detected GPU">GPU nodes</p>
+                          <p className="font-semibold text-gray-900">{gpuNodeCount ?? 'N/A'}</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-500">GPUs used</p>
                           <p className="font-semibold text-gray-900">
                             {gpuData ? `${cUsed} / ${cTotal}` : `– / ${cTotal}`}
                           </p>
@@ -487,31 +481,6 @@ export default function Clusters() {
                           </p>
                         </div>
                       </div>
-                    </div>
-                  )
-                })()}
-
-                {(() => {
-                  const costs = costsByCluster[cluster.id]
-                  if (!costs || costs.length === 0) return null
-                  const valid = costs.filter((c) => !c.error && c.total_cost != null)
-                  if (valid.length === 0) {
-                    return (
-                      <div className="mt-4 pt-4 border-t border-gray-100 text-sm text-gray-400">
-                        No billing data
-                      </div>
-                    )
-                  }
-                  return (
-                    <div className="mt-4 pt-4 border-t border-gray-100 space-y-1 text-sm">
-                      {valid.map((cost) => (
-                        <div key={cost.billing_month} className="flex items-center justify-between">
-                          <span className="text-gray-400">{cost.billing_month}</span>
-                          <span className="font-semibold text-gray-900">
-                            {cost.total_cost!.toLocaleString(undefined, { style: 'currency', currency: cost.currency })}
-                          </span>
-                        </div>
-                      ))}
                     </div>
                   )
                 })()}

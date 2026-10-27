@@ -25,6 +25,7 @@ import type {
   AuthConfig,
   RefreshDisplayMode,
   RefreshDisplayPreference,
+  FournosLiveJobSummaryResponse,
 } from '../types'
 import { createLogger } from '../utils/logger'
 import { clearSession } from '../stores/authStore'
@@ -463,6 +464,11 @@ export const costExplorerApi = {
 }
 
 export const fournosApi = {
+  getLiveJobSummary: async (): Promise<FournosLiveJobSummaryResponse> => {
+    const { data } = await api.get('/fournos/jobs/live-summary')
+    return data
+  },
+
   listJobs: async (params: {
     tab?: string
     project?: string
@@ -516,6 +522,21 @@ export const fournosApi = {
 
   getJob: async (name: string) => {
     const { data } = await api.get(`/fournos/jobs/${name}`)
+    return data
+  },
+
+  getInferenceLogsAvailability: async (name: string): Promise<{ available: boolean }> => {
+    const { data } = await api.get(`/fournos/jobs/${encodeURIComponent(name)}/inference-logs/availability`)
+    return data
+  },
+
+  getInferenceServerLogs: async (name: string): Promise<import('../types').InferenceServerLogs> => {
+    const { data } = await api.get(`/fournos/jobs/${encodeURIComponent(name)}/inference-logs`)
+    return data
+  },
+
+  searchJobNames: async (query: string): Promise<{ items: Array<{ name: string; status: string; source: string }> }> => {
+    const { data } = await api.get('/fournos/jobs/name-search', { params: { q: query } })
     return data
   },
 
@@ -574,6 +595,43 @@ export const fournosApi = {
 
   rerunJob: async (name: string) => {
     const { data } = await api.post(`/fournos/jobs/${name}/rerun`)
+    return data
+  },
+
+  editSubmitJob: async (name: string, spec: Record<string, unknown>) => {
+    const { data } = await api.post(`/fournos/jobs/${name}/edit-submit`, { spec })
+    return data
+  },
+
+  getCptRuns: async (params: {
+    project?: string
+    version?: string
+    accelerator?: string
+    cluster?: string
+    owner?: string
+    show_stopped?: boolean
+  } = {}): Promise<import('../types').CptRunListResponse> => {
+    const { data } = await api.get('/fournos/cpt-runs', { params })
+    return data
+  },
+
+  getCptRunGroup: async (groupId: string): Promise<import('../types').CptRunGroup> => {
+    const { data } = await api.get(`/fournos/cpt-runs/${encodeURIComponent(groupId)}`)
+    return data
+  },
+
+  stopCptRunGroup: async (groupId: string): Promise<import('../types').StopCptRunGroupResponse> => {
+    const { data } = await api.post(`/fournos/cpt-runs/groups/${groupId}/stop`)
+    return data
+  },
+
+  updateCptRunVersion: async (
+    runId: string,
+    versionLabel: string,
+  ): Promise<import('../types').UpdateCptRunVersionResponse> => {
+    const { data } = await api.post(`/fournos/cpt-runs/${runId}/version`, {
+      version_label: versionLabel,
+    })
     return data
   },
 
