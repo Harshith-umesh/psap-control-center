@@ -367,6 +367,18 @@ def build_cpt_run_groups(jobs: list[Any]) -> list[dict[str, Any]]:
     return groups
 
 
+def redact_cpt_group_owners(group: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of a CPT group without owner identities."""
+    public_group = dict(group)
+    public_group["owners"] = []
+    public_group["owner_label"] = ""
+    public_group["attempts"] = [
+        {**attempt, "owner": ""}
+        for attempt in group.get("attempts", [])
+    ]
+    return public_group
+
+
 def filter_cpt_run_groups(
     groups: list[dict[str, Any]], *, project: str = "", version: str = "",
     accelerator: str = "", cluster: str = "", owner: str = "",

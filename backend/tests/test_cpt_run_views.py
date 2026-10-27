@@ -6,6 +6,7 @@ from app.services.cpt_run_views import (
     build_cpt_run_groups,
     build_new_cpt_attempt,
     filter_cpt_run_groups,
+    redact_cpt_group_owners,
 )
 
 
@@ -134,6 +135,23 @@ class CptRunViewsTests(unittest.TestCase):
             build_new_cpt_attempt(ordinary, {"cluster": "hera"}, "owner"),
             (None, {}),
         )
+
+    def test_redact_cpt_group_owners_returns_copy_and_hides_attempt_owners(self):
+        group = {
+            "owners": ["runner"],
+            "owner_label": "runner",
+            "attempts": [{"id": "run-1", "owner": "runner"}],
+            "status": "Succeeded",
+        }
+
+        public_group = redact_cpt_group_owners(group)
+
+        self.assertEqual(public_group["owners"], [])
+        self.assertEqual(public_group["owner_label"], "")
+        self.assertEqual(public_group["attempts"], [{"id": "run-1", "owner": ""}])
+        self.assertEqual(public_group["status"], "Succeeded")
+        self.assertEqual(group["owners"], ["runner"])
+        self.assertEqual(group["attempts"][0]["owner"], "runner")
 
     def test_failed_to_submit_models_remain_visible_but_not_counted_as_submitted(self):
         created = datetime(2026, 10, 1, tzinfo=timezone.utc)

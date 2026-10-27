@@ -31,7 +31,16 @@ import { isAuthenticated, isAdmin, getDisplayName, clearSession } from '../store
 import { authApi } from '../services/api'
 import { useHearthStatus, useDisconnectHearth } from '../hooks/useHearth'
 
-const navigation = [
+type NavigationItem = {
+  name: string
+  href: string
+  icon: typeof HomeIcon
+  adminOnly?: boolean
+  comingSoon?: boolean
+  badge?: string
+}
+
+const navigation: NavigationItem[] = [
   { name: 'Overview', href: '/dashboard', icon: HomeIcon },
   { name: 'Clusters', href: '/clusters', icon: ServerStackIcon },
   { name: 'Fournos Dashboard', href: '/testing?tab=live', icon: BeakerIcon },

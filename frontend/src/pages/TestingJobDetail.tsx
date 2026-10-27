@@ -688,7 +688,7 @@ export default function TestingJobDetail() {
             )}
             {forge_info.pr_url && <><dt className="text-gray-500">Pull Request</dt><dd className="text-gray-800"><a href={forge_info.pr_url} target="_blank" rel="noopener noreferrer" className="text-indigo-600 hover:underline">#{forge_info.pr_number}: {forge_info.pr_title}</a></dd></>}
             {secretRefs.length > 0 && <><dt className="text-gray-500">Secrets</dt><dd className="break-all text-gray-800">{secretRefs.map(String).join(', ')}</dd></>}
-            {meta.creationTimestamp && <><dt className="text-gray-500">Created</dt><dd className="text-gray-800">{new Date(meta.creationTimestamp as string).toLocaleString()}</dd></>}
+            {typeof meta.creationTimestamp === 'string' && <><dt className="text-gray-500">Created</dt><dd className="text-gray-800">{new Date(meta.creationTimestamp).toLocaleString()}</dd></>}
           </dl>
 
           <details className="mt-4 overflow-hidden rounded-lg border border-gray-200">

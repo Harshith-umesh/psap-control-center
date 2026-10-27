@@ -885,7 +885,7 @@ async def live_jobs_summary():
     queued_phases = {"Pending", "Resolving", "Admitted"}
     by_status: dict[str, int] = {}
     by_cluster: dict[str, dict[str, int]] = {}
-    for job in await _get_live_jobs():
+    for job in await _get_live_jobs(raise_on_error=True):
         phase = str((job.get("status") or {}).get("phase") or "Pending")
         if phase in terminal_phases:
             continue
@@ -2104,6 +2104,7 @@ async def _load_cpt_run_groups() -> list[dict[str, Any]]:
 
 @router.get("/cpt-runs")
 async def list_cpt_runs(
+    request: Request,
     project: str = Query("", max_length=255),
     version: str = Query("", max_length=128),
     accelerator: str = Query("", max_length=100),
@@ -2111,6 +2112,8 @@ async def list_cpt_runs(
     owner: str = Query("", max_length=255),
     show_stopped: bool = False,
 ):
+    include_owner = get_current_user(request) is not None
+    effective_owner = owner if include_owner else ""
     groups = await _load_cpt_run_groups()
     matching = cpt_run_views.filter_cpt_run_groups(
         groups,
@@ -2118,12 +2121,14 @@ async def list_cpt_runs(
         version=version,
         accelerator=accelerator,
         cluster=cluster,
-        owner=owner,
+        owner=effective_owner,
         show_stopped=show_stopped,
     )
     return {
         "projects": sorted({group["project"] for group in groups if group["project"]}),
-        "groups": matching,
+        "groups": matching if include_owner else [
+            cpt_run_views.redact_cpt_group_owners(group) for group in matching
+        ],
         "hidden_stopped_count": sum(
             group["status"] == "Stopped"
             for group in cpt_run_views.filter_cpt_run_groups(
@@ -2132,7 +2137,7 @@ async def list_cpt_runs(
                 version=version,
                 accelerator=accelerator,
                 cluster=cluster,
-                owner=owner,
+                owner=effective_owner,
                 show_stopped=True,
             )
         ),
@@ -2140,17 +2145,19 @@ async def list_cpt_runs(
             "versions": sorted({group["version_label"] for group in groups if group["version_label"]}, key=str.casefold),
             "accelerators": sorted({group["accelerator"] for group in groups if group["accelerator"]}, key=str.casefold),
             "clusters": sorted({group["cluster"] for group in groups if group["cluster"]}, key=str.casefold),
-            "owners": sorted({owner for group in groups for owner in group["owners"] if owner}, key=str.casefold),
+            "owners": sorted({group_owner for group in groups for group_owner in group["owners"] if group_owner}, key=str.casefold) if include_owner else [],
         },
     }
 
 
 @router.get("/cpt-runs/{group_id}")
-async def get_cpt_run_group(group_id: str):
+async def get_cpt_run_group(group_id: str, request: Request):
     groups = await _load_cpt_run_groups()
     group = next((item for item in groups if item["id"] == group_id), None)
     if group is None:
         raise HTTPException(404, "CPT run group not found")
+    if get_current_user(request) is None:
+        return cpt_run_views.redact_cpt_group_owners(group)
     return group
 
 

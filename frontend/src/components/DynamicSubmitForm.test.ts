@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { getMatrixWorkloadOptions } from './DynamicSubmitForm'
+import { getMatrixWorkloadOptions } from '../utils/matrixWorkloads'
 import type { UiPipeline } from '../types'
 
 const pipeline: UiPipeline = {
