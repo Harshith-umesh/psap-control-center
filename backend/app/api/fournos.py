@@ -10,8 +10,9 @@ import json
 import logging
 import re
 import threading
+import time
 import urllib.request
-from collections import deque
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, List, Optional
@@ -21,7 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from kubernetes.client.rest import ApiException
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from app.core.auth import (
     REQUESTER_EMAIL_ANNOTATION,
@@ -109,6 +110,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/fournos", tags=["fournos"])
 
 _COMPLETED_GRACE_SECONDS = 180
+_LIVE_JOB_STEP_CACHE_TTL_SECONDS = 10.0
+_LIVE_JOB_STEP_CACHE_MAX_ENTRIES = 1024
+_LIVE_JOB_STEP_LOOKUP_LIMIT = threading.BoundedSemaphore(8)
+_live_job_step_cache: OrderedDict[str, tuple[float, Optional[dict]]] = OrderedDict()
+_live_job_step_inflight: dict[str, asyncio.Task[Optional[dict]]] = {}
 _LOG_ISSUE_RE = re.compile(r"\b(?:error|warning|warn)\b", re.IGNORECASE)
 _LOG_DECORATION_RE = re.compile(
     r"^\s*(?:error|warning|warn)?\s*:?\s*[-=*_]{3,}\s*$",
@@ -435,30 +441,72 @@ def _live_job_to_summary(
     }
 
 
+def _get_live_job_step_limited(job_name: str) -> Optional[dict]:
+    with _LIVE_JOB_STEP_LOOKUP_LIMIT:
+        return k8s.get_current_step_for_job(job_name)
+
+
+async def _fetch_live_job_step(job_name: str) -> Optional[dict]:
+    try:
+        return await asyncio.to_thread(_get_live_job_step_limited, job_name)
+    except Exception:
+        logger.debug(
+            "Unable to determine current pipeline step for %s",
+            job_name,
+            exc_info=True,
+        )
+        return None
+
+
+def _remember_live_job_step(
+    job_name: str,
+    task: asyncio.Task[Optional[dict]],
+) -> None:
+    if _live_job_step_inflight.get(job_name) is not task:
+        return
+    _live_job_step_inflight.pop(job_name, None)
+    if task.cancelled() or task.exception() is not None:
+        return
+
+    _live_job_step_cache[job_name] = (
+        time.monotonic() + _LIVE_JOB_STEP_CACHE_TTL_SECONDS,
+        task.result(),
+    )
+    _live_job_step_cache.move_to_end(job_name)
+    while len(_live_job_step_cache) > _LIVE_JOB_STEP_CACHE_MAX_ENTRIES:
+        _live_job_step_cache.popitem(last=False)
+
+
+async def _cached_live_job_step(job_name: str) -> Optional[dict]:
+    """Share short-lived step lookups across the live list and overview APIs."""
+    now = time.monotonic()
+    cached = _live_job_step_cache.get(job_name)
+    if cached and cached[0] > now:
+        _live_job_step_cache.move_to_end(job_name)
+        return cached[1]
+    if cached:
+        _live_job_step_cache.pop(job_name, None)
+
+    task = _live_job_step_inflight.get(job_name)
+    if task is None:
+        task = asyncio.create_task(_fetch_live_job_step(job_name))
+        _live_job_step_inflight[job_name] = task
+        task.add_done_callback(
+            lambda completed, name=job_name: _remember_live_job_step(name, completed)
+        )
+    return await asyncio.shield(task)
+
+
 async def _attach_live_job_progress(summaries: list[dict]) -> None:
-    """Best-effort lookup of active Tekton task steps for the live table."""
+    """Attach active Tekton steps, reusing lookups across frequent live polls."""
     candidates = [
         summary
         for summary in summaries
         if summary.get("status") in ("Running", "Admitted")
     ]
-    semaphore = asyncio.Semaphore(8)
-
-    async def _current_step(summary: dict) -> Optional[dict]:
-        async with semaphore:
-            try:
-                return await asyncio.to_thread(
-                    k8s.get_current_step_for_job, summary["name"]
-                )
-            except Exception:
-                logger.debug(
-                    "Unable to determine current pipeline step for %s",
-                    summary.get("name", ""),
-                    exc_info=True,
-                )
-                return None
-
-    steps = await asyncio.gather(*(_current_step(item) for item in candidates))
+    steps = await asyncio.gather(
+        *(_cached_live_job_step(item["name"]) for item in candidates)
+    )
     for summary, step in zip(candidates, steps):
         summary["current_step"] = step
 
@@ -931,9 +979,24 @@ async def search_job_names(q: str = Query(..., min_length=1, max_length=128)):
                 return {"items": items}
 
     async with AsyncSessionLocal() as session:
-        archived = await db_svc.search_jobs_by_name_pattern(
-            session, q, limit=20 - len(items)
-        )
+        try:
+            archived = await db_svc.search_jobs_by_name_pattern(
+                session, q, limit=20 - len(items)
+            )
+        except DBAPIError as exc:
+            # Python's regex parser and PostgreSQL's ARE parser accept
+            # different syntax. Only translate PostgreSQL's invalid-regex
+            # error; unrelated database failures must still surface normally.
+            sqlstate = (
+                getattr(exc.orig, "sqlstate", None)
+                or getattr(exc.orig, "pgcode", None)
+            )
+            if sqlstate == "2201B":
+                raise HTTPException(
+                    422,
+                    "Regular expression syntax is not supported for job-name search",
+                ) from exc
+            raise
     for job in archived:
         if job["name"] and job["name"] not in seen:
             seen.add(job["name"])

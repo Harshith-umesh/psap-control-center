@@ -470,6 +470,26 @@ async def _archive_job(job: dict) -> None:
 
     async with _watcher_session() as session, session.begin():
         existing = await db_svc.get_job_by_name(session, job_name)
+        incoming_cpt_metadata = fields.get("cpt_run_metadata")
+        existing_cpt_metadata = (
+            existing.cpt_run_metadata
+            if existing and existing.cpt_run_id == fields.get("cpt_run_id")
+            else {}
+        )
+        if not isinstance(existing_cpt_metadata, dict):
+            existing_cpt_metadata = {}
+        # The admin version-correction endpoint writes the corrected label to
+        # the database. Preserve that value when a later watch event still
+        # carries the original submission annotation.
+        stored_version = existing_cpt_metadata.get("version_label")
+        if (
+            isinstance(incoming_cpt_metadata, dict)
+            and stored_version
+            and incoming_cpt_metadata.get("version_label") != stored_version
+        ):
+            incoming_cpt_metadata = dict(incoming_cpt_metadata)
+            incoming_cpt_metadata["version_label"] = stored_version
+            fields["cpt_run_metadata"] = incoming_cpt_metadata
         schedule_parent = fields.get("triggered_by_schedule")
         parent = None
         if schedule_parent:

@@ -6,6 +6,7 @@ import { createPortal } from 'react-dom'
 import ReviewRow, { ReviewSection } from './ReviewRow'
 import YamlPreview from './YamlPreview'
 import { getProjectSubmitAdapter } from './rhaiis/rhaiisSubmitAdapter'
+import { normalizeClusterName } from '../utils/cptClusterOptions'
 import { useSubmitJob, useSubmitMatrix } from '../hooks/useFournos'
 import { buildMatrixJobPreviews, buildSingleJobPreview, mergeMatrixConfigOverrides, toYamlPreview } from '../utils/fournosJobPreview'
 import { getMatrixWorkloadOptions } from '../utils/matrixWorkloads'
@@ -240,6 +241,9 @@ export default function DynamicSubmitForm({
     () => activeMode?.pipelines.find((p) => p.key === pipelineKey),
     [activeMode, pipelineKey]
   )
+  const selectedPipelineClusterSupported = !!selectedPipeline?.clusters?.some(
+    (allowedCluster) => normalizeClusterName(allowedCluster) === normalizeClusterName(basics.cluster)
+  )
   const matrixWorkloads = useMemo(
     () => getMatrixWorkloadOptions(project, selectedPipeline),
     [project, selectedPipeline]
@@ -438,7 +442,7 @@ export default function DynamicSubmitForm({
         !selectedPipeline ||
         matrixJobCount === 0 ||
         matrixWorkloadExecutionCount === 0 ||
-        ((selectedPipeline.clusters?.length || 0) > 0 && !selectedPipeline.clusters?.includes(basics.cluster))
+        ((selectedPipeline.clusters?.length || 0) > 0 && !selectedPipelineClusterSupported)
       ) return
       const { args, overrides } = collectSharedArgsAndOverrides()
       try {
@@ -531,7 +535,7 @@ export default function DynamicSubmitForm({
   const projectFieldsValid = projectAdapter?.validate(activeMode, values, derived) ?? true
   const formValid = requiredFieldsValid && projectFieldsValid
   const canSubmit = isMatrix
-    ? !submitMatrix.isPending && !!basics.cluster.trim() && !!basics.owner.trim() && buildSourceValid && formValid && !!selectedPipeline && matrixJobCount > 0 && matrixWorkloadExecutionCount > 0 && (!(selectedPipeline.clusters?.length) || !!selectedPipeline.clusters?.includes(basics.cluster)) && (!isRhaiisCpt || matrixClusterValid !== false)
+    ? !submitMatrix.isPending && !!basics.cluster.trim() && !!basics.owner.trim() && buildSourceValid && formValid && !!selectedPipeline && matrixJobCount > 0 && matrixWorkloadExecutionCount > 0 && (!(selectedPipeline.clusters?.length) || selectedPipelineClusterSupported) && (!isRhaiisCpt || matrixClusterValid !== false)
     : !submitJob.isPending && !!basics.cluster.trim() && !!basics.owner.trim() && buildSourceValid && formValid
 
   const matrixSubmissionFeedback = matrixSubmissionResult ? (() => {
@@ -676,7 +680,7 @@ export default function DynamicSubmitForm({
             {selectedPipeline?.clusters?.length ? (
               <p className="mt-1 text-xs text-gray-500">
                 Available on: {selectedPipeline.clusters.join(', ')}
-                {!selectedPipeline.clusters.includes(basics.cluster) && (
+                {!selectedPipelineClusterSupported && (
                   <span className="ml-1 font-medium text-amber-700">
                     Select one of these clusters below to submit this pipeline.
                   </span>

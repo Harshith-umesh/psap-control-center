@@ -45,6 +45,7 @@ import {
   filterCptClusterOptions,
   getHearthClusterOptions,
   isCptClusterOptionSelected,
+  normalizeClusterName,
 } from '../utils/cptClusterOptions'
 import {
   useFournosJobs,
@@ -669,7 +670,9 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
     [hearthClusterOptions, matrixClusterConstraints],
   )
   const selectedHearthCluster = useMemo(
-    () => compatibleCptClusterOptions.find((item) => item.name === cluster),
+    () => compatibleCptClusterOptions.find(
+      (item) => normalizeClusterName(item.name) === normalizeClusterName(cluster),
+    ),
     [compatibleCptClusterOptions, cluster],
   )
   const selectedCluster = useHearthForCpt ? selectedHearthCluster : registeredSelectedCluster
@@ -680,19 +683,6 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
   }, [useHearthForCpt, matrixClusterConstraints, hearthClustersData, cluster, compatibleCptClusterOptions])
   const hearthClustersUnavailable = hearthClustersError
     || (!!hearthClustersData && !hearthClustersData.available)
-
-  useEffect(() => {
-    if (
-      !useHearthForCpt ||
-      !matrixClusterConstraints ||
-      !cluster.trim() ||
-      hearthClustersLoading ||
-      !hearthClustersData?.available
-    ) return
-    if (!isCptClusterOptionSelected(cluster, compatibleCptClusterOptions)) {
-      setCluster('')
-    }
-  }, [useHearthForCpt, matrixClusterConstraints, cluster, hearthClustersLoading, hearthClustersData, compatibleCptClusterOptions])
 
   // Any project that publishes a projects/<name>/ui/submit.yaml in Forge
   // gets a fully dynamic form for free — see docs/ui-schema-spec.md.
@@ -1071,7 +1061,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
                   Hearth has no cluster matching this pipeline’s configured cluster IDs.
                 </p>
               )}
-              {matrixClusterConstraints && !hearthClustersUnavailable && (
+              {useHearthForCpt && matrixClusterConstraints && !hearthClustersUnavailable && (
                 <p className="mt-1 text-xs text-gray-400">
                   Cluster choices come from Hearth and use the canonical IDs configured for this CPT pipeline.
                 </p>
@@ -2112,11 +2102,20 @@ export default function Testing() {
   const queuedClusterRows = useMemo(() => {
     const countsByCluster = liveJobSummary?.by_cluster || {}
     const countsByKey = new Map(
-      Object.entries(countsByCluster).map(([name, counts]) => [name.trim().toLowerCase(), counts])
+      Object.entries(countsByCluster).map(([name, counts]) => [normalizeClusterName(name), counts])
     )
-    return QUEUED_CLUSTER_NAMES
-      .map((cluster) => {
-        const counts = countsByKey.get(cluster)
+    const clusterNamesByKey = new Map(
+      QUEUED_CLUSTER_NAMES.map((name) => [normalizeClusterName(name), name]),
+    )
+    Object.keys(countsByCluster).forEach((name) => {
+      const normalizedName = normalizeClusterName(name)
+      if (normalizedName && !clusterNamesByKey.has(normalizedName)) {
+        clusterNamesByKey.set(normalizedName, name.trim())
+      }
+    })
+    return [...clusterNamesByKey.entries()]
+      .map(([normalizedName, cluster]) => {
+        const counts = countsByKey.get(normalizedName)
         return {
           cluster,
           queued: counts?.queued || 0,
