@@ -98,6 +98,7 @@ class FournosJob(Base):
     # the CPT view can aggregate old and new attempts even after the live FJob
     # has been archived from Kubernetes.
     cpt_run_id = Column(String(36), nullable=True, index=True)
+    cpt_group_id = Column(String(24), nullable=True, index=True)
     cpt_run_metadata = Column(_JSON, nullable=False, default=dict)
     cpt_stop_requested_at = Column(DateTime(timezone=True), nullable=True)
     cpt_stop_message = Column(Text, default="")
@@ -167,6 +168,7 @@ class FournosCptRunJobArchive(Base):
 
     id = Column(String(36), primary_key=True)
     run_id = Column(String(36), nullable=False, index=True)
+    cpt_group_id = Column(String(24), nullable=True, index=True)
     position = Column(Integer, nullable=False, default=0)
     job_name = Column(String(255), nullable=True, index=True)
     model_name = Column(String(512), default="")

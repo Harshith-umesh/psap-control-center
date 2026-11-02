@@ -90,6 +90,13 @@ podman push quay.io/${QUAY_ORG}/psap-control-center-frontend:latest
 > are building on an x86_64 host, you can omit `--platform linux/amd64` and
 > use the standard multi-stage `frontend/Dockerfile` directly.
 
+Set any `VITE_*_URL` sidebar destinations in the build environment before
+running `npm run build`. Unset destinations are hidden from the sidebar. These
+values are baked into the static frontend image; each environment needs a build
+with its own configured URLs. `FOURNOS_DEFAULT_JOB_TTL` is optional and unset
+by default so the Fournos operator applies its own retention policy. Job
+priority defaults to `manual` for both single jobs and CPT submissions.
+
 ### 3. Create the namespace
 
 ```bash
@@ -199,9 +206,11 @@ the configured namespaces:
   `delete` permission on `fournosjobs.fournos.dev`.
 - RHAIIS inference-server logs additionally require `get` access to the
   target-cluster kubeconfig Secrets in `TARGET_CLUSTER_SECRETS_NAMESPACE`
-  (default: `psap-secrets`). The log API is authenticated and reads only the
-  Secret named `kubeconfig-<cluster>` for a currently running RHAIIS job; it
-  never returns credential data to the browser.
+  (default: `psap-secrets`). The backend uses the Secret named
+  `kubeconfig-<cluster>` only for a currently running RHAIIS job. It never
+  returns credential data to the browser, and it authorizes log access only
+  for the job requester or an administrator. Apply this permission only to
+  the management-cluster identity used by Control Center.
 
 Use the same kubeconfig that will be supplied to Control Center to verify the
 timeline permissions:

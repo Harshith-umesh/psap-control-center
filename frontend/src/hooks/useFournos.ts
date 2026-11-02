@@ -515,11 +515,13 @@ export function useCptRuns(params: {
   cluster?: string
   owner?: string
   show_stopped?: boolean
+  page?: number
+  per_page?: number
 } = {}) {
   return useQuery<CptRunListResponse>({
     queryKey: ['fournos-cpt-runs', params],
     queryFn: () => fournosApi.getCptRuns(params),
-    refetchInterval: 10_000,
+    refetchInterval: 30_000,
     retry: 1,
   })
 }

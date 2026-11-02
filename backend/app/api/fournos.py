@@ -21,7 +21,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from kubernetes.client.rest import ApiException
-from sqlalchemy import select
+from sqlalchemy import func, select, union_all
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from app.core.auth import (
@@ -1496,19 +1496,34 @@ async def _rhaiis_inference_logs_available(job_name: str, job: dict | None = Non
     return _is_rhaiis_testing_step(step)
 
 
+def _authorize_rhaiis_inference_logs(job: dict, user: dict) -> None:
+    """Limit cross-cluster inference log reads to the job requester or admin."""
+    if user.get("role") == "admin":
+        return
+    requester_subject = _live_job_requester_subject(job)
+    if requester_subject and requester_subject == str(user.get("subject") or ""):
+        return
+    raise HTTPException(403, "Only the job requester or an administrator may view inference logs")
+
+
 @router.get("/jobs/{job_name}/inference-logs/availability")
-async def inference_logs_availability(job_name: str, _=Depends(require_auth)):
-    return {"available": await _rhaiis_inference_logs_available(job_name)}
+async def inference_logs_availability(job_name: str, user=Depends(require_auth)):
+    job = await asyncio.to_thread(k8s.get_fournos_job, job_name)
+    if not job:
+        return {"available": False}
+    _authorize_rhaiis_inference_logs(job, user)
+    return {"available": await _rhaiis_inference_logs_available(job_name, job)}
 
 
 @router.get("/jobs/{job_name}/inference-logs")
 async def get_rhaiis_inference_logs(
-    job_name: str, response: Response, _=Depends(require_auth)
+    job_name: str, response: Response, user=Depends(require_auth)
 ):
     response.headers["Cache-Control"] = "no-store"
     job = await asyncio.to_thread(k8s.get_fournos_job, job_name)
     if not job:
         raise HTTPException(404, "FournosJob not found")
+    _authorize_rhaiis_inference_logs(job, user)
     if not _rhaiis_inference_logs_job_eligible(job):
         raise HTTPException(409, "Inference logs are available only while the RHAIIS run is active")
     if not await _rhaiis_inference_logs_available(job_name, job):
@@ -1578,7 +1593,8 @@ async def rerun_job(job_name: str, user=Depends(require_admin)):
     forge = spec.get("executionEngine", {}).get("forge", {})
     project = forge.get("project", "unknown")
     spec.pop("shutdown", None)
-    spec.setdefault("ttl", settings.FOURNOS_DEFAULT_JOB_TTL)
+    if settings.FOURNOS_DEFAULT_JOB_TTL:
+        spec.setdefault("ttl", settings.FOURNOS_DEFAULT_JOB_TTL)
     spec["owner"] = _verified_owner(user)
     cpt_run_id, cpt_run_metadata = cpt_run_views.build_new_cpt_attempt(
         source_db_job, spec, spec["owner"]
@@ -1723,7 +1739,8 @@ async def edit_and_submit_job(
     project = str(forge["project"]).strip()
     spec.pop("shutdown", None)
     spec["owner"] = owner
-    spec.setdefault("ttl", settings.FOURNOS_DEFAULT_JOB_TTL)
+    if settings.FOURNOS_DEFAULT_JOB_TTL:
+        spec.setdefault("ttl", settings.FOURNOS_DEFAULT_JOB_TTL)
     cpt_run_id, cpt_run_metadata = cpt_run_views.build_new_cpt_attempt(
         source_db_job, spec, owner
     )
@@ -2009,7 +2026,6 @@ async def submit_job(req: SubmitJobRequest, user=Depends(require_auth)):
         "displayName": display_name,
         "owner": owner,
         "pipeline": req.pipeline,
-        "ttl": settings.FOURNOS_DEFAULT_JOB_TTL,
         "exclusive": req.exclusive,
         "executionEngine": {
             "forge": {
@@ -2019,6 +2035,8 @@ async def submit_job(req: SubmitJobRequest, user=Depends(require_auth)):
             }
         },
     }
+    if settings.FOURNOS_DEFAULT_JOB_TTL:
+        spec["ttl"] = settings.FOURNOS_DEFAULT_JOB_TTL
     if req.priority and req.priority.strip():
         spec["priority"] = req.priority.strip()
     if req.gpu_type.strip():
@@ -2126,25 +2144,28 @@ async def submit_job(req: SubmitJobRequest, user=Depends(require_auth)):
 
 # ─── routes: matrix/CPT tracking ────────────────────────────────────────
 
-async def _load_cpt_run_groups() -> list[dict[str, Any]]:
+async def _load_cpt_run_groups(group_ids: list[str]) -> list[dict[str, Any]]:
+    """Build CPT views for a bounded set of indexed group IDs."""
+    if not group_ids:
+        return []
     async with AsyncSessionLocal() as session:
         result = await session.execute(
             select(FournosJob)
-            .where(FournosJob.cpt_run_id.is_not(None))
+            .where(FournosJob.cpt_group_id.in_(group_ids))
             .order_by(FournosJob.created_at.desc())
         )
-        jobs = result.scalars().all()
+        jobs = list(result.scalars().all())
         archive_result = await session.execute(
-            select(FournosCptRunJobArchive).order_by(
-                FournosCptRunJobArchive.created_at.desc()
-            )
+            select(FournosCptRunJobArchive)
+            .where(FournosCptRunJobArchive.cpt_group_id.in_(group_ids))
+            .order_by(FournosCptRunJobArchive.created_at.desc())
         )
         archive_jobs = archive_result.scalars().all()
 
     tracked_pairs = {(job.name, job.cpt_run_id) for job in jobs}
     for archived in archive_jobs:
         # A live watcher record wins for real jobs; archive-only rows fill in
-        # failed submissions and jobs that were absent when the backfill ran.
+        # failed submissions and jobs absent from the live-job history table.
         if archived.job_name and (archived.job_name, archived.run_id) in tracked_pairs:
             continue
         metadata = dict(archived.cpt_run_metadata or {})
@@ -2152,6 +2173,7 @@ async def _load_cpt_run_groups() -> list[dict[str, Any]]:
             name=archived.job_name or "",
             job_name=archived.job_name,
             cpt_run_id=archived.run_id,
+            cpt_group_id=archived.cpt_group_id,
             cpt_run_metadata=metadata,
             submission_status=archived.submission_status,
             status=archived.status,
@@ -2162,7 +2184,90 @@ async def _load_cpt_run_groups() -> list[dict[str, Any]]:
             stop_requested_at=archived.stop_requested_at,
             cpt_stop_message=archived.stop_message,
         ))
-    return cpt_run_views.build_cpt_run_groups(list(jobs))
+    return cpt_run_views.build_cpt_run_groups(jobs)
+
+
+_CPT_FILTER_OPTIONS_CACHE: dict[bool, tuple[float, dict[str, list[str]]]] = {}
+_CPT_FILTER_OPTIONS_TTL_SECONDS = 60.0
+
+
+async def _cpt_filter_options(include_owner: bool) -> dict[str, list[str]]:
+    cached = _CPT_FILTER_OPTIONS_CACHE.get(include_owner)
+    now = time.monotonic()
+    if cached and now - cached[0] < _CPT_FILTER_OPTIONS_TTL_SECONDS:
+        return cached[1]
+
+    fields = {
+        "projects": "project",
+        "versions": "version_label",
+        "accelerators": "accelerator",
+        "clusters": "cluster",
+    }
+    if include_owner:
+        fields["owners"] = "owner"
+    options: dict[str, list[str]] = {}
+    async with AsyncSessionLocal() as session:
+        for output_key, metadata_key in fields.items():
+            values: set[str] = set()
+            for model in (FournosJob, FournosCptRunJobArchive):
+                expression = model.cpt_run_metadata[metadata_key].as_string()
+                result = await session.execute(
+                    select(expression)
+                    .where(
+                        model.cpt_group_id.is_not(None),
+                        expression.is_not(None),
+                        expression != "",
+                    )
+                    .distinct()
+                    .limit(500)
+                )
+                values.update(
+                    str(value).strip() for value in result.scalars().all()
+                    if str(value or "").strip()
+                )
+            options[output_key] = sorted(values, key=str.casefold)
+    _CPT_FILTER_OPTIONS_CACHE[include_owner] = (now, options)
+    return options
+
+
+async def _page_cpt_group_ids(
+    filters: dict[str, str], page: int, per_page: int
+) -> tuple[int, list[str]]:
+    def activity_query(model):
+        conditions = [model.cpt_group_id.is_not(None)]
+        for key, value in filters.items():
+            if value:
+                conditions.append(model.cpt_run_metadata[key].as_string() == value)
+        return select(
+            model.cpt_group_id.label("group_id"),
+            model.created_at.label("created_at"),
+        ).where(*conditions)
+
+    async with AsyncSessionLocal() as session:
+        activity = union_all(
+            activity_query(FournosJob),
+            activity_query(FournosCptRunJobArchive),
+        ).subquery()
+        grouped = (
+            select(
+                activity.c.group_id,
+                func.max(activity.c.created_at).label("latest_created_at"),
+            )
+            .group_by(activity.c.group_id)
+            .subquery()
+        )
+        count_result = await session.execute(
+            select(func.count()).select_from(grouped)
+        )
+        total = int(count_result.scalar() or 0)
+        id_result = await session.execute(
+            select(grouped.c.group_id)
+            .order_by(grouped.c.latest_created_at.desc(), grouped.c.group_id)
+            .offset((page - 1) * per_page)
+            .limit(per_page)
+        )
+        group_ids = [str(value) for value in id_result.scalars().all()]
+    return total, group_ids
 
 
 @router.get("/cpt-runs")
@@ -2174,10 +2279,24 @@ async def list_cpt_runs(
     cluster: str = Query("", max_length=255),
     owner: str = Query("", max_length=255),
     show_stopped: bool = False,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(25, ge=1, le=100),
 ):
     include_owner = get_current_user(request) is not None
     effective_owner = owner if include_owner else ""
-    groups = await _load_cpt_run_groups()
+    filters = {
+        "project": project,
+        "version_label": version,
+        "accelerator": accelerator,
+        "cluster": cluster,
+        "owner": effective_owner,
+    }
+
+    total, group_ids = await _page_cpt_group_ids(
+        filters, page, per_page
+    )
+
+    groups = await _load_cpt_run_groups(group_ids)
     matching = cpt_run_views.filter_cpt_run_groups(
         groups,
         project=project,
@@ -2187,35 +2306,29 @@ async def list_cpt_runs(
         owner=effective_owner,
         show_stopped=show_stopped,
     )
+    hidden_stopped_count = sum(group["status"] == "Stopped" for group in groups)
+    filter_options = await _cpt_filter_options(include_owner)
     return {
-        "projects": sorted({group["project"] for group in groups if group["project"]}),
+        "projects": filter_options.get("projects", []),
         "groups": matching if include_owner else [
             cpt_run_views.redact_cpt_group_owners(group) for group in matching
         ],
-        "hidden_stopped_count": sum(
-            group["status"] == "Stopped"
-            for group in cpt_run_views.filter_cpt_run_groups(
-                groups,
-                project=project,
-                version=version,
-                accelerator=accelerator,
-                cluster=cluster,
-                owner=effective_owner,
-                show_stopped=True,
-            )
-        ),
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "hidden_stopped_count": hidden_stopped_count,
         "filter_options": {
-            "versions": sorted({group["version_label"] for group in groups if group["version_label"]}, key=str.casefold),
-            "accelerators": sorted({group["accelerator"] for group in groups if group["accelerator"]}, key=str.casefold),
-            "clusters": sorted({group["cluster"] for group in groups if group["cluster"]}, key=str.casefold),
-            "owners": sorted({group_owner for group in groups for group_owner in group["owners"] if group_owner}, key=str.casefold) if include_owner else [],
+            "versions": filter_options.get("versions", []),
+            "accelerators": filter_options.get("accelerators", []),
+            "clusters": filter_options.get("clusters", []),
+            "owners": filter_options.get("owners", []) if include_owner else [],
         },
     }
 
 
 @router.get("/cpt-runs/{group_id}")
 async def get_cpt_run_group(group_id: str, request: Request):
-    groups = await _load_cpt_run_groups()
+    groups = await _load_cpt_run_groups([group_id])
     group = next((item for item in groups if item["id"] == group_id), None)
     if group is None:
         raise HTTPException(404, "CPT run group not found")
@@ -2227,7 +2340,7 @@ async def get_cpt_run_group(group_id: str, request: Request):
 @router.post("/cpt-runs/groups/{group_id}/stop")
 async def stop_cpt_run_group(group_id: str, _=Depends(require_admin)):
     """Request stop for active matrix children and record the request promptly."""
-    groups = await _load_cpt_run_groups()
+    groups = await _load_cpt_run_groups([group_id])
     group = next((item for item in groups if item["id"] == group_id), None)
     if group is None:
         raise HTTPException(404, "CPT run group not found")
@@ -2322,20 +2435,21 @@ async def update_cpt_run_version(run_id: str, request: Request, _=Depends(requir
             metadata = dict(job.cpt_run_metadata or {})
             metadata["version_label"] = version_label
             job.cpt_run_metadata = metadata
+            job.cpt_group_id = cpt_run_views.cpt_group_id(metadata)
         for archive_job in archive_jobs:
             metadata = dict(archive_job.cpt_run_metadata or {})
             metadata["version_label"] = version_label
             archive_job.cpt_run_metadata = metadata
+            archive_job.cpt_group_id = cpt_run_views.cpt_group_id(metadata)
         await session.flush()
 
-    groups = await _load_cpt_run_groups()
-    group = next((item for item in groups if any(
-        attempt["id"] == run_id for attempt in item["attempts"]
-    )), None)
+    updated_metadata = dict((jobs or archive_jobs)[0].cpt_run_metadata or {})
+    group_id = cpt_run_views.cpt_group_id(updated_metadata) or ""
+    _CPT_FILTER_OPTIONS_CACHE.clear()
     return {
         "status": "ok",
         "version_label": version_label,
-        "group_id": group["id"] if group else "",
+        "group_id": group_id,
     }
 
 
@@ -2344,23 +2458,153 @@ async def update_cpt_run_version(run_id: str, request: Request, _=Depends(requir
 # Generic across every project that declares a `kind: matrix` mode in its
 # ui/submit.yaml (see app/schemas/ui_schema.py) — no project-specific code.
 
+def _normalize_matrix_cluster(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.casefold())
+
+
+async def _validate_matrix_submission(req: SubmitMatrixRequest):
+    """Resolve client selections against the current server-side Forge schema."""
+    project = req.project.strip()
+    mode_id = req.matrix_mode_id.strip()
+    pipeline_key = req.selected_pipeline_key.strip()
+    if not project or not mode_id or not pipeline_key:
+        raise HTTPException(400, "Project, matrix mode, and pipeline are required")
+    schema = await project_ui_schema.get_schema(project)
+    if schema is None:
+        raise HTTPException(400, "Forge submit schema is unavailable for this project")
+    mode = next(
+        (
+            candidate for candidate in schema.modes
+            if candidate.id == mode_id and candidate.kind == "matrix"
+        ),
+        None,
+    )
+    if mode is None:
+        raise HTTPException(400, "The selected matrix mode is not present in the current Forge schema")
+    pipeline = next(
+        (candidate for candidate in mode.pipelines if candidate.key == pipeline_key),
+        None,
+    )
+    if pipeline is None:
+        raise HTTPException(400, "The selected matrix pipeline is not present in the current Forge schema")
+    is_cpt_mode = mode.id == "cpt"
+    submitted_cpt_key = req.matrix_pipeline_key.strip()
+    if is_cpt_mode and submitted_cpt_key != pipeline.key:
+        raise HTTPException(400, "CPT tracking must reference the selected CPT pipeline")
+    if not is_cpt_mode and submitted_cpt_key:
+        raise HTTPException(400, "CPT tracking must reference the selected CPT pipeline")
+
+    submitted_field_values = {
+        "engine": req.engine.strip(),
+        "accelerator": req.accelerator.strip(),
+        "version": req.version_label.strip(),
+        "engine_version": req.engine_version.strip(),
+    }
+    schema_fields = {
+        field.key: field
+        for section in getattr(mode, "sections", [])
+        for field in section.fields
+    }
+    for field_key, value in submitted_field_values.items():
+        field = schema_fields.get(field_key)
+        if value and field and field.options:
+            allowed_values = {option.value for option in field.options}
+            if value not in allowed_values:
+                raise HTTPException(
+                    400,
+                    "The selected {} is not present in the current Forge schema".format(
+                        field_key.replace("_", " ")
+                    ),
+                )
+
+    for field_key in ("engine", "accelerator"):
+        pipeline_value = getattr(pipeline, field_key, None)
+        submitted_value = submitted_field_values[field_key]
+        if (
+            pipeline_value
+            and submitted_value
+            and str(pipeline_value).casefold() != submitted_value.casefold()
+        ):
+            raise HTTPException(
+                400,
+                "The selected {} does not match the selected matrix pipeline".format(
+                    field_key
+                ),
+            )
+
+    allowed_job_pipelines = {
+        value.strip() for value in settings.FOURNOS_DEFAULT_PIPELINES.split(",")
+        if value.strip()
+    }
+    if req.pipeline.strip() not in allowed_job_pipelines:
+        raise HTTPException(400, "The selected Fournos execution pipeline is not configured")
+
+    if pipeline.clusters:
+        allowed_clusters = {
+            _normalize_matrix_cluster(name): name for name in pipeline.clusters if name.strip()
+        }
+        cluster_key = _normalize_matrix_cluster(req.cluster)
+        if cluster_key not in allowed_clusters:
+            raise HTTPException(400, "The selected cluster is not allowed by this matrix pipeline")
+        cluster = allowed_clusters[cluster_key]
+    else:
+        cluster = req.cluster.strip()
+
+    requested_workloads = [str(value).strip() for value in req.workloads]
+    if len(requested_workloads) != len(set(requested_workloads)):
+        raise HTTPException(400, "Duplicate workloads are not allowed")
+    allowed_workloads = set(pipeline.workloads)
+    for model in pipeline.models:
+        allowed_workloads.update(model.workloads or [])
+    if not requested_workloads or not set(requested_workloads).issubset(allowed_workloads):
+        raise HTTPException(400, "One or more selected workloads are not allowed by this matrix pipeline")
+
+    schema_models = {model.key: model for model in pipeline.models}
+    submitted_keys = [model.key for model in req.models]
+    if len(submitted_keys) != len(set(submitted_keys)):
+        raise HTTPException(400, "Duplicate models are not allowed")
+    unknown_models = [key for key in submitted_keys if key not in schema_models]
+    if unknown_models:
+        raise HTTPException(400, "One or more selected models are not allowed by this matrix pipeline")
+
+    selected_models = []
+    for model_key in submitted_keys:
+        model = schema_models[model_key]
+        supported = set(model.workloads or pipeline.workloads)
+        model_workloads = [value for value in requested_workloads if value in supported]
+        if model_workloads:
+            selected_models.append((model, model_workloads))
+    if not selected_models:
+        raise HTTPException(400, "No selected models support any of the selected workloads")
+    pipeline_gpu_type = getattr(pipeline, "gpu_type", None)
+    if pipeline_gpu_type and req.gpu_type and pipeline_gpu_type.casefold() != req.gpu_type.casefold():
+        raise HTTPException(400, "The selected GPU type is not allowed by this matrix pipeline")
+    return pipeline, selected_models, requested_workloads, cluster
+
+
 @router.post("/submit-matrix", response_model=SubmitMatrixResponse)
 async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
-    """Submit one FournosJob per selected model with supported workloads.
-
-    Model-specific workload availability is intersected with the request's
-    globally selected workload columns. Older clients that omit availability
-    retain the previous all-models-by-all-workloads behavior.
-    """
+    """Submit one FournosJob per schema-selected model and supported workload."""
     if not req.models or not req.workloads:
         raise HTTPException(400, "models and workloads are required")
-    if req.project.strip().lower() == "rhaiis" and req.matrix_pipeline_key.strip():
+    selected_pipeline, selected_models, selected_workloads, matrix_cluster = (
+        await _validate_matrix_submission(req)
+    )
+    is_cpt_submission = req.matrix_mode_id.strip() == "cpt"
+    if req.project.strip().lower() == "rhaiis" and is_cpt_submission:
         if not req.version_label.strip():
             raise HTTPException(400, "Version label is required for RHAIIS CPT submissions")
         if not req.engine_version.strip():
             raise HTTPException(400, "Engine image/version is required for RHAIIS CPT submissions")
 
     owner = _verified_owner(user)
+    matrix_engine = str(getattr(selected_pipeline, "engine", None) or req.engine).strip()
+    matrix_accelerator = str(
+        getattr(selected_pipeline, "accelerator", None) or req.accelerator
+    ).strip()
+    matrix_gpu_type = str(
+        getattr(selected_pipeline, "gpu_type", None) or req.gpu_type
+    ).strip()
     try:
         normalized_work_items = normalize_work_items(req.work_items)
         normalized_run_group_ids = normalize_group_ids(req.run_group_ids)
@@ -2381,19 +2625,6 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
     source_env, source_fields = await _resolve_source_request(
         req.pull_request, resolved_pull_sha
     )
-    selected_models: list[tuple[Any, list[str]]] = []
-    for model_item in req.models:
-        available = set(model_item.workloads or req.workloads)
-        model_workloads = [
-            workload for workload in req.workloads if workload in available
-        ]
-        if model_workloads:
-            selected_models.append((model_item, model_workloads))
-    if not selected_models:
-        raise HTTPException(
-            400, "No selected models support any of the selected workloads"
-        )
-
     model_prefixes = [
         re.sub(
             r"[^a-z0-9-]",
@@ -2411,17 +2642,17 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
             400, "models must produce unique Kubernetes job names"
         )
     results = []
-    cpt_run_id = str(uuid4()) if req.matrix_pipeline_key.strip() else None
+    cpt_run_id = str(uuid4()) if is_cpt_submission else None
     run_started_at = datetime.now(timezone.utc).isoformat()
     cpt_run_base = {
         "project": req.project,
-        "pipeline_key": req.matrix_pipeline_key.strip(),
+        "pipeline_key": selected_pipeline.key if cpt_run_id else "",
         "version_label": req.version_label.strip() or "Unspecified",
-        "cluster": req.cluster,
-        "accelerator": req.accelerator.strip(),
-        "engine": req.engine.strip(),
+        "cluster": matrix_cluster,
+        "accelerator": matrix_accelerator,
+        "engine": matrix_engine,
         "engine_version": req.engine_version.strip(),
-        "fournos_pipeline": req.pipeline,
+        "fournos_pipeline": req.pipeline.strip(),
         "forge_source": (
             source_fields.get("source_requested_sha")
             or source_fields.get("source_resolved_sha")
@@ -2429,19 +2660,18 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
             or ("main" if req.use_latest_main else "Unknown")
         ),
         "owner": owner,
-        "configured_model_count": (
-            req.configured_model_count
-            if req.configured_model_count is not None
-            else len(req.models)
-        ),
-        "workloads": list(req.workloads),
+        "configured_model_count": len(selected_pipeline.models),
+        "workloads": list(selected_workloads),
         "started_at": run_started_at,
     }
+    submitted_models = {model.key: model for model in req.models}
+    cpt_tracking_persisted = False
     for (model_item, model_workloads), job_name in zip(selected_models, job_names):
         args = list(req.args) + [model_item.key] + model_workloads
 
-        job_overrides: dict[str, Any] = dict(req.config_overrides)
-        job_overrides.update({k: v for k, v in model_item.overrides.items()})
+        job_overrides: dict[str, Any] = dict(selected_pipeline.overrides)
+        job_overrides.update(req.config_overrides)
+        job_overrides.update(model_item.overrides)
         job_overrides = project_adapters.normalize_overrides(
             req.project, job_overrides
         )
@@ -2449,7 +2679,7 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
             req.project, job_overrides, model_workloads
         )
 
-        display_name = "{}-{}-{}".format(req.project, model_item.key, req.cluster)
+        display_name = "{}-{}-{}".format(req.project, model_item.key, matrix_cluster)
         env = dict(source_env)
         cpt_run_metadata = {
             **cpt_run_base,
@@ -2459,11 +2689,10 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
         } if cpt_run_id else {}
 
         spec: dict[str, Any] = {
-            "cluster": req.cluster,
+            "cluster": matrix_cluster,
             "displayName": display_name,
             "owner": owner,
-            "pipeline": req.pipeline,
-            "ttl": settings.FOURNOS_DEFAULT_JOB_TTL,
+            "pipeline": req.pipeline.strip(),
             "exclusive": req.exclusive,
             "executionEngine": {
                 "forge": {
@@ -2473,12 +2702,16 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
                 }
             },
         }
+        if settings.FOURNOS_DEFAULT_JOB_TTL:
+            spec["ttl"] = settings.FOURNOS_DEFAULT_JOB_TTL
         if req.priority and req.priority.strip():
             spec["priority"] = req.priority.strip()
-        if req.gpu_type.strip() or model_item.gpu_count:
+        submitted_model = submitted_models[model_item.key]
+        model_gpu_count = model_item.tp or submitted_model.gpu_count
+        if matrix_gpu_type or model_gpu_count:
             spec["hardware"] = {
-                "gpuType": req.gpu_type.strip() or "unknown",
-                "gpuCount": model_item.gpu_count or 1,
+                "gpuType": matrix_gpu_type or "unknown",
+                "gpuCount": model_gpu_count or 1,
             }
         _apply_scheduling(spec, req.schedule, req.scheduled_start_time)
 
@@ -2515,8 +2748,8 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
                     name=job_name,
                     project=req.project,
                     preset="{} {}".format(model_item.key, " ".join(model_workloads)),
-                    cluster=req.cluster,
-                    pipeline=req.pipeline,
+                    cluster=matrix_cluster,
+                    pipeline=req.pipeline.strip(),
                     owner=owner,
                     requester_subject=user.get("subject", ""),
                     requester_email=user.get("email", ""),
@@ -2561,6 +2794,8 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
             })
             continue
 
+        if cpt_run_id:
+            cpt_tracking_persisted = True
         try:
             created = await asyncio.to_thread(k8s.create_fournos_job, body)
             created_name = created.get("metadata", {}).get("name", job_name)
@@ -2592,11 +2827,17 @@ async def submit_matrix(req: SubmitMatrixRequest, user=Depends(require_auth)):
                 "error": str(exc),
             })
 
+    if cpt_run_id:
+        _CPT_FILTER_OPTIONS_CACHE.clear()
     return {
         "status": "ok",
         "jobs": results,
         "total": len(results),
         "cpt_run_id": cpt_run_id,
+        "cpt_group_id": (
+            cpt_run_views.cpt_group_id(cpt_run_base)
+            if cpt_run_id and cpt_tracking_persisted else None
+        ),
     }
 
 

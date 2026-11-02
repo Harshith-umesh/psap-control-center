@@ -610,6 +610,8 @@ export const fournosApi = {
     cluster?: string
     owner?: string
     show_stopped?: boolean
+    page?: number
+    per_page?: number
   } = {}): Promise<import('../types').CptRunListResponse> => {
     const { data } = await api.get('/fournos/cpt-runs', { params })
     return data

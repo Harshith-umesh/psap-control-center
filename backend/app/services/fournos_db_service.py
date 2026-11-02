@@ -20,6 +20,7 @@ from app.models.fournos_job import (
     FournosJobWorkItem,
     FournosRunGroup,
 )
+from app.services.cpt_run_views import cpt_group_id as get_cpt_group_id
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,9 @@ def _text_search_expression(columns, query: str, *, postgres: bool):
 
 
 async def upsert_job(session: AsyncSession, **kwargs: Any) -> FournosJob:
+    metadata = kwargs.get("cpt_run_metadata")
+    if kwargs.get("cpt_run_id") and isinstance(metadata, dict):
+        kwargs["cpt_group_id"] = get_cpt_group_id(metadata)
     if "id" not in kwargs:
         kwargs["id"] = str(uuid4())
 

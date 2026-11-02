@@ -46,6 +46,13 @@ def _group_id(fields: tuple[str, ...]) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24]
 
 
+def cpt_group_id(metadata: dict[str, Any]) -> str | None:
+    """Return the stable group identifier for one tracked CPT child."""
+    if not isinstance(metadata, dict) or not _text(metadata.get("pipeline_key")):
+        return None
+    return _group_id(_fields(metadata))
+
+
 def _status(job: Any) -> str:
     if getattr(job, "submission_status", "") == "Failed":
         return "Not submitted"

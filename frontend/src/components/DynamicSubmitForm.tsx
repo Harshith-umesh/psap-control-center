@@ -453,6 +453,8 @@ export default function DynamicSubmitForm({
           pipeline: basics.pipeline,
           args,
           config_overrides: mergeMatrixConfigOverrides(selectedPipeline.overrides, overrides),
+          matrix_mode_id: activeMode.id,
+          selected_pipeline_key: selectedPipeline.key,
           matrix_pipeline_key: activeMode.id === 'cpt' ? selectedPipeline.key : '',
           version_label: String(values.version || '').trim(),
           accelerator: String(values.accelerator || '').trim(),
@@ -575,9 +577,9 @@ export default function DynamicSubmitForm({
             )
           })}
         </ul>
-        {matrixSubmissionResult.cpt_run_id && (
+        {matrixSubmissionResult.cpt_group_id && (
           <Link
-            to={'/testing?tab=cpt&group=' + encodeURIComponent(matrixSubmissionResult.cpt_run_id)}
+            to={'/testing?tab=cpt&group=' + encodeURIComponent(matrixSubmissionResult.cpt_group_id)}
             className="mt-3 inline-flex text-sm font-semibold text-indigo-700 hover:underline"
           >
             Track this CPT run

@@ -35,6 +35,7 @@ import WizardSteps from '../components/WizardSteps'
 import ReviewRow, { ReviewSection } from '../components/ReviewRow'
 import YamlPreview from '../components/YamlPreview'
 import SearchableSelect from '../components/SearchableSelect'
+import EditableCombobox from '../components/EditableCombobox'
 import { getForgeProjectUiSettings } from '../projects/rhaiis'
 import { buildSingleJobPreview, toYamlPreview, withVersionOverride } from '../utils/fournosJobPreview'
 import { workItemFromInput } from '../utils/workItems'
@@ -70,6 +71,7 @@ import {
   useRefreshProjectUiSchema,
   useClusterOverview,
   useHistoryPreference,
+  useHistoryFilterOptions,
   useSaveHistoryPreference,
   useResetHistoryPreference,
   useWorkItemConfig,
@@ -87,7 +89,6 @@ import type {
   HistoryViewState,
 } from '../types'
 
-const QUEUED_CLUSTER_NAMES = ['janus', 'athena-fire', 'b200', 'hera', 'mi355x', 'old-zeus', 'zeus', 'dodo']
 
 const STATUS_COLORS: Record<string, string> = {
   Running: 'bg-blue-100 text-blue-800',
@@ -578,7 +579,6 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
   const [version, setVersion] = useState('')
   const [owner, setOwner] = useState(() => getDisplayName() || '')
   const [priority, setPriority] = useState('manual')
-  const [priorityTouched, setPriorityTouched] = useState(false)
   const [exclusive, setExclusive] = useState(false)
   const [configRaw, setConfigRaw] = useState('')
   const [pullSha, setPullSha] = useState('')
@@ -701,8 +701,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
 
   const handleRhaiisCptModeChange = useCallback((isCptMode: boolean) => {
     setRhaiisCptMode(isCptMode)
-    if (!priorityTouched) setPriority(isCptMode ? 'nightly' : 'manual')
-  }, [priorityTouched])
+  }, [])
 
   const filteredPRs = useMemo(() => {
     if (!githubPRs) return []
@@ -720,7 +719,6 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
     setProject(name)
     setPipeline(getForgeProjectUiSettings(name).defaultPipeline)
     setPriority('manual')
-    setPriorityTouched(false)
     setPreset('')
     setVersion('')
     setPullSha('')
@@ -1098,10 +1096,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
               <label className="block text-sm font-medium text-gray-700">Priority</label>
               <select
                 value={priority}
-                onChange={(e) => {
-                  setPriority(e.target.value)
-                  setPriorityTouched(true)
-                }}
+                onChange={(e) => setPriority(e.target.value)}
                 className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm"
               >
                 <option value="manual">manual — 200 (highest, Intlab)</option>
@@ -1861,6 +1856,7 @@ export default function Testing() {
   const [historyTags, setHistoryTags] = useState(initialHistory.tags.join(', '))
   const [historyPerPage, setHistoryPerPage] = useState(initialHistory.per_page)
   const authenticated = isAuthenticated()
+  const { data: historyFilterOptions } = useHistoryFilterOptions(activeTab === 'history')
   // History-only date + local time-of-day range filter. Empty historyDate
   // means "no time filter" — from/to only matter once a date is picked.
   const [historyDate, setHistoryDate] = useState(initialHistory.history_date)
@@ -2105,7 +2101,10 @@ export default function Testing() {
       Object.entries(countsByCluster).map(([name, counts]) => [normalizeClusterName(name), counts])
     )
     const clusterNamesByKey = new Map(
-      QUEUED_CLUSTER_NAMES.map((name) => [normalizeClusterName(name), name]),
+      (clustersData?.clusters || []).map((cluster: Cluster) => [
+        normalizeClusterName(cluster.name),
+        cluster.name,
+      ]),
     )
     Object.keys(countsByCluster).forEach((name) => {
       const normalizedName = normalizeClusterName(name)
@@ -2124,7 +2123,7 @@ export default function Testing() {
         }
       })
       .sort((a, b) => b.queued - a.queued || b.active - a.active || a.cluster.localeCompare(b.cluster))
-  }, [liveJobSummary?.by_cluster])
+  }, [liveJobSummary?.by_cluster, clustersData?.clusters])
   const filterProjectNames = useMemo(
     () => (forgeProjects || []).map((p: ForgeProject) => p.name),
     [forgeProjects]
@@ -2363,6 +2362,100 @@ export default function Testing() {
                 </div>
               )}
             </>
+          )}
+          {activeTab === 'history' && (
+            <details className="w-full border-t border-gray-200 pt-2">
+              <summary className="cursor-pointer select-none text-xs font-medium text-gray-600 hover:text-gray-800">
+                Filter list
+              </summary>
+              <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                {authenticated && (
+                  <EditableCombobox
+                    value={historyIdentity}
+                    maxLength={255}
+                    onChange={(value) => { setHistoryIdentity(value); setPage(1) }}
+                    options={historyFilterOptions?.identities || []}
+                    placeholder="Owner or requester"
+                    ariaLabel="Owner or requester"
+                  />
+                )}
+                <select
+                  value={historyFailure}
+                  onChange={(e) => { setHistoryFailure(e.target.value); setPage(1) }}
+                  aria-label="Failure outcome"
+                  className="rounded-md border-gray-300 text-sm shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                >
+                  <option value="">All failure outcomes</option>
+                  <option value="failed">Failed</option>
+                  <option value="cancelled">Cancelled</option>
+                  <option value="infrastructure_error">Infrastructure error</option>
+                  <option value="unknown">Unknown</option>
+                </select>
+                <EditableCombobox
+                  value={historyRepository}
+                  maxLength={255}
+                  onChange={(value) => { setHistoryRepository(value); setPage(1) }}
+                  options={historyFilterOptions?.repositories || []}
+                  placeholder="Repository (owner/name)"
+                  ariaLabel="Source repository"
+                />
+                <EditableCombobox
+                  value={historyPrNumber}
+                  onChange={(value) => { setHistoryPrNumber(value.replace(/\D/g, '')); setPage(1) }}
+                  options={(historyFilterOptions?.pr_numbers || []).map(String)}
+                  inputMode="numeric"
+                  placeholder="PR number"
+                  ariaLabel="Pull request number"
+                />
+                <EditableCombobox
+                  value={historySourceSha}
+                  maxLength={64}
+                  onChange={(value) => {
+                    setHistorySourceSha(value.replace(/[^0-9a-fA-F]/g, '').slice(0, 64))
+                    setPage(1)
+                  }}
+                  options={historyFilterOptions?.source_shas || []}
+                  placeholder="Requested/submitted SHA"
+                  ariaLabel="Source commit SHA"
+                />
+                <EditableCombobox
+                  value={historyForge}
+                  maxLength={255}
+                  onChange={(value) => { setHistoryForge(value); setPage(1) }}
+                  options={historyFilterOptions?.forge || []}
+                  placeholder="Forge version or image digest"
+                  ariaLabel="Forge version or image digest"
+                />
+                {authenticated && (
+                  <EditableCombobox
+                    value={historyWorkItemProvider}
+                    maxLength={50}
+                    onChange={(value) => { setHistoryWorkItemProvider(value.toLowerCase()); setPage(1) }}
+                    options={historyFilterOptions?.work_item_providers || ['jira']}
+                    placeholder="Work-item provider"
+                    ariaLabel="Work-item provider"
+                  />
+                )}
+                {authenticated && (
+                  <EditableCombobox
+                    value={historyWorkItemKey}
+                    maxLength={100}
+                    onChange={(value) => { setHistoryWorkItemKey(value.toUpperCase()); setPage(1) }}
+                    options={historyFilterOptions?.work_item_keys || []}
+                    placeholder="Work-item key"
+                    ariaLabel="Work-item key"
+                  />
+                )}
+                <EditableCombobox
+                  value={historyTags}
+                  onChange={(value) => { setHistoryTags(value); setPage(1) }}
+                  options={historyFilterOptions?.tags || []}
+                  multiple
+                  placeholder="Tags (comma-separated)"
+                  ariaLabel="Tags"
+                />
+              </div>
+            </details>
           )}
           {(
             (activeTab === 'live' && (filterProject || filterCluster || filterStatus || requesterScope === 'mine')) ||

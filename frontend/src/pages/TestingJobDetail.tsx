@@ -552,7 +552,7 @@ export default function TestingJobDetail() {
             <div>
               <h2 className="text-sm font-semibold text-gray-900">Edit and submit as a new job</h2>
               <p className="mt-1 max-w-3xl text-xs leading-5 text-gray-500">
-                Edit the JSON FournosJob spec below, then submit it as a separate run. The current job is unchanged; owner is set to your signed-in identity and the default TTL is 12h. Scheduling fields are omitted so this creates a one-off run.
+                Edit the JSON FournosJob spec below, then submit it as a separate run. The current job is unchanged; owner is set to your signed-in identity. TTL follows the backend configuration, and the Fournos operator applies its default when no override is set. Scheduling fields are omitted so this creates a one-off run.
               </p>
             </div>
             <button type="button" onClick={() => setEditSubmitOpen(false)} className="text-sm text-gray-500 hover:text-gray-700">Close</button>

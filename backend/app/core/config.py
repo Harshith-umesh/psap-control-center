@@ -53,7 +53,8 @@ class Settings(BaseSettings):
     FOURNOS_API_VERSION: str = "v1"
     FOURNOS_JOB_PLURAL: str = "fournosjobs"
     FOURNOS_K8S_TIMEOUT: int = 30
-    FOURNOS_DEFAULT_JOB_TTL: str = "12h"
+    # When unset, let the Fournos operator apply its configured default TTL.
+    FOURNOS_DEFAULT_JOB_TTL: Optional[str] = None
     TARGET_CLUSTER_SECRETS_NAMESPACE: str = "psap-secrets"
     # Optional read-only source used by the one-time Fournos history backfill.
     FOURNOS_ARCHIVE_DATABASE_URL: Optional[str] = None

@@ -3,6 +3,8 @@ import {
   ServerStackIcon,
   CpuChipIcon,
   CheckCircleIcon,
+  UserGroupIcon,
+  CalendarDaysIcon,
   FireIcon,
   LockClosedIcon,
   ExclamationTriangleIcon,
@@ -10,6 +12,7 @@ import {
 } from '@heroicons/react/24/outline'
 import { useQueries } from '@tanstack/react-query'
 import { useClusters } from '../hooks/useClusters'
+import { useReservations } from '../hooks/useReservations'
 import { useHearthClusters } from '../hooks/useHearth'
 import { useFournosLiveJobSummary } from '../hooks/useFournos'
 import { clusterApi } from '../services/api'
@@ -20,6 +23,7 @@ import GpuDonutChart from '../components/GpuDonutChart'
 
 export default function Dashboard() {
   const { data: clustersData, isLoading: clustersLoading } = useClusters()
+  const { data: reservationsData, isLoading: reservationsLoading } = useReservations()
   const {
     data: liveJobSummary,
     isLoading: liveJobSummaryLoading,
@@ -31,6 +35,14 @@ export default function Dashboard() {
   const hearthAvailable = hearthData?.available ?? false
 
   const clusters = clustersData?.clusters || []
+  const reservations = reservationsData?.reservations || []
+  const activeReservations = reservations.filter((reservation) => reservation.status === 'active')
+  const upcomingReservations = reservations
+    .filter((reservation) => reservation.status === 'scheduled')
+    .sort((a, b) => new Date(a.start_time).getTime() - new Date(b.start_time).getTime())
+  const pastReservations = reservations
+    .filter((reservation) => ['completed', 'cancelled', 'denied'].includes(reservation.status))
+    .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime())
   const liveJobStatuses = liveJobSummary?.by_status || {}
   const waitingJobs = ['Pending', 'Resolving', 'Admitted'].reduce(
     (total, status) => total + (liveJobStatuses[status] || 0),
@@ -118,6 +130,13 @@ export default function Dashboard() {
       color: 'bg-green-500',
       href: '/clusters',
     },
+    {
+      name: 'Active Reservations',
+      value: activeReservations.length,
+      icon: UserGroupIcon,
+      color: 'bg-orange-500',
+      href: '/reservations',
+    },
   ]
 
   return (
@@ -133,10 +152,13 @@ export default function Dashboard() {
           <Link to="/clusters" className="btn-secondary">
             View Clusters
           </Link>
+          <Link to="/calendar" className="btn-primary">
+            <CalendarDaysIcon className="mr-2 h-4 w-4" /> Open Calendar
+          </Link>
         </div>
       </div>
 
-      <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
+      <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-4">
         {stats.map((stat) => (
           <Link
             key={stat.name}
@@ -150,7 +172,7 @@ export default function Dashboard() {
               <div className="ml-4">
                 <p className="text-sm font-medium text-gray-500">{stat.name}</p>
                 <p className="text-2xl font-semibold text-gray-900">
-                  {clustersLoading ? '...' : stat.value}
+                  {clustersLoading || (stat.name === 'Active Reservations' && reservationsLoading) ? '...' : stat.value}
                 </p>
               </div>
             </div>
@@ -272,6 +294,42 @@ export default function Dashboard() {
           </p>
         )}
       </section>
+
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-3">
+        {[
+          { title: 'Active Reservations', rows: activeReservations, empty: 'No active reservations', muted: false },
+          { title: 'Upcoming Reservations', rows: upcomingReservations.slice(0, 10), empty: 'No upcoming reservations scheduled', muted: false },
+          { title: 'Past Reservations', rows: pastReservations.slice(0, 10), empty: 'No past reservations', muted: true },
+        ].map((section) => (
+          <section key={section.title} className="card overflow-hidden">
+            <div className="flex items-center justify-between border-b border-gray-200 px-5 py-4">
+              <h2 className="font-semibold text-gray-900">{section.title}</h2>
+              <Link to="/reservations" className="text-xs font-medium text-primary-600 hover:text-primary-700">View all</Link>
+            </div>
+            {reservationsLoading ? (
+              <p className="px-5 py-8 text-center text-sm text-gray-400">Loading reservations…</p>
+            ) : section.rows.length === 0 ? (
+              <p className="px-5 py-8 text-center text-sm text-gray-400">{section.empty}</p>
+            ) : (
+              <ul className="divide-y divide-gray-100">
+                {section.rows.slice(0, 5).map((reservation) => (
+                  <li key={reservation.id} className="px-5 py-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <p className={`truncate text-sm font-medium ${section.muted ? 'text-gray-500' : 'text-gray-900'}`}>{reservation.title}</p>
+                        <p className="mt-0.5 text-xs text-gray-500">{reservation.cluster_name || 'Unknown cluster'} · {reservation.user_name}</p>
+                      </div>
+                      <span className="shrink-0 text-right text-xs text-gray-500">
+                        {format(new Date(reservation.start_time), 'MMM d, h:mm a')}
+                      </span>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        ))}
+      </div>
 
       <div className="grid grid-cols-1 gap-6">
         <div className="card">

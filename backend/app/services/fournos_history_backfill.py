@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import (
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.models.fournos_job import FournosCptRunJobArchive, FournosJob
+from app.services.cpt_run_views import cpt_group_id
 
 
 SOURCE_COLUMNS = (
@@ -253,6 +254,9 @@ async def backfill_archived_cpt_jobs(
                                 **metadata,
                                 **existing_metadata,
                             }
+                            target_job.cpt_group_id = cpt_group_id(
+                                target_job.cpt_run_metadata
+                            )
                             linked += 1
                             continue
 
@@ -277,6 +281,7 @@ async def backfill_archived_cpt_jobs(
                                     or datetime.now(timezone.utc)
                                 ),
                                 cpt_run_metadata=metadata,
+                                cpt_group_id=cpt_group_id(metadata),
                             )
                             target.add(record)
                             archived += 1

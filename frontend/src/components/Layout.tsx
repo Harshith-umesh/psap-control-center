@@ -13,6 +13,8 @@ import {
   Bars3Icon,
   HomeIcon,
   ServerStackIcon,
+  CalendarDaysIcon,
+  ClipboardDocumentListIcon,
   BeakerIcon,
   ChartBarIcon,
   ArrowTopRightOnSquareIcon,
@@ -30,6 +32,7 @@ import HearthConnectModal from './HearthConnectModal'
 import { isAuthenticated, isAdmin, getDisplayName, clearSession } from '../stores/authStore'
 import { authApi } from '../services/api'
 import { useHearthStatus, useDisconnectHearth } from '../hooks/useHearth'
+import { useReservations } from '../hooks/useReservations'
 
 type NavigationItem = {
   name: string
@@ -43,7 +46,10 @@ type NavigationItem = {
 const navigation: NavigationItem[] = [
   { name: 'Overview', href: '/dashboard', icon: HomeIcon },
   { name: 'Clusters', href: '/clusters', icon: ServerStackIcon },
-  { name: 'Fournos Dashboard', href: '/testing?tab=live', icon: BeakerIcon },
+  { name: 'Reservations', href: '/reservations', icon: ClipboardDocumentListIcon },
+  { name: 'Calendar', href: '/calendar', icon: CalendarDaysIcon },
+  { name: 'Fournos Dashboard', href: '/testing?tab=live', icon: BeakerIcon, badge: 'Experimental' },
+  { name: 'Results', href: '/results', icon: ChartBarIcon, comingSoon: true },
   { name: 'Cost Explorer', href: '/cost-explorer', icon: CurrencyDollarIcon, adminOnly: true },
   { name: 'Settings', href: '/settings', icon: Cog6ToothIcon, adminOnly: true },
 ]
@@ -52,18 +58,19 @@ const fournDashboardSubnav = [
   { id: 'jobs', name: 'Jobs', href: '/testing?tab=live' },
   { id: 'submit', name: 'Submit', href: '/testing?tab=submit' },
   { id: 'cpt', name: 'CPT Jobs', href: '/testing?tab=cpt' },
+  { id: 'schedules', name: 'Schedules & Locks', href: '/testing?tab=schedules' },
 ] as const
 
 const performanceDashboardSubnav = [
-  { name: 'Production', href: 'https://aidash.app.intlab.redhat.com' },
-    { name: 'Staging', href: 'https://staging-aidash.apps.ocp4.intlab.redhat.com/' },
-] as const
+  { name: 'Production', href: import.meta.env.VITE_PERFORMANCE_DASHBOARD_PRODUCTION_URL as string | undefined },
+  { name: 'Staging', href: import.meta.env.VITE_PERFORMANCE_DASHBOARD_STAGING_URL as string | undefined },
+].filter((item): item is { name: string; href: string } => Boolean(item.href?.trim()))
 
 const psapToolsSubnav = [
-  { name: 'PSAP Report Hub', href: 'https://reports.psap.aws.rhperfscale.org' },
-  { name: 'ConfigIQ', href: 'https://configiq.apps.ocp4.intlab.redhat.com' },
-  { name: 'Servit Studio', href: 'https://inftune-launcher-ui-inftune.apps.ocp4.intlab.redhat.com' },
-] as const
+  { name: 'PSAP Report Hub', href: import.meta.env.VITE_PSAP_REPORT_HUB_URL as string | undefined },
+  { name: 'ConfigIQ', href: import.meta.env.VITE_CONFIGIQ_URL as string | undefined },
+  { name: 'Servit Studio', href: import.meta.env.VITE_SERVIT_STUDIO_URL as string | undefined },
+].filter((item): item is { name: string; href: string } => Boolean(item.href?.trim()))
 
 const SIDEBAR_WIDTH_STORAGE_KEY = 'psap-control-center-sidebar-width'
 const DEFAULT_SIDEBAR_WIDTH = 288
@@ -75,6 +82,7 @@ function clampSidebarWidth(width: number) {
 }
 
 function PerformanceDashboardSection({ onNavigate }: { onNavigate?: () => void }) {
+  if (performanceDashboardSubnav.length === 0) return null
   return (
     <li>
       <div className="flex items-center gap-x-3 border-l-[3px] border-l-transparent px-6 py-3 text-lg font-medium text-gray-300">
@@ -103,6 +111,7 @@ function PerformanceDashboardSection({ onNavigate }: { onNavigate?: () => void }
 }
 
 function PsapToolsSection({ onNavigate }: { onNavigate?: () => void }) {
+  if (psapToolsSubnav.length === 0) return null
   return (
     <li>
       <div className="flex items-center gap-x-3 border-l-[3px] border-l-transparent px-6 py-3 text-lg font-medium text-gray-300">
@@ -255,6 +264,13 @@ export default function Layout() {
 
   const { data: hearthStatus } = useHearthStatus()
   const admin = isAdmin()
+  const { data: pendingReservationsData } = useReservations(
+    { status: 'pending' },
+    { enabled: admin },
+  )
+  const pendingReservationCount = admin
+    ? (pendingReservationsData?.reservations?.length ?? 0)
+    : 0
   const filteredNav = navigation.filter(item => !item.adminOnly || admin)
 
   const syncAuth = useCallback(() => setAuthed(isAuthenticated()), [])
@@ -388,6 +404,11 @@ export default function Layout() {
                                 Soon
                               </span>
                             )}
+                            {item.name === 'Reservations' && pendingReservationCount > 0 && (
+                              <span className="ml-auto rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-300">
+                                {pendingReservationCount} pending
+                              </span>
+                            )}
                             {item.badge && (
                               <span className="ml-auto rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-300">
                                 {item.badge}
@@ -481,6 +502,11 @@ export default function Layout() {
                     {item.comingSoon && (
                       <span className="ml-auto text-xs text-gray-500 bg-white/10 px-2 py-0.5 rounded-full">
                         Soon
+                      </span>
+                    )}
+                    {item.name === 'Reservations' && pendingReservationCount > 0 && (
+                      <span className="ml-auto rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-300">
+                        {pendingReservationCount} pending
                       </span>
                     )}
                     {item.badge && (

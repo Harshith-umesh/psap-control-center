@@ -223,9 +223,12 @@ export default function CptJobsPanel() {
   const [cluster, setCluster] = useState('')
   const [owner, setOwner] = useState('')
   const [showStopped, setShowStopped] = useState(false)
+  const [page, setPage] = useState(1)
+  const pageSize = 25
   const groupId = searchParams.get('group') || ''
   const { data, isLoading, isError, error, refetch } = useCptRuns({
     project, version, accelerator, cluster, owner, show_stopped: showStopped,
+    page, per_page: pageSize,
   })
   const selectedGroupQuery = useCptRunGroup(groupId)
 
@@ -303,13 +306,13 @@ export default function CptJobsPanel() {
       </div>
 
       <div className="flex flex-wrap items-center gap-3">
-        <Filter label="Project" value={project} options={projectOptions} onChange={setProject} />
-        <Filter label="Version" value={version} options={data?.filter_options.versions || []} onChange={setVersion} />
-        <Filter label="Accelerator" value={accelerator} options={data?.filter_options.accelerators || []} onChange={setAccelerator} />
-        <Filter label="Cluster" value={cluster} options={data?.filter_options.clusters || []} onChange={setCluster} />
-        <Filter label="Owner" value={owner} options={data?.filter_options.owners || []} onChange={setOwner} />
-        <button type="button" onClick={() => setShowStopped((value) => !value)} className="ml-auto rounded-md border border-gray-300 bg-white px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50">
-          {showStopped ? 'Hide stopped groups' : `Show stopped groups${data?.hidden_stopped_count ? ` (${data.hidden_stopped_count})` : ''}`}
+        <Filter label="Project" value={project} options={projectOptions} onChange={(value) => { setProject(value); setPage(1) }} />
+        <Filter label="Version" value={version} options={data?.filter_options.versions || []} onChange={(value) => { setVersion(value); setPage(1) }} />
+        <Filter label="Accelerator" value={accelerator} options={data?.filter_options.accelerators || []} onChange={(value) => { setAccelerator(value); setPage(1) }} />
+        <Filter label="Cluster" value={cluster} options={data?.filter_options.clusters || []} onChange={(value) => { setCluster(value); setPage(1) }} />
+        <Filter label="Owner" value={owner} options={data?.filter_options.owners || []} onChange={(value) => { setOwner(value); setPage(1) }} />
+        <button type="button" onClick={() => { setShowStopped((value) => !value); setPage(1) }} className="ml-auto rounded-md border border-gray-300 bg-white px-3 py-1.5 text-xs font-medium text-gray-600 hover:bg-gray-50">
+          {showStopped ? 'Hide stopped groups' : 'Show stopped groups'}
         </button>
       </div>
 
@@ -371,6 +374,30 @@ export default function CptJobsPanel() {
             ) : null}
           </tbody>
         </table>
+      </div>
+
+      <div className="flex items-center justify-between text-sm text-gray-500">
+        <span>
+          {data?.total ? `Page ${page} · ${data.total} CPT groups` : 'No CPT groups'}
+        </span>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setPage((value) => Math.max(1, value - 1))}
+            disabled={page <= 1 || isLoading}
+            className="rounded-md border border-gray-300 bg-white px-3 py-1.5 disabled:opacity-40"
+          >
+            Previous
+          </button>
+          <button
+            type="button"
+            onClick={() => setPage((value) => value + 1)}
+            disabled={!data || page * pageSize >= data.total || isLoading}
+            className="rounded-md border border-gray-300 bg-white px-3 py-1.5 disabled:opacity-40"
+          >
+            Next
+          </button>
+        </div>
       </div>
     </section>
   )

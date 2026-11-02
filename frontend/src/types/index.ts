@@ -852,6 +852,8 @@ export interface SubmitMatrixRequest {
   config_overrides: Record<string, string>
   models: SubmitMatrixModelInput[]
   workloads: string[]
+  matrix_mode_id: string
+  selected_pipeline_key: string
   matrix_pipeline_key?: string
   version_label?: string
   accelerator?: string
@@ -884,6 +886,7 @@ export interface SubmitMatrixResponse {
   jobs: SubmitMatrixResultItem[]
   total: number
   cpt_run_id?: string | null
+  cpt_group_id?: string | null
 }
 
 export interface CptProfileResult {
@@ -955,6 +958,9 @@ export interface CptRunGroup {
 export interface CptRunListResponse {
   projects: string[]
   groups: CptRunGroup[]
+  total: number
+  page: number
+  per_page: number
   hidden_stopped_count: number
   filter_options: {
     versions: string[]

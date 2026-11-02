@@ -455,12 +455,13 @@ class SubmitJobResponse(BaseModel):
 
 class SubmitMatrixModelInput(BaseModel):
     key: str
+    # Display/override metadata is accepted for older clients; the endpoint
+    # resolves authoritative labels and model overrides from the Forge schema.
     label: str = ""
     overrides: Dict[str, Any] = Field(default_factory=dict)
-    gpu_count: Optional[int] = None
-    # Workloads supported by this model. The endpoint intersects these with
-    # the request's globally selected workloads. Omitted/empty preserves the
-    # legacy behavior where every model receives the global list.
+    gpu_count: Optional[int] = Field(None, ge=1)
+    # Availability is resolved from the selected model in the Forge schema;
+    # this field remains for backward-compatible request parsing.
     workloads: Optional[List[str]] = None
 
 
@@ -474,8 +475,10 @@ class SubmitMatrixRequest(BaseModel):
     config_overrides: Dict[str, str] = Field(default_factory=dict)
     models: List[SubmitMatrixModelInput]
     workloads: List[str]
-    # Explicit CPT/matrix identity. Empty pipeline key leaves a matrix
-    # submission out of the CPT tracker for backward-compatible clients.
+    # The selected schema mode/pipeline are validated by the backend before
+    # any child jobs are created. The CPT key is empty for untracked matrices.
+    matrix_mode_id: str = Field("", max_length=255)
+    selected_pipeline_key: str = Field("", max_length=255)
     matrix_pipeline_key: str = Field("", max_length=255)
     version_label: str = Field("", max_length=128)
     accelerator: str = Field("", max_length=100)
@@ -513,6 +516,7 @@ class SubmitMatrixResponse(BaseModel):
     jobs: List[SubmitMatrixResultItem]
     total: int
     cpt_run_id: Optional[str] = None
+    cpt_group_id: Optional[str] = None
 
 
 class EditJobSubmitRequest(BaseModel):

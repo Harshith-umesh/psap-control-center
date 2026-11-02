@@ -138,10 +138,24 @@ def test_anonymous_cpt_list_does_not_filter_or_expose_owners(monkeypatch):
         "attempts": [{"id": "run-id", "owner": "runner"}],
     }
 
-    async def load_groups():
-        return [group]
+    async def load_groups(group_ids):
+        return [group] if group["id"] in group_ids else []
+
+    async def page_group_ids(_filters, _page, _per_page):
+        return 1, [group["id"]]
+
+    async def filter_options(include_owner):
+        return {
+            "projects": ["rhaiis"],
+            "versions": ["vLLM-0.26.0"],
+            "accelerators": ["amd"],
+            "clusters": ["mi355x"],
+            "owners": ["runner"] if include_owner else [],
+        }
 
     monkeypatch.setattr(fournos, "_load_cpt_run_groups", load_groups)
+    monkeypatch.setattr(fournos, "_page_cpt_group_ids", page_group_ids)
+    monkeypatch.setattr(fournos, "_cpt_filter_options", filter_options)
     request = Request({"type": "http", "headers": []})
 
     response = asyncio.run(fournos.list_cpt_runs(
@@ -189,10 +203,25 @@ def test_authenticated_cpt_list_retains_owner_filter(monkeypatch):
         },
     ]
 
-    async def load_groups():
-        return groups
+    async def load_groups(group_ids):
+        return [group for group in groups if group["id"] in group_ids]
+
+    async def page_group_ids(filters, _page, _per_page):
+        matching = [group for group in groups if not filters["owner"] or filters["owner"] in group["owners"]]
+        return len(matching), [group["id"] for group in matching]
+
+    async def filter_options(include_owner):
+        return {
+            "projects": ["rhaiis"],
+            "versions": ["vLLM-0.26.0"],
+            "accelerators": ["amd"],
+            "clusters": ["mi355x"],
+            "owners": ["other", "runner"] if include_owner else [],
+        }
 
     monkeypatch.setattr(fournos, "_load_cpt_run_groups", load_groups)
+    monkeypatch.setattr(fournos, "_page_cpt_group_ids", page_group_ids)
+    monkeypatch.setattr(fournos, "_cpt_filter_options", filter_options)
     monkeypatch.setattr(fournos, "get_current_user", lambda _request: {"subject": "user"})
     request = Request({"type": "http", "headers": []})
 
@@ -221,8 +250,8 @@ def test_anonymous_cpt_detail_does_not_expose_owners(monkeypatch):
         "attempts": [{"id": "run-id", "owner": "runner"}],
     }
 
-    async def load_groups():
-        return [group]
+    async def load_groups(group_ids):
+        return [group] if group["id"] in group_ids else []
 
     monkeypatch.setattr(fournos, "_load_cpt_run_groups", load_groups)
     request = Request({"type": "http", "headers": []})

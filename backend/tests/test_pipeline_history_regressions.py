@@ -643,6 +643,25 @@ def test_matrix_recurring_submission_preserves_pr_provenance(monkeypatch):
     monkeypatch.setattr(
         fournos_api.k8s, "create_fournos_job", create_fournos_job
     )
+    schema_models = [
+        SimpleNamespace(key="model-a", label="Model A", overrides={}, tp=None, workloads=["profile1", "profile4"]),
+        SimpleNamespace(key="model-b", label="Model B", overrides={}, tp=None, workloads=["profile1"]),
+        SimpleNamespace(key="model-legacy", label="Model Legacy", overrides={}, tp=None, workloads=None),
+        SimpleNamespace(key="model-no-match", label="Model No Match", overrides={}, tp=None, workloads=["profile2"]),
+    ]
+    schema_pipeline = SimpleNamespace(
+        key="cpt-rhaiis-3.6-mi355x",
+        clusters=["mi355x"],
+        workloads=["profile1", "profile2", "profile4", "profile5"],
+        models=schema_models,
+        overrides={},
+        gpu_type=None,
+    )
+    async def get_schema(_project):
+        return SimpleNamespace(modes=[SimpleNamespace(
+            id="cpt", kind="matrix", pipelines=[schema_pipeline]
+        )])
+    monkeypatch.setattr(fournos_api.project_ui_schema, "get_schema", get_schema)
 
     request = SubmitMatrixRequest(
         project="rhaiis",
@@ -665,6 +684,8 @@ def test_matrix_recurring_submission_preserves_pr_provenance(monkeypatch):
             SubmitMatrixModelInput(key="model-no-match", workloads=["profile2"]),
         ],
         workloads=["profile1", "profile4", "profile5"],
+        matrix_mode_id="cpt",
+        selected_pipeline_key="cpt-rhaiis-3.6-mi355x",
         matrix_pipeline_key="cpt-rhaiis-3.6-mi355x",
         version_label="RHAIIS-test",
         accelerator="amd",

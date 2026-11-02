@@ -6,11 +6,11 @@ import type { PullRequestSelection } from '../types'
 // the Review & Submit step matches exactly what gets POSTed to the cluster.
 // Defaults (namespace, apiVersion) match app/core/config.py's Settings
 // defaults — if those are ever overridden via env vars in a real
-// deployment, this preview is illustrative rather than exact.
+// deployment, this preview is illustrative rather than exact. The backend
+// applies its configured TTL policy, so TTL is omitted from this client preview.
 
 const NAMESPACE = 'fournos-jobs'
 const API_VERSION = 'fournos.dev/v1'
-const DEFAULT_FJOB_TTL = '12h'
 
 export function mergeMatrixConfigOverrides(
   pipelineOverrides: Record<string, unknown>,
@@ -92,7 +92,6 @@ export function buildSingleJobPreview(input: SharedInput): Record<string, unknow
     displayName,
     owner: input.owner || 'fournos-dashboard',
     pipeline: input.pipeline,
-    ttl: DEFAULT_FJOB_TTL,
     exclusive: input.exclusive,
     executionEngine: {
       forge: {
@@ -145,7 +144,6 @@ export function buildMatrixJobPreviews(
       displayName,
       owner: input.owner,
       pipeline: input.pipeline,
-      ttl: DEFAULT_FJOB_TTL,
       exclusive: input.exclusive,
       executionEngine: {
         forge: { project: input.project, args, configOverrides: overrides },
