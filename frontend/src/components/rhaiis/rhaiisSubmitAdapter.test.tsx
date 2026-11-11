@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { mergeMatrixConfigOverrides } from '../../utils/fournosJobPreview'
+import type { UiField } from '../../types'
 import {
   canonicalFournosGpuType,
   getProjectSubmitAdapter,
@@ -40,6 +41,22 @@ describe('RHAIIS submission adapter', () => {
     })
 
     expect(overrides[expectedKey]).toBe('4')
+  })
+
+  it('pins Qwen3-0.6B first and sorts the remaining model options alphabetically', () => {
+    const options = [
+      { value: 'zeta-model', label: 'Zeta Model', overrides: {}, extra: {} },
+      { value: '__custom_model__', label: 'Custom model', overrides: {}, extra: {} },
+      { value: 'qwen3-0.6b/tp1', label: 'Qwen3-0.6B', overrides: {}, extra: {} },
+      { value: 'gpt-oss-120b', label: 'GPT-OSS-120B', overrides: {}, extra: {} },
+    ]
+
+    expect(adapter.orderFieldOptions!({ key: 'model' } as UiField, options).map((option) => option.value)).toEqual([
+      'qwen3-0.6b/tp1',
+      'gpt-oss-120b',
+      'zeta-model',
+      '__custom_model__',
+    ])
   })
 
   it('maps custom workload concurrency input to Forge rates', () => {

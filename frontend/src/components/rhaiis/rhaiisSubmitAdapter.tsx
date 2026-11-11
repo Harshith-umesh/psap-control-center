@@ -1,6 +1,6 @@
 import type { Dispatch, ReactNode, SetStateAction } from 'react'
 import ReviewRow, { ReviewSection } from '../ReviewRow'
-import type { UiField, UiMode, UiSection } from '../../types'
+import type { UiField, UiMode, UiOption, UiSection } from '../../types'
 
 export interface ProjectSubmitBasics {
   cluster: string
@@ -64,6 +64,7 @@ export interface ProjectSubmitAdapter {
   ): boolean
   isCustomWorkloadSelected(values: Record<string, unknown>): boolean
   sectionLabel(section: UiSection): string
+  orderFieldOptions?(field: UiField, options: UiOption[]): UiOption[]
   fieldPresentation(
     field: UiField,
     values: Record<string, unknown>,
@@ -76,6 +77,10 @@ export interface ProjectSubmitAdapter {
   ): ReactNode
   renderAdditionalConfig(context: Omit<RenderContext, 'field'>): ReactNode
   renderMatrixExtras?(selectedWorkloads: string[]): ReactNode
+  applyMatrixWorkloads?(
+    overrides: Record<string, string>,
+    workloads: string[],
+  ): Record<string, string>
   renderReviewBasics(derived: ProjectDerivedState): ReactNode
   renderAdditionalReview(
     values: Record<string, unknown>,
@@ -129,11 +134,57 @@ function setTensorParallelOverride(
   overrides[paths[engine] || paths.vllm] = stringifyValue(tpSize)
 }
 
+function orderRhaiisFieldOptions(field: UiField, options: UiOption[]): UiOption[] {
+  if (field.key !== 'model') return options
+
+  const isPinnedModel = (option: UiOption) =>
+    [option.value, option.label].some((name) =>
+      name.toLowerCase().replace(/[^a-z0-9]/g, '').includes('qwen306b'),
+    )
+  const pinned = options.find(isPinnedModel)
+  const custom = options.find((option) => option.value === '__custom_model__')
+  const remaining = options
+    .filter((option) => option !== pinned && option.value !== '__custom_model__')
+    .sort((a, b) =>
+      a.label.localeCompare(b.label, undefined, { sensitivity: 'base', numeric: true })
+      || a.value.localeCompare(b.value, undefined, { sensitivity: 'base', numeric: true }),
+    )
+
+  return [...(pinned ? [pinned] : []), ...remaining, ...(custom ? [custom] : [])]
+}
+
 function stringifyValue(value: unknown): string {
   if (Array.isArray(value)) return JSON.stringify(value)
   if (typeof value === 'boolean') return value ? 'true' : 'false'
   return value == null ? '' : String(value)
 }
+
+const RHAIIS_OVERRIDE_EXAMPLES = `# Engine / vLLM args
+rhaiis.engines.vllm.images.nvidia: vllm/vllm-openai:v0.24.0
+rhaiis.engines.vllm.images.amd: vllm/vllm-openai-rocm:v0.26.0
+rhaiis.engines.vllm.args.tensor-parallel-size: 1
+rhaiis.engines.vllm.args.max-model-len: 4096
+rhaiis.engines.vllm.args.kv-cache-dtype: fp8
+rhaiis.engines.vllm.args.enable-auto-tool-choice: true
+rhaiis.engines.vllm.args.tool-call-parser: openai
+
+# Environment variables
+rhaiis.env_vars.VLLM_SOME_FLAG: "1"
+rhaiis.env_vars.ANOTHER_VAR: "value"
+
+# Speculative decoding
+rhaiis.engines.vllm.args.speculative-config: '{"model":"...","num_speculative_tokens":7,"method":"eagle3"}'
+
+# Workload tuning (per-profile overrides)
+workloads.profile1.rates: [1,50]
+workloads.profile1.max_seconds: 30
+workloads.profile1.rampup: 0
+workloads.profile1.samples: 50
+
+# Deployment / cluster
+rhaiis.cluster_tag: "hera2"
+rhaiis.deploy.image_pull_secrets: ["my-image-pull"]
+benchmarks.guidellm.fs_group: 0`
 
 function rawOptionValue(field: UiField | undefined, value: unknown): unknown {
   const option = field?.options.find((item) => item.value === value)
@@ -350,6 +401,8 @@ const rhaiisSubmitAdapter: ProjectSubmitAdapter = {
     return section.id === 'model' ? 'Workload' : section.label
   },
 
+  orderFieldOptions: orderRhaiisFieldOptions,
+
   fieldPresentation(field, values, activeMode) {
     return {
       hidden: field.key === 'tp_size' && (!values.model || values.model === '__custom_model__'),
@@ -472,6 +525,13 @@ const rhaiisSubmitAdapter: ProjectSubmitAdapter = {
     )
   },
 
+  applyMatrixWorkloads(overrides, workloads) {
+    return {
+      ...overrides,
+      'tests.rhaiis.workload_keys': JSON.stringify(workloads),
+    }
+  },
+
   renderSectionExtras(section, { derived }) {
     if (section.id !== 'infra') return null
     return (
@@ -492,15 +552,23 @@ const rhaiisSubmitAdapter: ProjectSubmitAdapter = {
     return (
       <div className="rounded-lg border border-gray-200 p-4">
         <label className="block text-sm font-medium text-gray-700">Advanced Config Overrides</label>
+        <details className="mt-3">
+          <summary className="inline-flex cursor-pointer list-none items-center rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm font-medium text-blue-700 hover:bg-blue-100">
+            📋 Show override examples
+          </summary>
+          <pre className="mt-2 overflow-x-auto whitespace-pre rounded-md border border-blue-100 bg-blue-50/60 p-3 font-mono text-xs leading-relaxed text-gray-800">
+            {RHAIIS_OVERRIDE_EXAMPLES}
+          </pre>
+        </details>
         <textarea
           value={String(values.advanced_overrides || '')}
           onChange={(e) => setFieldValue('advanced_overrides', e.target.value)}
           rows={4}
           className="input mt-1 font-mono"
-          placeholder="key: value (one per line)\ne.g. experiment.concurrency: [32]"
+          placeholder="key: value (one per line)"
         />
         <p className="mt-1 text-xs text-gray-400">
-          Optional Forge overrides. Use one <code>key: value</code> per line; these are applied last.
+          Optional Forge overrides. Use one <code>key: value</code> per line; these are applied last. To set runtime environment variables, use keys such as <code>rhaiis.env_vars.VLLM_SOME_FLAG</code>.
         </p>
       </div>
     )

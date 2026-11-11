@@ -24,10 +24,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import urllib.error
 from typing import Dict, Iterable, List, Optional, Tuple
-
-import yaml
 
 from app.schemas.ui_schema import (
     ProjectUiSchema,
@@ -278,7 +277,9 @@ def _resolve_mode_presets(
 # Matrix mode: generic pipeline (CPT-style) resolution
 # ---------------------------------------------------------------------------
 
-def _parse_matrix_models(raw: object, tp_key: str) -> List[UiPipelineModel]:
+def _parse_matrix_models(
+    raw: object, tp_key: str, workloads_key: str
+) -> List[UiPipelineModel]:
     """Normalize a pipeline's model list into [{key, overrides, tp}, ...].
 
     Accepts either a dict (``{model_key: {overrides..., <tp_key>: N}}``) or a
@@ -289,17 +290,34 @@ def _parse_matrix_models(raw: object, tp_key: str) -> List[UiPipelineModel]:
     if isinstance(raw, dict):
         for key, val in raw.items():
             overrides: Dict[str, object] = {}
-            tp = None
+            model_workloads: Optional[List[str]] = None
+            suffix_tp = re.search(r"/tp(\d+)$", str(key), re.IGNORECASE)
+            tp = int(suffix_tp.group(1)) if suffix_tp else None
             if isinstance(val, dict):
-                overrides = {k: v for k, v in val.items() if k != tp_key}
-                tp = val.get(tp_key)
-                if tp is not None:
+                overrides = {
+                    k: v
+                    for k, v in val.items()
+                    if k != tp_key and k != workloads_key and not str(k).startswith("__")
+                }
+                explicit_tp = val.get(tp_key)
+                if explicit_tp is not None:
                     try:
-                        tp = int(tp)
+                        tp = int(explicit_tp)
                     except (TypeError, ValueError):
-                        tp = None
+                        pass
+                raw_workloads = val.get(workloads_key)
+                if isinstance(raw_workloads, str):
+                    raw_workloads = [raw_workloads]
+                if isinstance(raw_workloads, list) and raw_workloads:
+                    model_workloads = [str(workload) for workload in raw_workloads]
             models.append(
-                UiPipelineModel(key=str(key), label=_titleize(str(key)), overrides=overrides, tp=tp)
+                UiPipelineModel(
+                    key=str(key),
+                    label=_titleize(re.sub(r"/tp\d+$", "", str(key), flags=re.IGNORECASE)),
+                    overrides=overrides,
+                    tp=tp,
+                    workloads=model_workloads,
+                )
             )
     elif isinstance(raw, list):
         for key in raw:
@@ -329,23 +347,81 @@ def _resolve_matrix_pipelines(
         )
         return
 
-    skip_keys = {cfg.marker_key, cfg.models_key, cfg.workloads_key, cfg.label_key}
+    skip_keys = {
+        cfg.marker_key,
+        cfg.models_key,
+        cfg.workloads_key,
+        cfg.label_key,
+        cfg.tp_key,
+        cfg.engine_key,
+        cfg.accelerator_key,
+        cfg.gpu_type_key,
+        cfg.clusters_key,
+    }
 
     for key, entry in entries:
         if not isinstance(entry, dict) or not entry.get(cfg.marker_key):
             continue
-        models = _parse_matrix_models(entry.get(cfg.models_key, []), cfg.tp_key)
-        workloads = [str(w) for w in entry.get(cfg.workloads_key, []) or []]
-        overrides = {k: v for k, v in entry.items() if k not in skip_keys}
-        mode.pipelines.append(
-            UiPipeline(
-                key=key,
-                label=str(entry.get(cfg.label_key) or _titleize(key)),
-                models=models,
-                workloads=workloads,
-                overrides=overrides,
-            )
+
+        # Forge's cpt.d/cpt.yaml is an aggregate catalog: a top-level
+        # `__cpt: true` marker contains one named pipeline per child mapping.
+        # Preset-pool parsing returns the whole file as one entry, so expand
+        # those children instead of exposing a fake empty pipeline named
+        # after the file (usually just "cpt"). Dedicated per-pipeline files
+        # continue to work as well.
+        nested_pipelines = [
+            (str(child_key), child)
+            for child_key, child in entry.items()
+            if not str(child_key).startswith("__") and isinstance(child, dict)
+        ]
+        definitions = (
+            nested_pipelines
+            if cfg.models_key not in entry and nested_pipelines
+            else [(key, entry)]
         )
+
+        for pipeline_key, definition in definitions:
+            models = _parse_matrix_models(
+                definition.get(cfg.models_key, []), cfg.tp_key, cfg.workloads_key
+            )
+            workloads = [
+                str(w) for w in definition.get(cfg.workloads_key, []) or []
+            ]
+            overrides = {
+                k: v
+                for k, v in definition.items()
+                if k not in skip_keys and not str(k).startswith("__")
+            }
+            raw_clusters = definition.get(cfg.clusters_key, []) or []
+            if isinstance(raw_clusters, str):
+                raw_clusters = [raw_clusters]
+            mode.pipelines.append(
+                UiPipeline(
+                    key=pipeline_key,
+                    label=str(
+                        definition.get(cfg.label_key) or _titleize(pipeline_key)
+                    ),
+                    models=models,
+                    workloads=workloads,
+                    overrides=overrides,
+                    engine=(
+                        str(definition[cfg.engine_key])
+                        if definition.get(cfg.engine_key) is not None
+                        else None
+                    ),
+                    accelerator=(
+                        str(definition[cfg.accelerator_key])
+                        if definition.get(cfg.accelerator_key) is not None
+                        else None
+                    ),
+                    gpu_type=(
+                        str(definition[cfg.gpu_type_key])
+                        if definition.get(cfg.gpu_type_key) is not None
+                        else None
+                    ),
+                    clusters=[str(cluster) for cluster in raw_clusters],
+                )
+            )
 
 
 # ---------------------------------------------------------------------------

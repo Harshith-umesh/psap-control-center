@@ -20,6 +20,7 @@ from app.models.fournos_job import (
     FournosJobWorkItem,
     FournosRunGroup,
 )
+from app.services.cpt_run_views import cpt_group_id as get_cpt_group_id
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,9 @@ def _text_search_expression(columns, query: str, *, postgres: bool):
 
 
 async def upsert_job(session: AsyncSession, **kwargs: Any) -> FournosJob:
+    metadata = kwargs.get("cpt_run_metadata")
+    if kwargs.get("cpt_run_id") and isinstance(metadata, dict):
+        kwargs["cpt_group_id"] = get_cpt_group_id(metadata)
     if "id" not in kwargs:
         kwargs["id"] = str(uuid4())
 
@@ -574,6 +578,41 @@ async def list_jobs(
     total = count_result.scalar() or 0
 
     return jobs, total
+
+
+async def search_jobs_by_name_pattern(
+    session: AsyncSession, pattern: str, *, limit: int = 20
+) -> list[dict[str, str]]:
+    """Return newest archived job names matching a case-insensitive regex."""
+    if session.bind is not None and session.bind.dialect.name == "postgresql":
+        stmt = (
+            select(FournosJob.name, FournosJob.status)
+            .where(FournosJob.name.op("~*")(pattern))
+            .order_by(FournosJob.created_at.desc())
+            .limit(limit)
+        )
+        result = await session.execute(stmt)
+        return [
+            {"name": name, "status": status or "Unknown"}
+            for name, status in result.all()
+        ]
+
+    # SQLite local development has no PostgreSQL regex operator. Job names
+    # are short; inspect a bounded recent window and apply the validated
+    # pattern in Python rather than silently changing regex semantics.
+    from app.services.job_name_search import compile_job_name_pattern
+
+    matcher = compile_job_name_pattern(pattern)
+    result = await session.execute(
+        select(FournosJob.name, FournosJob.status)
+        .order_by(FournosJob.created_at.desc())
+        .limit(5000)
+    )
+    return [
+        {"name": name, "status": status or "Unknown"}
+        for name, status in result.all()
+        if matcher.search(name or "")
+    ][:limit]
 
 
 async def get_history_preference(

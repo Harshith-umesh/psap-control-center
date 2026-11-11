@@ -40,6 +40,39 @@ def augment_schema(schema: ProjectUiSchema) -> None:
     for mode in schema.modes:
         all_fields = [field for section in mode.sections for field in section.fields]
 
+        # CPT's pipeline catalog carries the supported engine and optional
+        # accelerator on each pipeline. Use that metadata to populate the
+        # required controls instead of leaving empty radio groups in the
+        # submit form. Accelerator choices come from configured engine image
+        # maps, so they stay aligned with Forge's current RHAIIS config.
+        if mode.kind == "matrix":
+            pipeline_engines = sorted(
+                {pipeline.engine for pipeline in mode.pipelines if pipeline.engine}
+            )
+            pipeline_accelerators = {
+                pipeline.accelerator
+                for pipeline in mode.pipelines
+                if pipeline.accelerator
+            }
+            pipeline_accelerators.update(
+                accelerator
+                for engine in pipeline_engines
+                for accelerator in engine_defaults.get(engine, {})
+            )
+            generated_options = {
+                "engine": pipeline_engines,
+                "accelerator": sorted(pipeline_accelerators),
+            }
+            for field in all_fields:
+                values = generated_options.get(field.key)
+                if values:
+                    present = {option.value for option in field.options}
+                    field.options.extend(
+                        UiOption(value=value, label=_titleize(value))
+                        for value in values
+                        if value not in present
+                    )
+
         infra = next((section for section in mode.sections if section.id == "infra"), None)
         run_settings = next(
             (
@@ -58,7 +91,11 @@ def augment_schema(schema: ProjectUiSchema) -> None:
             if section.id == "model":
                 section.label = "Workload"
 
-        if infra is not None and not any(field.key == "gpu_count" for field in infra.fields):
+        if (
+            mode.id == "single"
+            and infra is not None
+            and not any(field.key == "gpu_count" for field in infra.fields)
+        ):
             infra.fields.append(
                 UiField(
                     key="gpu_count",
@@ -105,6 +142,7 @@ def augment_schema(schema: ProjectUiSchema) -> None:
                             label="Custom Model (provide HuggingFace ID)",
                         )
                     )
+                field.options.sort(key=lambda option: (option.label or option.value).casefold())
             elif field.key == "workload":
                 # Some Forge entries such as `ci-quick` are complete test
                 # presets, so they correctly live in Quick Presets, but they
@@ -169,6 +207,10 @@ def augment_schema(schema: ProjectUiSchema) -> None:
                 # required for a reproducible submission.
                 if field.visible_if.field == "compare_versions":
                     field.required = True
+            elif mode.id == "cpt" and field.key == "version":
+                field.required = True
+            elif mode.id == "cpt" and field.key == "engine_version":
+                field.required = True
 
         if mode.id == "single":
             model_section = next(

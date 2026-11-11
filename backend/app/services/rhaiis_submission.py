@@ -58,6 +58,6 @@ def normalize_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
 def add_matrix_workload_override(
     overrides: dict[str, Any], workloads: list[str]
 ) -> None:
-    """Add the RHAIIS plural workload override for matrix submissions."""
+    """Set the RHAIIS workload override for one model's matrix cell set."""
     if workloads:
-        overrides.setdefault("tests.rhaiis.workload_keys", json.dumps(workloads))
+        overrides["tests.rhaiis.workload_keys"] = json.dumps(workloads)

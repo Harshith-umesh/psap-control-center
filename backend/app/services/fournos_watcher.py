@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import time
@@ -344,6 +345,75 @@ def _extract_forge_fields(job: dict) -> dict:
     job_name = meta.get("name", "")
     phase = status.get("phase", "Unknown")
 
+    cpt_run_id = annotations.get("fournos.dev/cpt-run-id", "")
+    cpt_pipeline_key = annotations.get("fournos.dev/cpt-pipeline-key", "")
+    cpt_run_metadata = {}
+    if cpt_run_id:
+        raw_cpt_metadata = annotations.get("fournos.dev/cpt-run-metadata", "")
+        if raw_cpt_metadata:
+            try:
+                parsed_metadata = json.loads(raw_cpt_metadata)
+            except (TypeError, ValueError):
+                parsed_metadata = {}
+            if isinstance(parsed_metadata, dict):
+                cpt_run_metadata = parsed_metadata
+        if not cpt_run_metadata and cpt_pipeline_key:
+            # Compatibility for FJobs created before the complete metadata
+            # annotation was introduced.
+            config_overrides = forge.get("configOverrides", {})
+            if not isinstance(config_overrides, dict):
+                config_overrides = {}
+            if isinstance(args, str):
+                args = [args]
+            if not isinstance(args, list):
+                args = []
+            accelerator = str(args[0]).strip() if args else ""
+            engine = str(args[1]).strip() if len(args) > 1 else ""
+            model_preset = annotations.get("fournos.dev/cpt-model-preset", "")
+            model_name = annotations.get("fournos.dev/cpt-model-name", "")
+            workloads = config_overrides.get("tests.rhaiis.workload_keys", [])
+            if isinstance(workloads, str):
+                try:
+                    workloads = json.loads(workloads)
+                except (TypeError, ValueError):
+                    workloads = [workloads]
+            if not isinstance(workloads, list):
+                workloads = []
+            try:
+                configured_model_count = int(
+                    annotations.get("fournos.dev/cpt-configured-model-count", "")
+                )
+            except (TypeError, ValueError):
+                configured_model_count = None
+            image_key = f"rhaiis.engines.{engine}.images.{accelerator}"
+            cpt_run_metadata = {
+                "project": forge.get("project", ""),
+                "pipeline_key": cpt_pipeline_key,
+                "version_label": config_overrides.get(
+                    "tests.rhaiis.version", "Unspecified"
+                ),
+                "cluster": spec.get("cluster", ""),
+                "accelerator": accelerator,
+                "engine": engine,
+                "engine_version": config_overrides.get(image_key, ""),
+                "fournos_pipeline": spec.get("pipeline", ""),
+                "forge_source": (spec.get("env") or {}).get("PULL_PULL_SHA", "Unknown"),
+                "owner": spec.get("owner", ""),
+                "configured_model_count": configured_model_count,
+                "started_at": created_at.isoformat() if created_at else "",
+                "model_key": model_preset or model_name,
+                "model_name": model_name or model_preset,
+                "model_preset": model_preset,
+                "workloads": [str(item).strip() for item in workloads if str(item or "").strip()],
+            }
+        if cpt_run_metadata:
+            cpt_run_metadata.setdefault("project", forge.get("project", ""))
+            cpt_run_metadata.setdefault("pipeline_key", cpt_pipeline_key)
+            cpt_run_metadata.setdefault("cluster", spec.get("cluster", ""))
+            cpt_run_metadata.setdefault("fournos_pipeline", spec.get("pipeline", ""))
+            cpt_run_metadata.setdefault("owner", spec.get("owner", ""))
+            cpt_run_metadata.setdefault("started_at", created_at.isoformat() if created_at else "")
+
     return {
         "name": job_name,
         "project": forge.get("project", ""),
@@ -368,6 +438,10 @@ def _extract_forge_fields(job: dict) -> dict:
         "config_overrides": forge.get("configOverrides", {}),
         "fjob_spec": spec,
         "fjob_status": status,
+        **({
+            "cpt_run_id": cpt_run_id,
+            "cpt_run_metadata": cpt_run_metadata,
+        } if cpt_run_metadata else {}),
         "triggered_by_schedule": schedule_name or None,
         "trigger_type": trigger_type,
         "is_lock": bool(spec.get("lockOnly")),
@@ -396,6 +470,26 @@ async def _archive_job(job: dict) -> None:
 
     async with _watcher_session() as session, session.begin():
         existing = await db_svc.get_job_by_name(session, job_name)
+        incoming_cpt_metadata = fields.get("cpt_run_metadata")
+        existing_cpt_metadata = (
+            existing.cpt_run_metadata
+            if existing and existing.cpt_run_id == fields.get("cpt_run_id")
+            else {}
+        )
+        if not isinstance(existing_cpt_metadata, dict):
+            existing_cpt_metadata = {}
+        # The admin version-correction endpoint writes the corrected label to
+        # the database. Preserve that value when a later watch event still
+        # carries the original submission annotation.
+        stored_version = existing_cpt_metadata.get("version_label")
+        if (
+            isinstance(incoming_cpt_metadata, dict)
+            and stored_version
+            and incoming_cpt_metadata.get("version_label") != stored_version
+        ):
+            incoming_cpt_metadata = dict(incoming_cpt_metadata)
+            incoming_cpt_metadata["version_label"] = stored_version
+            fields["cpt_run_metadata"] = incoming_cpt_metadata
         schedule_parent = fields.get("triggered_by_schedule")
         parent = None
         if schedule_parent:

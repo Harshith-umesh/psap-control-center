@@ -6,7 +6,8 @@ import type { PullRequestSelection } from '../types'
 // the Review & Submit step matches exactly what gets POSTed to the cluster.
 // Defaults (namespace, apiVersion) match app/core/config.py's Settings
 // defaults — if those are ever overridden via env vars in a real
-// deployment, this preview is illustrative rather than exact.
+// deployment, this preview is illustrative rather than exact. The backend
+// applies its configured TTL policy, so TTL is omitted from this client preview.
 
 const NAMESPACE = 'fournos-jobs'
 const API_VERSION = 'fournos.dev/v1'
@@ -92,7 +93,6 @@ export function buildSingleJobPreview(input: SharedInput): Record<string, unknow
     owner: input.owner || 'fournos-dashboard',
     pipeline: input.pipeline,
     exclusive: input.exclusive,
-    priority: input.priority,
     executionEngine: {
       forge: {
         project: input.project,
@@ -101,6 +101,7 @@ export function buildSingleJobPreview(input: SharedInput): Record<string, unknow
       },
     },
   }
+  if (input.priority.trim()) spec.priority = input.priority.trim()
   if (input.gpuType?.trim()) {
     spec.hardware = { gpuType: input.gpuType.trim(), gpuCount: input.gpuCount || 1 }
   }
@@ -123,12 +124,18 @@ export function buildSingleJobPreview(input: SharedInput): Record<string, unknow
 
 export function buildMatrixJobPreviews(
   input: SharedInput & {
-    models: { key: string; overrides: Record<string, string>; gpuCount?: number | null }[]
+    models: {
+      key: string
+      overrides: Record<string, string>
+      gpuCount?: number | null
+      workloads?: string[]
+    }[]
     workloads: string[]
   }
 ): Record<string, unknown>[] {
   return input.models.map((model) => {
-    const args = [...input.args, model.key, ...input.workloads]
+    const workloads = model.workloads ?? input.workloads
+    const args = [...input.args, model.key, ...workloads]
     const overrides = { ...input.configOverrides, ...model.overrides }
     const displayName = `${input.project}-${model.key}-${input.cluster}`
 
@@ -138,11 +145,11 @@ export function buildMatrixJobPreviews(
       owner: input.owner,
       pipeline: input.pipeline,
       exclusive: input.exclusive,
-      priority: input.priority,
       executionEngine: {
         forge: { project: input.project, args, configOverrides: overrides },
       },
     }
+    if (input.priority.trim()) spec.priority = input.priority.trim()
     if (input.gpuType?.trim() || model.gpuCount) {
       spec.hardware = { gpuType: input.gpuType?.trim() || 'unknown', gpuCount: model.gpuCount || 1 }
     }
@@ -178,4 +185,21 @@ export function withVersionOverride(
 export function toYamlPreview(docs: Record<string, unknown> | Record<string, unknown>[]): string {
   const arr = Array.isArray(docs) ? docs : [docs]
   return arr.map((d) => dump(d, { indent: 2, lineWidth: 100, noRefs: true })).join('---\n')
+}
+
+/**
+ * Render the same concise FournosJob document shown by the FourNos dashboard:
+ * apiVersion, kind, metadata.name, and the submitted spec (not runtime status
+ * or private/requester annotations).
+ */
+export function buildFournosJobYaml(job: {
+  metadata?: Record<string, unknown>
+  spec?: Record<string, unknown>
+}): string {
+  return dump({
+    apiVersion: 'fournos.dev/v1',
+    kind: 'FournosJob',
+    metadata: { name: job.metadata?.name || '' },
+    spec: job.spec || {},
+  }, { indent: 2, lineWidth: 80, noRefs: true, sortKeys: false })
 }
