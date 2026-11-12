@@ -12,6 +12,7 @@ from app.models.node_history import NodeHistory
 from app.schemas.cluster import ClusterCreate, ClusterUpdate, ClusterStatus
 from app.services.kubernetes_service import KubernetesService
 from app.services import billing_csv_service
+from app.services import gpu_status_cache
 from app.core.config import settings
 from app.utils.logger import create_logger
 
@@ -265,6 +266,7 @@ class ClusterService:
                 cluster.gpu_count = cluster_info.get("gpu_count")
                 cluster.gpu_type = cluster_info.get("gpu_type")
             else:
+                gpu_status_cache.store(cluster_id, gpu_alloc.to_dict())
                 cluster.gpu_allocation_mode = gpu_alloc.gpu_allocation_mode
                 cluster.gpu_count = str(gpu_alloc.total_gpus)
                 cluster.gpu_type = (
