@@ -6,7 +6,9 @@ from time import monotonic
 from typing import Any, Optional
 
 
-GPU_STATUS_CACHE_TTL_SECONDS = 15 * 60
+# Keep snapshots through the 3-minute refresh cadence plus 3 minutes of grace
+# for a refresh that runs long or fails once.
+GPU_STATUS_CACHE_TTL_SECONDS = 6 * 60
 
 _lock = Lock()
 _entries: dict[str, tuple[float, dict[str, Any]]] = {}

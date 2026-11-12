@@ -14,7 +14,7 @@ from app.utils.logger import create_logger, set_log_level_from_env
 set_log_level_from_env()
 logger = create_logger("Main")
 
-CLUSTER_REFRESH_INTERVAL = 600  # 10 minutes in seconds
+CLUSTER_REFRESH_INTERVAL = 180  # 3 minutes in seconds
 CLUSTER_REFRESH_STALL = 120     # cancel if no K8s I/O succeeds for this many seconds
 CLUSTER_REFRESH_CONCURRENCY = 3 # max clusters refreshing at the same time
 
@@ -67,7 +67,7 @@ async def update_reservation_statuses_task():
 
 
 def _next_aligned_refresh() -> datetime:
-    """Return the next 10-minute-aligned UTC time (e.g. :00, :10, :20 ...)."""
+    """Return the next 3-minute-aligned UTC time (e.g. :00, :03, :06 ...)."""
     now = datetime.now(timezone.utc)
     epoch_s = int(now.timestamp())
     next_s = epoch_s + (CLUSTER_REFRESH_INTERVAL - epoch_s % CLUSTER_REFRESH_INTERVAL)
