@@ -79,4 +79,3 @@ def can_manage_group(group, user: dict | None) -> bool:
         return True
     subject = str(user.get("subject") or "")
     return bool(subject and subject == (group.created_by_subject or ""))
-
