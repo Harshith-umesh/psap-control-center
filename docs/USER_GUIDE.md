@@ -211,12 +211,16 @@ or permanently delete its archived record.
    `ui/submit.yaml` schema. Depending on that schema, the form may include an
    owner, priority, pull-request SHA, presets, configuration overrides, GPU
    requirements, or exclusive-lock controls.
-4. Review the generated YAML.
-5. Choose one of the available launch modes:
+4. Optionally select or create reusable run groups for an experiment, workload
+   family, campaign/cycle, or cohort. Group keys and types remain stable while
+   display names may evolve; archived groups remain visible on historical runs
+   but cannot be selected for new submissions.
+5. Review the generated YAML.
+6. Choose one of the available launch modes:
    - **Run now** for an immediate standard or matrix submission.
    - **Defer** to select a future calendar slot.
    - **Recurring** to provide a cron schedule for repeated runs.
-6. Submit the job.
+7. Submit the job.
 
 The custom non-Forge job option is a placeholder and is not yet available.
 

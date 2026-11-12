@@ -3,6 +3,7 @@ import toast from 'react-hot-toast'
 import { fournosApi } from '../services/api'
 import type {
   FournosJobListResponse,
+  FournosLiveJobSummaryResponse,
   FournosJobDetailResponse,
   FournosJobEvent,
   RecurringJob,
@@ -12,6 +13,7 @@ import type {
   CreateClusterLockRequest,
   ForgeProject,
   GitHubPR,
+  GitHubRelease,
   GithubSyncStatus,
   SlotHold,
   SubmitJobRequest,
@@ -19,6 +21,17 @@ import type {
   SubmitMatrixRequest,
   SubmitMatrixResponse,
   ProjectUiSchemaResponse,
+  HistoryPreferenceResponse,
+  HistoryFilterOptionsResponse,
+  HistoryViewState,
+  WorkItemConfig,
+  WorkItemReference,
+  RunGroupCreate,
+  RunGroupReference,
+  CptRunGroup,
+  CptRunListResponse,
+  StopCptRunGroupResponse,
+  UpdateCptRunVersionResponse,
 } from '../types'
 
 // ─── Jobs ──────────────────────────────────────────────────────────────
@@ -29,18 +42,82 @@ export function useFournosJobs(params: {
   cluster?: string
   status?: string
   owner?: string
+  requester_scope?: 'all' | 'mine'
+  q?: string
+  identity?: string
+  failure_outcome?: string
+  repository?: string
+  pr_number?: number
+  source_sha?: string
+  forge?: string
+  work_item_provider?: string
+  work_item_key?: string
+  tags?: string
   start_time?: string
   end_time?: string
   sort_by?: string
   sort_dir?: 'asc' | 'desc'
   page?: number
   per_page?: number
-} = {}) {
+} = {}, enabled = true) {
   return useQuery<FournosJobListResponse>({
     queryKey: ['fournos-jobs', params],
     queryFn: () => fournosApi.listJobs(params),
+    enabled,
     refetchInterval: params.tab === 'live' ? 5000 : false,
     retry: 1,
+  })
+}
+
+export function useFournosLiveJobSummary(enabled = true) {
+  return useQuery<FournosLiveJobSummaryResponse>({
+    queryKey: ['fournos-live-job-summary'],
+    queryFn: () => fournosApi.getLiveJobSummary(),
+    enabled,
+    staleTime: 10_000,
+    refetchInterval: 30_000,
+    retry: 1,
+  })
+}
+
+export function useHistoryPreference(enabled: boolean) {
+  return useQuery<HistoryPreferenceResponse>({
+    queryKey: ['fournos-history-preference'],
+    queryFn: () => fournosApi.getHistoryPreference(),
+    enabled,
+    retry: 1,
+  })
+}
+
+export function useHistoryFilterOptions(enabled: boolean) {
+  return useQuery<HistoryFilterOptionsResponse>({
+    queryKey: ['fournos-history-filter-options'],
+    queryFn: () => fournosApi.getHistoryFilterOptions(),
+    enabled,
+    staleTime: 5 * 60 * 1000,
+    retry: 1,
+  })
+}
+
+export function useSaveHistoryPreference() {
+  const qc = useQueryClient()
+  return useMutation<HistoryPreferenceResponse, Error, HistoryViewState>({
+    mutationFn: (state) => fournosApi.saveHistoryPreference(state),
+    onSuccess: (data) => {
+      qc.setQueryData(['fournos-history-preference'], data)
+    },
+    onError: (error) => toast.error(error.message || 'Failed to save History view'),
+  })
+}
+
+export function useResetHistoryPreference() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: () => fournosApi.resetHistoryPreference(),
+    onSuccess: () => {
+      qc.removeQueries({ queryKey: ['fournos-history-preference'] })
+    },
+    onError: (error) => toast.error(error.message || 'Failed to reset History view'),
   })
 }
 
@@ -50,6 +127,83 @@ export function useFournosJob(name: string | undefined) {
     queryFn: () => fournosApi.getJob(name!),
     enabled: !!name,
     refetchInterval: 5000,
+  })
+}
+
+export function useInferenceLogsAvailability(name: string | undefined, enabled: boolean) {
+  return useQuery({
+    queryKey: ['fournos-inference-logs-availability', name],
+    queryFn: () => fournosApi.getInferenceLogsAvailability(name!),
+    enabled: !!name && enabled,
+    refetchInterval: 10_000,
+    retry: false,
+  })
+}
+
+export function useInferenceServerLogs(name: string | undefined, enabled: boolean) {
+  return useQuery({
+    queryKey: ['fournos-inference-logs', name],
+    queryFn: () => fournosApi.getInferenceServerLogs(name!),
+    enabled: !!name && enabled,
+    refetchInterval: 10_000,
+    retry: false,
+  })
+}
+
+export function useWorkItemConfig() {
+  return useQuery<WorkItemConfig>({
+    queryKey: ['fournos-work-item-config'],
+    queryFn: () => fournosApi.getWorkItemConfig(),
+    staleTime: Infinity,
+    retry: 1,
+  })
+}
+
+export function useUpdateJobWorkItems(name: string | undefined) {
+  const qc = useQueryClient()
+  return useMutation<WorkItemReference[], Error, WorkItemReference[]>({
+    mutationFn: (workItems) => fournosApi.updateJobWorkItems(name!, workItems),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['fournos-job', name] })
+      qc.invalidateQueries({ queryKey: ['fournos-jobs'] })
+      qc.invalidateQueries({ queryKey: ['fournos-history-filter-options'] })
+      toast.success('Work-item associations updated')
+    },
+    onError: (error) => toast.error(error.message || 'Failed to update work items'),
+  })
+}
+
+export function useRunGroups(includeArchived = false) {
+  return useQuery<RunGroupReference[]>({
+    queryKey: ['fournos-run-groups', includeArchived],
+    queryFn: () => fournosApi.listRunGroups(includeArchived),
+    staleTime: 60_000,
+    retry: 1,
+  })
+}
+
+export function useCreateRunGroup() {
+  const qc = useQueryClient()
+  return useMutation<RunGroupReference, Error, RunGroupCreate>({
+    mutationFn: (group) => fournosApi.createRunGroup(group),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['fournos-run-groups'] })
+      toast.success('Run group created')
+    },
+    onError: (error) => toast.error(error.message || 'Failed to create run group'),
+  })
+}
+
+export function useUpdateJobRunGroups(name: string | undefined) {
+  const qc = useQueryClient()
+  return useMutation<RunGroupReference[], Error, string[]>({
+    mutationFn: (groupIds) => fournosApi.updateJobRunGroups(name!, groupIds),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['fournos-job', name] })
+      qc.invalidateQueries({ queryKey: ['fournos-jobs'] })
+      toast.success('Run grouping updated')
+    },
+    onError: (error) => toast.error(error.message || 'Failed to update run grouping'),
   })
 }
 
@@ -79,6 +233,18 @@ export function useRerunJob() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['fournos-jobs'] })
     },
+  })
+}
+
+export function useEditSubmitJob(name: string) {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (spec: Record<string, unknown>) => fournosApi.editSubmitJob(name, spec),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['fournos-jobs'] })
+      toast.success('Edited job submitted')
+    },
+    onError: (error: Error) => toast.error(error.message || 'Failed to submit edited job'),
   })
 }
 
@@ -271,6 +437,16 @@ export function useGithubPRs() {
   })
 }
 
+export function useGithubReleases(enabled = true) {
+  return useQuery<GitHubRelease[]>({
+    queryKey: ['github-releases'],
+    queryFn: () => fournosApi.getGithubReleases(),
+    enabled,
+    staleTime: 30 * 60 * 1000,
+    refetchOnWindowFocus: false,
+  })
+}
+
 export function useRefreshGithubPRs() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -327,6 +503,65 @@ export function useSubmitMatrix() {
     mutationFn: (req) => fournosApi.submitMatrix(req),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['fournos-jobs'] })
+      qc.invalidateQueries({ queryKey: ['fournos-cpt-runs'] })
     },
+  })
+}
+
+export function useCptRuns(params: {
+  project?: string
+  version?: string
+  accelerator?: string
+  cluster?: string
+  owner?: string
+  show_stopped?: boolean
+  page?: number
+  per_page?: number
+} = {}) {
+  return useQuery<CptRunListResponse>({
+    queryKey: ['fournos-cpt-runs', params],
+    queryFn: () => fournosApi.getCptRuns(params),
+    refetchInterval: 30_000,
+    retry: 1,
+  })
+}
+
+export function useCptRunGroup(groupId: string) {
+  return useQuery<CptRunGroup>({
+    queryKey: ['fournos-cpt-run-group', groupId],
+    queryFn: () => fournosApi.getCptRunGroup(groupId),
+    enabled: !!groupId,
+    refetchInterval: 10_000,
+    retry: 1,
+  })
+}
+
+export function useStopCptRunGroup() {
+  const qc = useQueryClient()
+  return useMutation<StopCptRunGroupResponse, Error, string>({
+    mutationFn: (groupId: string) => fournosApi.stopCptRunGroup(groupId),
+    onSuccess: (result) => {
+      qc.invalidateQueries({ queryKey: ['fournos-cpt-runs'] })
+      qc.invalidateQueries({ queryKey: ['fournos-jobs'] })
+      if (result.failed > 0) {
+        toast.error(`Stop requested for ${result.requested} job(s); ${result.failed} could not be stopped`)
+      } else {
+        toast.success(`Stop requested for ${result.requested} active CPT job(s)`)
+      }
+    },
+    onError: (error: Error) => toast.error(error.message || 'Failed to stop CPT jobs'),
+  })
+}
+
+export function useUpdateCptRunVersion() {
+  const qc = useQueryClient()
+  return useMutation<UpdateCptRunVersionResponse, Error, { runId: string; versionLabel: string }>({
+    mutationFn: ({ runId, versionLabel }: { runId: string; versionLabel: string }) =>
+      fournosApi.updateCptRunVersion(runId, versionLabel),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['fournos-cpt-runs'] })
+      toast.success('CPT version label updated')
+    },
+    onError: (error: Error) => toast.error(error.message || 'Failed to update CPT version label'),
   })
 }

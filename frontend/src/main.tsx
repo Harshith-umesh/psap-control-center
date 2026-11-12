@@ -6,6 +6,7 @@ import { Toaster } from 'react-hot-toast'
 import App from './App'
 import './index.css'
 import { setLogLevelFromEnv, createLogger } from './utils/logger'
+import { authConfigQueryOptions } from './hooks/useAuthConfig'
 
 setLogLevelFromEnv()
 const logger = createLogger('Main')
@@ -19,6 +20,11 @@ const queryClient = new QueryClient({
     },
   },
 })
+
+// Begin public authentication discovery before route components start their
+// page-specific requests. The Login modal consumes this same cached query, so
+// opening it never starts a second request during this application load.
+void queryClient.prefetchQuery(authConfigQueryOptions)
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>

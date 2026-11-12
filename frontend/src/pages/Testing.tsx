@@ -1,11 +1,11 @@
-import { useState, useMemo, useEffect, useRef, Fragment, type ComponentType } from 'react'
-import { Link, useSearchParams } from 'react-router-dom'
+import { useState, useMemo, useEffect, useRef, useCallback, Fragment, type ComponentType } from 'react'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { Menu, Transition } from '@headlessui/react'
 import {
   PlayIcon,
   ClockIcon,
+  QueueListIcon,
   CalendarDaysIcon,
-  PlusIcon,
   ArrowLeftIcon,
   ArrowPathIcon,
   XMarkIcon,
@@ -19,24 +19,38 @@ import {
   ChevronDownIcon,
   ChevronUpDownIcon,
   EllipsisVerticalIcon,
+  PencilSquareIcon,
 } from '@heroicons/react/24/outline'
 import clsx from 'clsx'
 import { getDisplayName, isAdmin, isAuthenticated } from '../stores/authStore'
 import { useClusters } from '../hooks/useClusters'
-import DynamicSubmitForm from '../components/DynamicSubmitForm'
+import { useHearthClusters } from '../hooks/useHearth'
+import DynamicSubmitForm, { type MatrixClusterConstraints } from '../components/DynamicSubmitForm'
 import ClusterCombobox from '../components/ClusterCombobox'
 import ClusterScheduleModal from '../components/ClusterScheduleModal'
-import ClusterActivityModal from '../components/ClusterActivityModal'
+import AcceleratorQueueSummary from '../components/AcceleratorQueueSummary'
 import SchedulingCalendar from '../components/SchedulingCalendar'
-import { cronFiresWithin } from '../utils/cronOccurrences'
 import { browserTimezone, datetimeLocalToUtcIso } from '../utils/timezone'
 import WizardSteps from '../components/WizardSteps'
 import ReviewRow, { ReviewSection } from '../components/ReviewRow'
 import YamlPreview from '../components/YamlPreview'
 import SearchableSelect from '../components/SearchableSelect'
+import EditableCombobox from '../components/EditableCombobox'
+import { getForgeProjectUiSettings } from '../projects/rhaiis'
 import { buildSingleJobPreview, toYamlPreview, withVersionOverride } from '../utils/fournosJobPreview'
+import { workItemFromInput } from '../utils/workItems'
+import RunGroupSelector from '../components/RunGroupSelector'
+import CptJobsPanel from '../components/CptJobsPanel'
+import JobNameSearch from '../components/JobNameSearch'
+import {
+  filterCptClusterOptions,
+  getHearthClusterOptions,
+  isCptClusterOptionSelected,
+  normalizeClusterName,
+} from '../utils/cptClusterOptions'
 import {
   useFournosJobs,
+  useFournosLiveJobSummary,
   useRecurringJobs,
   useClusterLocks,
   useForgeProjects,
@@ -50,11 +64,18 @@ import {
   useDeleteClusterLock,
   useCreateClusterLock,
   useGithubPRs,
+  useGithubReleases,
   useGithubSyncStatus,
   useRefreshGithubSync,
   useProjectUiSchema,
   useRefreshProjectUiSchema,
   useClusterOverview,
+  useHistoryPreference,
+  useHistoryFilterOptions,
+  useSaveHistoryPreference,
+  useResetHistoryPreference,
+  useWorkItemConfig,
+  useRunGroups,
 } from '../hooks/useFournos'
 import type {
   FournosJobSummary,
@@ -63,40 +84,11 @@ import type {
   ForgeProject,
   Cluster,
   JobScheduling,
-  ClusterOverview,
+  GitHubPR,
+  PullRequestSelection,
+  HistoryViewState,
 } from '../types'
 
-const RUNNING_JOB_STATUSES = new Set(['Running', 'Pending', 'Admitted', 'Resolving'])
-
-/** Is there anything happening on this cluster right now, or coming up in
- * the next `hours` hours? Used to decide whether the "what's happening on
- * this cluster" popup should open automatically on the Submit page — we
- * only want to interrupt the user when it's actually relevant. */
-function hasUpcomingClusterActivity(overview: ClusterOverview | undefined, hours: number): boolean {
-  if (!overview) return false
-  const now = Date.now()
-  const windowMs = hours * 3600_000
-  const untilTs = now + windowMs
-
-  for (const job of overview.current_jobs) {
-    if (RUNNING_JOB_STATUSES.has(job.status)) return true
-    if (job.scheduled_start_time) {
-      const t = new Date(job.scheduled_start_time).getTime()
-      if (t > now && t <= untilTs) return true
-    }
-  }
-  for (const r of overview.recurring_jobs) {
-    if (cronFiresWithin(r.schedule, new Date(now), windowMs)) return true
-  }
-  for (const lock of overview.locks) {
-    const startMs = lock.scheduled_start_time ? new Date(lock.scheduled_start_time).getTime() : new Date(lock.created_at).getTime()
-    const lockUntilMs = lock.lock_until ? new Date(lock.lock_until).getTime() : null
-    const activeNow = startMs <= now && (lockUntilMs === null || lockUntilMs > now)
-    const startsSoon = startMs > now && startMs <= untilTs
-    if (activeNow || startsSoon) return true
-  }
-  return false
-}
 
 const STATUS_COLORS: Record<string, string> = {
   Running: 'bg-blue-100 text-blue-800',
@@ -110,6 +102,9 @@ const STATUS_COLORS: Record<string, string> = {
 }
 
 const ALL_STATUSES = ['Running', 'Pending', 'Admitted', 'Resolving', 'Succeeded', 'Failed', 'Stopped']
+const HISTORY_STATUSES = ['Succeeded', 'Failed', 'Stopped']
+const HISTORY_STATUS_SET = new Set(HISTORY_STATUSES)
+const HISTORY_FAILURE_SET = new Set(['failed', 'cancelled', 'infrastructure_error', 'unknown'])
 
 /** Today's date in the browser's own timezone, as a "YYYY-MM-DD" string —
  * matches what a native `<input type="date">` shows/expects, no UTC
@@ -130,13 +125,6 @@ function formatAge(ts: string | null): string {
   return `${Math.floor(h / 24)}d ${h % 24}h`
 }
 
-const TABS = [
-  { id: 'live', label: 'Live Jobs', icon: PlayIcon },
-  { id: 'history', label: 'History', icon: ClockIcon },
-  { id: 'submit', label: 'Submit Job', icon: PlusIcon },
-  { id: 'schedules', label: 'Schedules/Locks', icon: CalendarDaysIcon },
-]
-
 // ─── Sortable table headers ─────────────────────────────────────────────
 // Shared by every table on this page (Live Jobs / History are server-driven
 // via sort_by+sort_dir query params; Recurring Jobs / Cluster Locks sort
@@ -144,6 +132,76 @@ const TABS = [
 
 type SortDir = 'asc' | 'desc'
 interface SortState { by: string; dir: SortDir }
+
+const DEFAULT_HISTORY_VIEW: HistoryViewState = {
+  query: '',
+  project: '',
+  cluster: '',
+  status: '',
+  requester_scope: 'all',
+  identity: '',
+  failure_outcome: '',
+  repository: '',
+  pr_number: null,
+  source_sha: '',
+  forge: '',
+  work_item_provider: '',
+  work_item_key: '',
+  tags: [],
+  history_date: '',
+  from_time: '00:00',
+  to_time: '23:59',
+  sort_by: 'date',
+  sort_dir: 'desc',
+  per_page: 100,
+}
+
+const HISTORY_URL_KEYS = [
+  'q', 'project', 'cluster', 'status', 'scope', 'identity', 'failure',
+  'repository', 'pr', 'sha', 'forge', 'work_provider', 'work_item', 'tags', 'date', 'from', 'to',
+  'sort', 'dir', 'per_page', 'page',
+] as const
+
+const HISTORY_SORT_KEYS = new Set([
+  'name', 'project', 'cluster', 'status', 'owner', 'date', 'duration',
+  'triggered_by',
+])
+
+function historyViewFromParams(params: URLSearchParams): HistoryViewState {
+  const parsedPr = Number(params.get('pr'))
+  const parsedPerPage = Number(params.get('per_page'))
+  const sort = params.get('sort') || ''
+  const dir = params.get('dir')
+  const status = params.get('status') || ''
+  const failure = params.get('failure') || ''
+  const sourceSha = params.get('sha') || ''
+  return {
+    query: params.get('q') || '',
+    project: params.get('project') || '',
+    cluster: params.get('cluster') || '',
+    status: HISTORY_STATUS_SET.has(status) ? status : '',
+    requester_scope: params.get('scope') === 'mine' ? 'mine' : 'all',
+    identity: params.get('identity') || '',
+    failure_outcome: HISTORY_FAILURE_SET.has(failure) ? failure : '',
+    repository: params.get('repository') || '',
+    pr_number: Number.isInteger(parsedPr) && parsedPr > 0 ? parsedPr : null,
+    source_sha: /^[0-9a-fA-F]{4,64}$/.test(sourceSha) ? sourceSha : '',
+    forge: params.get('forge') || '',
+    work_item_provider: params.get('work_provider') || '',
+    work_item_key: params.get('work_item') || '',
+    tags: (params.get('tags') || '').split(',').map((tag) => tag.trim()).filter(Boolean).slice(0, 20),
+    history_date: params.get('date') || '',
+    from_time: params.get('from') || '00:00',
+    to_time: params.get('to') || '23:59',
+    sort_by: (HISTORY_SORT_KEYS.has(sort) ? sort : 'date') as HistoryViewState['sort_by'],
+    sort_dir: dir === 'asc' ? 'asc' : 'desc',
+    per_page: [25, 50, 100, 200].includes(parsedPerPage) ? parsedPerPage : 100,
+  }
+}
+
+function hasHistoryUrlState(params: URLSearchParams): boolean {
+  return HISTORY_URL_KEYS.some((key) => params.has(key))
+}
 
 /** Clicking the already-active column flips its direction; clicking a new
  * column starts it off ascending. */
@@ -170,16 +228,18 @@ function SortableTh({
   sort,
   onSort,
   align = 'left',
+  large = false,
 }: {
   label: string
   sortKey: string
   sort: SortState
   onSort: (key: string) => void
   align?: 'left' | 'right'
+  large?: boolean
 }) {
   const active = sort.by === sortKey
   return (
-    <th className={clsx('px-4 py-3 text-xs font-medium uppercase', align === 'right' ? 'text-right' : 'text-left')}>
+    <th className={clsx('px-4 py-3 font-medium uppercase', large ? 'text-sm' : 'text-xs', align === 'right' ? 'text-right' : 'text-left')}>
       <button
         type="button"
         onClick={() => onSort(sortKey)}
@@ -244,6 +304,63 @@ function formatHistoryDate(job: FournosJobSummary): string {
   return timestamp ? new Date(timestamp).toLocaleString() : '-'
 }
 
+function formatDuration(seconds: number | null): string {
+  if (seconds == null || !Number.isFinite(seconds) || seconds < 0) return '-'
+  const totalSeconds = Math.floor(seconds)
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const remainingSeconds = totalSeconds % 60
+  return `${String(hours).padStart(2, '0')}h ${String(minutes).padStart(2, '0')}m ${String(remainingSeconds).padStart(2, '0')}s`
+}
+
+function JobProgressCell({ job }: { job: FournosJobSummary }) {
+  if (job.current_step) {
+    return (
+      <div className="flex flex-col gap-0.5">
+        <span className="inline-flex items-center gap-1.5 font-medium text-gray-800">
+          <span className="h-2 w-2 animate-pulse rounded-full bg-indigo-500" aria-hidden="true" />
+          {job.current_step.displayName || job.current_step.name}
+        </span>
+        {job.current_step.startTime && (
+          <span className="text-xs text-gray-500">{formatAge(job.current_step.startTime)}</span>
+        )}
+      </div>
+    )
+  }
+
+  const progress = job.task_progress
+  if (progress && progress.total > 0) {
+    const completedPercent = Math.max(0, Math.min(100, (progress.completed / progress.total) * 100))
+    const progressTitle = `${progress.completed} of ${progress.total} tasks completed${progress.failed ? `; ${progress.failed} failed` : ''}`
+    return (
+      <div className="min-w-32">
+        <div className="h-1.5 w-28 overflow-hidden rounded-full bg-gray-200" title={progressTitle}>
+          <div className="h-full rounded-full bg-emerald-500" style={{ width: `${completedPercent}%` }} />
+        </div>
+        <div className="mt-1 flex items-center gap-2 text-xs text-gray-500">
+          <span>{progress.completed}/{progress.total} tasks</span>
+          {progress.failed > 0 && <span className="text-red-600">{progress.failed} failed</span>}
+        </div>
+      </div>
+    )
+  }
+
+  if (['Pending', 'Resolving', 'Admitted'].includes(job.status)) {
+    return (
+      <span className={clsx('inline-flex rounded-full px-2 py-0.5 text-sm font-medium', STATUS_COLORS[job.status] || STATUS_COLORS.Unknown)}>
+        {job.status}
+      </span>
+    )
+  }
+
+  const fallback = job.message?.trim()
+  return (
+    <span className="block max-w-56 truncate text-gray-500" title={fallback || undefined}>
+      {fallback || (job.status === 'Running' ? 'Starting…' : '-')}
+    </span>
+  )
+}
+
 function JobsTable({
   jobs,
   source,
@@ -252,6 +369,7 @@ function JobsTable({
   onCancel,
   onDelete,
   onRerun,
+  onEdit,
 }: {
   jobs: FournosJobSummary[]
   source: 'live' | 'history'
@@ -260,6 +378,7 @@ function JobsTable({
   onCancel?: (name: string) => void
   onDelete?: (name: string) => void
   onRerun?: (name: string) => void
+  onEdit?: (name: string) => void
 }) {
   if (jobs.length === 0) {
     return (
@@ -274,21 +393,28 @@ function JobsTable({
       <table className="min-w-full divide-y divide-gray-200">
         <thead className="bg-gray-50">
           <tr>
-            <SortableTh label="Name" sortKey="name" sort={sort} onSort={onSort} />
-            <SortableTh label="Project" sortKey="project" sort={sort} onSort={onSort} />
-            <SortableTh label="Cluster" sortKey="cluster" sort={sort} onSort={onSort} />
-            <SortableTh label="Status" sortKey="status" sort={sort} onSort={onSort} />
-            <SortableTh label={source === 'live' ? 'Age' : 'Date'} sortKey={source === 'live' ? 'age' : 'date'} sort={sort} onSort={onSort} />
-            <SortableTh label="Owner" sortKey="owner" sort={sort} onSort={onSort} />
-            <SortableTh label="Triggered By" sortKey="triggered_by" sort={sort} onSort={onSort} />
-            {source === 'history' && <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">MLflow</th>}
+            <SortableTh label="Name" sortKey="name" sort={sort} onSort={onSort} large />
+            <SortableTh label="Project" sortKey="project" sort={sort} onSort={onSort} large />
+            <th className="px-4 py-3 text-left text-sm font-medium text-gray-500 uppercase">Preset</th>
+            <SortableTh label="Cluster" sortKey="cluster" sort={sort} onSort={onSort} large />
+            <SortableTh label="Status" sortKey="status" sort={sort} onSort={onSort} large />
+            {source === 'live' && <th className="px-4 py-3 text-left text-sm font-medium text-gray-500 uppercase">Progress</th>}
+            <SortableTh label={source === 'live' ? 'Age' : 'Date'} sortKey={source === 'live' ? 'age' : 'date'} sort={sort} onSort={onSort} large />
+            <SortableTh label="Owner" sortKey="owner" sort={sort} onSort={onSort} large />
+            {source === 'live' ? (
+              <SortableTh label="Triggered By" sortKey="triggered_by" sort={sort} onSort={onSort} large />
+            ) : (
+              <SortableTh label="Duration" sortKey="duration" sort={sort} onSort={onSort} large />
+            )}
+            {source === 'live' && <th className="px-4 py-3 text-left text-sm font-medium text-gray-500 uppercase">PR</th>}
+            {source === 'history' && <th className="px-4 py-3 text-center text-sm font-medium text-gray-500 uppercase">MLflow</th>}
             <th className="px-4 py-3" />
           </tr>
         </thead>
         <tbody className="divide-y divide-gray-200">
           {jobs.map((job) => (
             <tr key={job.name} className="hover:bg-gray-50">
-              <td className="px-4 py-3 text-sm">
+              <td className="px-4 py-3 text-base">
                 <Link
                   to={`/testing/jobs/${job.name}`}
                   className="text-indigo-600 hover:text-indigo-800 font-medium"
@@ -296,48 +422,86 @@ function JobsTable({
                   {job.name}
                 </Link>
               </td>
-              <td className="px-4 py-3 text-sm text-gray-900">{job.project || '-'}</td>
-              <td className="px-4 py-3 text-sm text-gray-900">{job.cluster || '-'}</td>
-              <td className="px-4 py-3 text-sm">
-                <span className={clsx('px-2 py-0.5 rounded-full text-xs font-medium', STATUS_COLORS[job.status] || STATUS_COLORS.Unknown)}>
+              <td className="px-4 py-3 text-base text-gray-900">{job.project || '-'}</td>
+              <td className="px-4 py-3 text-base text-gray-700">
+                <code
+                  className="block max-w-xs whitespace-normal break-words font-mono text-sm"
+                  title={job.preset || 'default'}
+                >
+                  {job.preset || 'default'}
+                </code>
+              </td>
+              <td className="px-4 py-3 text-base text-gray-900">{job.cluster || '-'}</td>
+              <td className="px-4 py-3 text-base">
+                <span className={clsx('px-2 py-0.5 rounded-full text-sm font-medium', STATUS_COLORS[job.status] || STATUS_COLORS.Unknown)}>
                   {job.status}
                 </span>
               </td>
-              <td className="px-4 py-3 text-sm text-gray-500">
+              {source === 'live' && (
+                <td className="px-4 py-3 text-base">
+                  <JobProgressCell job={job} />
+                </td>
+              )}
+              <td className="px-4 py-3 text-base text-gray-500">
                 {source === 'live'
                   ? formatAge(job.created_at)
                   : formatHistoryDate(job)}
               </td>
-              <td className="px-4 py-3 text-sm text-gray-500">{job.owner || '-'}</td>
-              <td className="px-4 py-3 text-sm text-gray-500">
-                {job.trigger_type === 'recurring' && job.triggered_by_schedule ? (
-                  <Link
-                    to={`/testing/schedules/${job.triggered_by_schedule}/runs`}
-                    className="inline-flex items-center gap-1 text-indigo-500 hover:text-indigo-700"
-                    title={`Created by recurring job "${job.triggered_by_schedule}"`}
-                  >
-                    <CalendarDaysIcon className="h-3.5 w-3.5" /> {job.triggered_by_schedule}
-                  </Link>
-                ) : job.trigger_type === 'deferred' ? (
-                  <span className="inline-flex items-center gap-1 text-gray-400">
-                    <ClockIcon className="h-3.5 w-3.5" /> Deferred
-                  </span>
-                ) : job.trigger_type === 'recurring-parent' ? (
-                  <span className="inline-flex items-center gap-1 text-teal-600">
-                    <CalendarDaysIcon className="h-3.5 w-3.5" /> Recurring template
-                  </span>
-                ) : (
-                  '-'
-                )}
-              </td>
+              <td className="px-4 py-3 text-base text-gray-500">{job.owner || '-'}</td>
+              {source === 'live' ? (
+                <td className="px-4 py-3 text-base text-gray-500">
+                  {job.trigger_type === 'recurring' && job.triggered_by_schedule ? (
+                    <Link
+                      to={`/testing/schedules/${job.triggered_by_schedule}/runs`}
+                      className="inline-flex items-center gap-1 text-indigo-500 hover:text-indigo-700"
+                      title={`Created by recurring job "${job.triggered_by_schedule}"`}
+                    >
+                      <CalendarDaysIcon className="h-3.5 w-3.5" /> {job.triggered_by_schedule}
+                    </Link>
+                  ) : job.trigger_type === 'deferred' ? (
+                    <span className="inline-flex items-center gap-1 text-gray-400">
+                      <ClockIcon className="h-3.5 w-3.5" /> Deferred
+                    </span>
+                  ) : job.trigger_type === 'recurring-parent' ? (
+                    <span className="inline-flex items-center gap-1 text-teal-600">
+                      <CalendarDaysIcon className="h-3.5 w-3.5" /> Recurring template
+                    </span>
+                  ) : (
+                    '-'
+                  )}
+                </td>
+              ) : (
+                <td className="px-4 py-3 text-base text-gray-500">{formatDuration(job.duration_seconds)}</td>
+              )}
+              {source === 'live' && (
+                <td className="px-4 py-3 text-base">
+                  {job.source_pr_number ? (
+                    job.source_pr_url ? (
+                      <a
+                        href={job.source_pr_url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="font-medium text-indigo-600 hover:text-indigo-800"
+                        title={job.source_pr_url}
+                      >
+                        #{job.source_pr_number}
+                      </a>
+                    ) : (
+                      <span className="text-gray-700">#{job.source_pr_number}</span>
+                    )
+                  ) : (
+                    <span className="text-gray-400">-</span>
+                  )}
+                </td>
+              )}
               {source === 'history' && (
-                <td className="px-4 py-3 text-sm text-center">
+                <td className="px-4 py-3 text-base text-center">
                   {job.mlflow_url ? (
                     <a
                       href={job.mlflow_url}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="inline-flex items-center gap-1 rounded-md border border-indigo-200 bg-indigo-50 px-2 py-1 text-xs font-medium text-indigo-700 hover:bg-indigo-100"
+                      className="inline-flex items-center gap-1 rounded-md border border-indigo-200 bg-indigo-50 px-2 py-1 text-sm font-medium text-indigo-700 hover:bg-indigo-100"
                     >
                       <ChartBarIcon className="h-3.5 w-3.5" /> MLflow
                     </a>
@@ -346,15 +510,14 @@ function JobsTable({
                   )}
                 </td>
               )}
-              <td className="px-4 py-3 text-sm text-right">
-                {source === 'live' && isAdmin() && ['Running', 'Pending', 'Admitted', 'Resolving'].includes(job.status) && onCancel && (
-                  <button onClick={() => onCancel(job.name)} className="text-red-500 hover:text-red-700" title="Cancel">
-                    <StopIcon className="h-4 w-4" />
-                  </button>
-                )}
-                {source === 'history' && isAdmin() && (
+              <td className="px-4 py-3 text-base text-right">
+                {isAdmin() && (source === 'live' || source === 'history') && (
                   <RowActionsMenu
                     items={[
+                      ...(source === 'live' && onCancel && ['Running', 'Pending', 'Admitted', 'Resolving'].includes(job.status)
+                        ? [{ label: 'Cancel', icon: StopIcon, onClick: () => onCancel(job.name), danger: true }]
+                        : []),
+                      ...(onEdit ? [{ label: 'Edit & Submit', icon: PencilSquareIcon, onClick: () => onEdit(job.name) }] : []),
                       ...(onRerun ? [{ label: 'Rerun', icon: ArrowPathIcon, onClick: () => onRerun(job.name) }] : []),
                       ...(onDelete ? [{ label: 'Delete', icon: TrashIcon, onClick: () => onDelete(job.name), danger: true }] : []),
                     ]}
@@ -373,19 +536,44 @@ function JobsTable({
 
 const VERSION_PROJECTS = ['mcp_gateway']
 
+type SubmitJobType = 'lock' | 'forge' | 'custom' | ''
+
+function submitFlowStage(params: URLSearchParams): { jobType: SubmitJobType; step: number } {
+  const rawType = params.get('submit_type')
+  const jobType: SubmitJobType = rawType === 'forge' || rawType === 'lock' || rawType === 'custom'
+    ? rawType
+    : ''
+  if (!jobType) return { jobType: '', step: 1 }
+
+  const rawStep = Number(params.get('submit_step'))
+  const maxStep = jobType === 'forge' ? 4 : 2
+  const step = Number.isInteger(rawStep) && rawStep >= 2
+    ? Math.min(rawStep, maxStep)
+    : 2
+  return { jobType, step }
+}
+
 function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
   const { data: projects } = useForgeProjects()
+  const { data: registeredClusters } = useClusters()
   const { data: pipelines } = usePipelines()
   const { data: githubPRs } = useGithubPRs()
   const { data: githubSyncStatus } = useGithubSyncStatus()
   const refreshGithubSync = useRefreshGithubSync()
   const submitJob = useSubmitJob()
+  const { data: workItemConfig } = useWorkItemConfig()
+  const { data: runGroups = [] } = useRunGroups()
+  const [submitSearchParams, setSubmitSearchParams] = useSearchParams()
+  const initialSubmitStage = submitFlowStage(submitSearchParams)
 
   // "Basics" — common to every project, owned here so there is exactly one
   // wizard/step indicator (DynamicSubmitForm only renders steps 2 and 3,
   // driven by the `step` state below, and never its own nested wizard).
   const [project, setProject] = useState('')
   const [cluster, setCluster] = useState('')
+  const [rhaiisPipelineSetupTarget, setRhaiisPipelineSetupTarget] = useState<HTMLDivElement | null>(null)
+  const [matrixClusterConstraints, setMatrixClusterConstraints] = useState<MatrixClusterConstraints | null>(null)
+  const [rhaiisCptMode, setRhaiisCptMode] = useState(false)
   const [pipeline, setPipeline] = useState('forge-test-only')
   const [preset, setPreset] = useState('')
   const [version, setVersion] = useState('')
@@ -394,19 +582,55 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
   const [exclusive, setExclusive] = useState(false)
   const [configRaw, setConfigRaw] = useState('')
   const [pullSha, setPullSha] = useState('')
+  const [selectedPR, setSelectedPR] = useState<GitHubPR | null>(null)
+  const [buildSourceInput, setBuildSourceInput] = useState('')
+  const [useLatestMain, setUseLatestMain] = useState(false)
   const [prSearch, setPrSearch] = useState('')
   const [prDropdownOpen, setPrDropdownOpen] = useState(false)
+  const [workItemInput, setWorkItemInput] = useState('')
+  const [runGroupIds, setRunGroupIds] = useState<string[]>([])
   // step 1 = "what do you want to do" (Lock / Forge Job / Custom Job).
   // For jobType === 'forge': 2 = Basics, 3 = Project Details, 4 = Review & Submit.
   // For jobType === 'lock': 2 = pick a cluster + inspect/manage its locks.
   // For jobType === 'custom': 2 = coming-soon placeholder.
-  const [jobType, setJobType] = useState<'lock' | 'forge' | 'custom' | ''>('')
-  const [step, setStep] = useState(1)
+  const [jobType, setJobType] = useState<SubmitJobType>(initialSubmitStage.jobType)
+  const [step, setStep] = useState(initialSubmitStage.step)
   const [lockCluster, setLockCluster] = useState('')
   const [lockReason, setLockReason] = useState('')
   const [scheduling, setScheduling] = useState<JobScheduling>({ mode: 'now' })
   const [scheduleModalOpen, setScheduleModalOpen] = useState(false)
   const createLock = useCreateClusterLock()
+  const useHearthForCpt = jobType === 'forge'
+    && project.trim().toLowerCase() === 'rhaiis'
+    && rhaiisCptMode
+  const {
+    data: hearthClustersData,
+    isLoading: hearthClustersLoading,
+    isError: hearthClustersError,
+  } = useHearthClusters(useHearthForCpt)
+
+  useEffect(() => {
+    const stage = submitFlowStage(submitSearchParams)
+    setJobType(stage.jobType)
+    setStep(stage.step)
+  }, [submitSearchParams])
+
+  const navigateSubmitStage = (nextType: SubmitJobType, nextStep: number) => {
+    const stage = nextType && nextStep > 1
+      ? { jobType: nextType, step: nextStep }
+      : { jobType: '' as const, step: 1 }
+    const nextParams = new URLSearchParams(submitSearchParams)
+    if (stage.jobType) {
+      nextParams.set('submit_type', stage.jobType)
+      nextParams.set('submit_step', String(stage.step))
+    } else {
+      nextParams.delete('submit_type')
+      nextParams.delete('submit_step')
+    }
+    setJobType(stage.jobType)
+    setStep(stage.step)
+    setSubmitSearchParams(nextParams)
+  }
 
   // Keep the visible owner tied to the authenticated session. The backend
   // independently derives the same value and ignores client-supplied owners.
@@ -417,42 +641,67 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
     return () => window.removeEventListener('auth-change', syncOwner)
   }, [])
 
-  // "What's happening on this cluster" popup for the Basics step — only
-  // interrupts the user automatically when there's something running or
-  // starting within the next 4 hours; otherwise stays out of the way and
-  // is reachable via the small manual link next to the Cluster field.
-  const { data: clusterOverview } = useClusterOverview(jobType === 'forge' ? cluster || undefined : undefined)
-  const [clusterActivityModalOpen, setClusterActivityModalOpen] = useState(false)
-  const autoPromptedClusterRef = useRef<string | null>(null)
-  useEffect(() => {
-    setClusterActivityModalOpen(false)
-    if (!cluster) autoPromptedClusterRef.current = null
-  }, [cluster])
-  useEffect(() => {
-    if (!cluster || !clusterOverview) return
-    if (autoPromptedClusterRef.current === cluster) return
-    autoPromptedClusterRef.current = cluster
-    if (hasUpcomingClusterActivity(clusterOverview, 4)) setClusterActivityModalOpen(true)
-  }, [cluster, clusterOverview])
+  const {
+    data: clusterOverview,
+    isLoading: clusterOverviewLoading,
+    isFetching: clusterOverviewFetching,
+    isError: clusterOverviewError,
+    refetch: refetchClusterOverview,
+  } = useClusterOverview(jobType === 'forge' ? cluster || undefined : undefined)
 
   const selectedProject = useMemo(
     () => projects?.find((p: ForgeProject) => p.name === project),
     [projects, project]
   )
+  const registeredSelectedCluster = useMemo(
+    () => registeredClusters?.clusters.find((item: Cluster) => item.name === cluster),
+    [registeredClusters, cluster]
+  )
+  const hearthClusterOptions = useMemo(
+    () => getHearthClusterOptions(hearthClustersData?.clusters || []),
+    [hearthClustersData],
+  )
+  const compatibleCptClusterOptions = useMemo(
+    () => filterCptClusterOptions(
+      hearthClusterOptions,
+      matrixClusterConstraints?.allowedClusterNames || [],
+      matrixClusterConstraints?.gpuType || '',
+    ),
+    [hearthClusterOptions, matrixClusterConstraints],
+  )
+  const selectedHearthCluster = useMemo(
+    () => compatibleCptClusterOptions.find(
+      (item) => normalizeClusterName(item.name) === normalizeClusterName(cluster),
+    ),
+    [compatibleCptClusterOptions, cluster],
+  )
+  const selectedCluster = useHearthForCpt ? selectedHearthCluster : registeredSelectedCluster
+  const matrixClusterValid = useMemo(() => {
+    if (!useHearthForCpt) return true
+    if (!matrixClusterConstraints || !hearthClustersData?.available) return false
+    return isCptClusterOptionSelected(cluster, compatibleCptClusterOptions)
+  }, [useHearthForCpt, matrixClusterConstraints, hearthClustersData, cluster, compatibleCptClusterOptions])
+  const hearthClustersUnavailable = hearthClustersError
+    || (!!hearthClustersData && !hearthClustersData.available)
 
   // Any project that publishes a projects/<name>/ui/submit.yaml in Forge
-  // gets a fully dynamic form for free — see docs/ui-schema-spec.md. This
-  // is the same mechanism for every project, RHAIIS included; there is no
-  // project-specific form or backend code path.
+  // gets a fully dynamic form for free — see docs/ui-schema-spec.md.
   const { data: uiSchemaResp, isFetching: isFetchingUiSchema } = useProjectUiSchema(project || undefined)
   const dynamicSchema = uiSchemaResp?.found ? uiSchemaResp.ui_schema : null
   const refreshUiSchema = useRefreshProjectUiSchema()
-
-  useEffect(() => {
-    if (jobType === 'forge') setStep(2)
-  }, [project, jobType])
+  const projectUiSettings = getForgeProjectUiSettings(project)
+  const { data: githubReleases } = useGithubReleases(projectUiSettings.loadsPublishedReleases)
+  const buildSourceValid = !projectUiSettings.requiresBuildSource || useLatestMain || !!pullSha.trim()
 
   const showVersion = VERSION_PROJECTS.includes(project)
+  // RHAIIS follows the FourNos dashboard's continuous form: choose the
+  // project, configure one job or a CPT matrix, inspect YAML, then submit.
+  // Other projects retain the generic multi-step Control Center wizard.
+  const rhaiisSinglePage = jobType === 'forge' && project === 'rhaiis'
+
+  const handleRhaiisCptModeChange = useCallback((isCptMode: boolean) => {
+    setRhaiisCptMode(isCptMode)
+  }, [])
 
   const filteredPRs = useMemo(() => {
     if (!githubPRs) return []
@@ -468,22 +717,53 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
 
   const handleProjectChange = (name: string) => {
     setProject(name)
+    setPipeline(getForgeProjectUiSettings(name).defaultPipeline)
+    setPriority('manual')
     setPreset('')
     setVersion('')
+    setPullSha('')
+    setSelectedPR(null)
+    setPrSearch('')
+    setBuildSourceInput('')
+    setUseLatestMain(false)
     const proj = projects?.find((p: ForgeProject) => p.name === name)
     if (proj?.cluster) setCluster(proj.cluster)
   }
 
-  const selectPR = (pr: { number: number; title: string; author: string; head_sha: string; draft: boolean } | null) => {
+  const clearBuildSource = () => {
+    setPrSearch('')
+    setPullSha('')
+    setSelectedPR(null)
+    setBuildSourceInput('')
+    setUseLatestMain(false)
+    setPrDropdownOpen(false)
+  }
+
+  const selectPR = (pr: GitHubPR | null) => {
     if (pr) {
       setPrSearch(`#${pr.number} — ${pr.title} (${pr.author})`)
       setPullSha(pr.head_sha)
+      setSelectedPR(pr)
+      setBuildSourceInput('')
+      setUseLatestMain(false)
     } else {
-      setPrSearch('')
-      setPullSha('')
+      clearBuildSource()
     }
     setPrDropdownOpen(false)
   }
+
+  const pullRequest: PullRequestSelection | null = selectedPR ? {
+    repository: selectedPR.repository,
+    number: selectedPR.number,
+    url: selectedPR.url,
+    head_branch: selectedPR.branch,
+    requested_sha: selectedPR.head_sha,
+  } : null
+
+  const workItems = useMemo(() => {
+    const item = workItemFromInput(workItemInput)
+    return item ? [item] : []
+  }, [workItemInput])
 
   const configOverrides = useMemo(() => {
     const overrides: Record<string, string> = {}
@@ -511,7 +791,11 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
         priority,
         exclusive,
         config_overrides: overrides,
+        pull_request: pullRequest,
         pull_sha: pullSha,
+        work_items: workItems,
+        run_group_ids: runGroupIds,
+        use_latest_main: useLatestMain,
         schedule: scheduling.mode === 'recurring' ? scheduling.scheduleUtc : '',
         scheduled_start_time: scheduling.mode === 'defer' ? scheduling.scheduledStartTimeUtc : null,
       })
@@ -531,15 +815,17 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
           : ['Job Type']
 
   const outerMaxWidth =
-    jobType === 'forge' && step === 4
+    rhaiisSinglePage
+      ? 'max-w-6xl'
+      : jobType === 'forge' && step === 4
       ? 'max-w-5xl'
       : step === 1 || (jobType === 'forge' && step === 2) || (jobType === 'lock' && step === 2)
         ? 'max-w-4xl'
         : 'max-w-2xl'
 
   return (
-    <div className={clsx('mx-auto space-y-6', outerMaxWidth)}>
-      {step > 1 && <WizardSteps steps={wizardSteps} current={step} />}
+    <div className={clsx('submit-page mx-auto space-y-6', outerMaxWidth)}>
+      {step > 1 && !rhaiisSinglePage && <WizardSteps steps={wizardSteps} current={step} />}
 
       {step === 1 && (
         <div className="text-center">
@@ -572,7 +858,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
               <button
                 key={type}
                 type="button"
-                onClick={() => { setJobType(type); setStep(2) }}
+                onClick={() => navigateSubmitStage(type, 2)}
                 className={clsx(
                   'group relative flex flex-col items-center gap-3.5 rounded-2xl border-2 bg-white px-6 py-9 text-center shadow-sm transition-all',
                   'hover:-translate-y-1 hover:shadow-xl',
@@ -624,10 +910,13 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
 
             <div className="grid grid-cols-1 gap-5 px-5 py-5 sm:grid-cols-3">
               <div>
-                <label className="block text-sm font-medium text-gray-900">Cluster</label>
+                <label className="block text-sm font-medium text-gray-900">
+                  Cluster<span className="ml-0.5 text-red-500">*</span>
+                </label>
                 <ClusterCombobox
                   value={lockCluster}
                   onChange={setLockCluster}
+                  required
                   inputClassName="mt-1.5 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm"
                 />
               </div>
@@ -690,7 +979,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
           </div>
           <button
             type="button"
-            onClick={() => setStep(1)}
+            onClick={() => navigateSubmitStage('', 1)}
             className="inline-flex items-center gap-1.5 rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
           >
             <ArrowLeftIcon className="h-4 w-4" /> Back
@@ -709,7 +998,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
           </div>
           <button
             type="button"
-            onClick={() => setStep(1)}
+            onClick={() => navigateSubmitStage('', 1)}
             className="inline-flex items-center gap-1.5 rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
           >
             <ArrowLeftIcon className="h-4 w-4" /> Back
@@ -741,15 +1030,45 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
             </select>
           </div>
 
+          {rhaiisSinglePage && <div ref={setRhaiisPipelineSetupTarget} className="space-y-4" />}
+
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
-              <label className="block text-sm font-medium text-gray-700">Cluster</label>
+              <label className="block text-sm font-medium text-gray-700">
+                Cluster<span className="text-red-500 ml-0.5">*</span>
+              </label>
               <ClusterCombobox
                 value={cluster}
                 onChange={setCluster}
                 required
                 inputClassName="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm"
+                clusterOptions={useHearthForCpt ? compatibleCptClusterOptions : undefined}
+                clusterOptionsLoading={useHearthForCpt && hearthClustersLoading}
+                clusterOptionsUnavailable={useHearthForCpt && hearthClustersUnavailable}
+                emptyStateMessage={matrixClusterConstraints?.allowedClusterNames.length
+                  ? 'No Hearth clusters match the cluster IDs configured for this CPT pipeline.'
+                  : 'No Hearth clusters match this CPT pipeline GPU type.'}
               />
+              {useHearthForCpt && hearthClustersUnavailable && (
+                <p className="mt-1 text-xs font-medium text-amber-700">
+                  Hearth cluster inventory is unavailable. Check the Hearth connection and retry.
+                </p>
+              )}
+              {useHearthForCpt && matrixClusterConstraints && hearthClustersData?.available && compatibleCptClusterOptions.length === 0 && (
+                <p className="mt-1 text-xs font-medium text-amber-700">
+                  Hearth has no cluster matching this pipeline’s configured cluster IDs.
+                </p>
+              )}
+              {useHearthForCpt && matrixClusterConstraints && !hearthClustersUnavailable && (
+                <p className="mt-1 text-xs text-gray-400">
+                  Cluster choices come from Hearth and use the canonical IDs configured for this CPT pipeline.
+                </p>
+              )}
+              {useHearthForCpt && matrixClusterConstraints && cluster.trim() && !matrixClusterValid && !hearthClustersUnavailable && (
+                <p className="mt-1 text-xs font-medium text-amber-700">
+                  Select a Hearth cluster listed by this CPT pipeline.
+                </p>
+              )}
             </div>
 
             <div>
@@ -775,12 +1094,20 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
 
             <div>
               <label className="block text-sm font-medium text-gray-700">Priority</label>
-              <select value={priority} onChange={(e) => setPriority(e.target.value)} className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm">
-                <option value="manual">manual</option>
-                <option value="low">low</option>
-                <option value="normal">normal</option>
-                <option value="high">high</option>
+              <select
+                value={priority}
+                onChange={(e) => setPriority(e.target.value)}
+                className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm"
+              >
+                <option value="manual">manual — 200 (highest, Intlab)</option>
+                <option value="nightly">nightly — 100 (Intlab)</option>
+                <option value="presubmit">presubmit — 50 (Intlab)</option>
+                <option value="adhoc">adhoc — 10 (lowest, Intlab)</option>
+                <option value="">Cluster default (no priority class)</option>
               </select>
+              <p className="mt-1 text-xs text-gray-500">
+                Priority affects queue order: when a cluster is busy, higher-priority jobs may run ahead of lower-priority jobs. CPT runs default to nightly. Choose Cluster default to let the cluster apply its own scheduling policy.
+              </p>
             </div>
 
             <div className="flex items-end">
@@ -791,33 +1118,39 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
             </div>
           </div>
 
-          {/* What's happening on this cluster — pops up automatically only
-              when something is running or starting within the next 4
-              hours (see hasUpcomingClusterActivity above); otherwise it
-              stays out of the way and is reachable via this manual link. */}
+          {/* Live queue and activity for the selected accelerator. */}
           {cluster && (
-            <div>
-              <button
-                type="button"
-                onClick={() => setClusterActivityModalOpen(true)}
-                className="inline-flex items-center gap-1 text-xs font-medium text-indigo-600 hover:text-indigo-800"
-              >
-                <CalendarDaysIcon className="h-3.5 w-3.5" />
-                View {cluster}'s schedule
-              </button>
-              <ClusterActivityModal
-                open={clusterActivityModalOpen}
-                onClose={() => setClusterActivityModalOpen(false)}
-                cluster={cluster}
-              />
-            </div>
+            <AcceleratorQueueSummary
+              cluster={cluster}
+              accelerator={selectedCluster?.gpu_type}
+              gpuCapacity={selectedCluster?.gpu_count}
+              overview={clusterOverview}
+              isLoading={clusterOverviewLoading}
+              isFetching={clusterOverviewFetching}
+              isError={clusterOverviewError}
+              onRefresh={() => { void refetchClusterOverview() }}
+            />
           )}
 
           {/* Pull Request picker */}
           <div className="relative">
             <div className="flex items-center justify-between">
-              <label className="block text-sm font-medium text-gray-700">Pull Request (optional)</label>
+              <label className="block text-sm font-medium text-gray-700">
+                {projectUiSettings.buildSourceLabel}
+                {projectUiSettings.requiresBuildSource && <span className="text-red-500 ml-0.5">*</span>}
+                {!projectUiSettings.requiresBuildSource && <span className="text-gray-400 font-normal ml-1">(optional)</span>}
+              </label>
               <div className="flex items-center gap-2">
+                {projectUiSettings.requiresBuildSource && (selectedPR || pullSha || buildSourceInput || useLatestMain || prSearch) && (
+                  <button
+                    type="button"
+                    onClick={clearBuildSource}
+                    className="text-xs font-medium text-gray-500 hover:text-gray-800"
+                    title="Clear the selected build source"
+                  >
+                    Clear selection
+                  </button>
+                )}
                 {githubSyncStatus?.last_synced_at && (
                   <span
                     className="text-[11px] text-gray-400"
@@ -841,9 +1174,10 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
             <input
               type="text"
               value={prSearch}
-              onChange={(e) => { setPrSearch(e.target.value); setPrDropdownOpen(true); setPullSha('') }}
+              onChange={(e) => { setPrSearch(e.target.value); setPrDropdownOpen(true); setPullSha(''); setSelectedPR(null); setBuildSourceInput('') }}
               onFocus={() => setPrDropdownOpen(true)}
-              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm"
+              disabled={projectUiSettings.requiresBuildSource && useLatestMain}
+              className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm disabled:bg-gray-100 disabled:text-gray-400"
               placeholder="Search PRs by number, title, or author..."
             />
             {pullSha && (
@@ -851,11 +1185,88 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
                 HEAD SHA: <code className="text-indigo-600 font-mono">{pullSha}</code>
               </p>
             )}
-            {!pullSha && (
+            {selectedPR && projectUiSettings.requiresBuildSource && (
+              <p className="mt-2 text-xs text-indigo-700" role="status">
+                Pull request #{selectedPR.number} is the selected build source. Clear or change the PR to use a commit SHA, release tag, or latest main.
+              </p>
+            )}
+            {!pullSha && !projectUiSettings.requiresBuildSource && (
               <p className="mt-1 text-xs text-gray-400">
                 {githubPRs ? `${githubPRs.length} open PR(s) loaded from Forge repo.` : 'Loading PRs...'}
                 {' '}Forge will build from this commit instead of the default image.
               </p>
+            )}
+            {projectUiSettings.requiresBuildSource && (
+              <>
+                <div className="mt-3">
+                  <label className="block text-sm font-medium text-gray-700">Commit SHA or Release Tag</label>
+                  <input
+                    type="text"
+                    value={buildSourceInput}
+                    onChange={(e) => {
+                      setBuildSourceInput(e.target.value)
+                      setPullSha(e.target.value.trim())
+                      setSelectedPR(null)
+                      setPrSearch('')
+                      setUseLatestMain(false)
+                    }}
+                    disabled={useLatestMain || !!selectedPR}
+                    required={!useLatestMain && !pullSha}
+                    className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm disabled:bg-gray-100 disabled:text-gray-400"
+                    placeholder="e.g. 711b5b24... or v0.24.0"
+                  />
+                  <p className="mt-1 text-xs text-gray-400">Pin a commit, PR HEAD SHA, or published Forge release for reproducible runs.</p>
+                </div>
+                <div className="mt-3">
+                  <label className="block text-sm font-medium text-gray-700">Published Forge releases</label>
+                  <select
+                    value={buildSourceInput}
+                    onChange={(e) => {
+                      const value = e.target.value
+                      setBuildSourceInput(value)
+                      setPullSha(value)
+                      setSelectedPR(null)
+                      setPrSearch('')
+                      setUseLatestMain(false)
+                    }}
+                    disabled={useLatestMain || !!selectedPR}
+                    className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm disabled:bg-gray-100 disabled:text-gray-400"
+                  >
+                    <option value="">Select a release tag (optional)</option>
+                    {(githubReleases || []).map((release) => (
+                      <option key={release.tag_name} value={release.tag_name}>
+                        {release.name || release.tag_name}{release.prerelease ? ' (pre-release)' : ''}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="mt-3">
+                  <label className="flex items-center gap-2 text-sm text-gray-700">
+                    <input
+                      type="checkbox"
+                      checked={useLatestMain}
+                      disabled={!!selectedPR}
+                      onChange={(e) => {
+                        const checked = e.target.checked
+                        setUseLatestMain(checked)
+                        if (checked) {
+                          setPullSha('')
+                          setSelectedPR(null)
+                          setBuildSourceInput('')
+                          setPrSearch('')
+                        }
+                      }}
+                      className="rounded border-gray-300 text-indigo-600"
+                    />
+                    Use latest <code>main</code>
+                  </label>
+                  {useLatestMain && (
+                    <div className="mt-2 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
+                      <strong>Warning:</strong> <code>main</code> changes frequently and may contain untested code or configuration changes. It can be incompatible with this pipeline and makes failures harder to reproduce. Use a pinned commit or release tag for stable runs.
+                    </div>
+                  )}
+                </div>
+              </>
             )}
             {prDropdownOpen && filteredPRs.length > 0 && (
               <div className="absolute z-20 mt-1 w-full max-h-60 overflow-y-auto rounded-md bg-white shadow-lg border border-gray-200">
@@ -879,24 +1290,59 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
             )}
           </div>
 
-          <div className="flex items-center justify-between pt-2">
-            <button
-              type="button"
-              onClick={() => setStep(1)}
-              className="inline-flex items-center gap-1.5 rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
-            >
-              <ArrowLeftIcon className="h-4 w-4" /> Back
-            </button>
-            <button
-              type="button"
-              disabled={!project || !cluster || !owner.trim()}
-              onClick={() => setStep(3)}
-              title={!owner.trim() ? 'Sign in to submit a job' : undefined}
-              className="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:opacity-50"
-            >
-              Next: Project Details
-            </button>
+          {workItemConfig?.enabled && (
+            <div>
+              <label className="block text-sm font-medium text-gray-700">
+                Jira work item (optional)
+              </label>
+              <input
+                type="text"
+                value={workItemInput}
+                onChange={(e) => setWorkItemInput(e.target.value)}
+                className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm"
+                placeholder="PROJECT-123 or an allowed Jira URL"
+                maxLength={1024}
+              />
+              <p className="mt-1 text-xs text-gray-400">
+                Associates an existing issue; Control Center will not modify Jira.
+              </p>
+            </div>
+          )}
+
+          <div className="rounded-lg border border-gray-200 p-4">
+            <h3 className="text-sm font-semibold text-gray-900">
+              Run grouping <span className="font-normal text-gray-400">(optional)</span>
+            </h3>
+            <p className="mb-2 mt-1 text-xs text-gray-400">
+              Associate this run with reusable experiments, workload families, campaigns, or cohorts.
+            </p>
+            <RunGroupSelector selectedIds={runGroupIds} onChange={setRunGroupIds} />
           </div>
+
+          {rhaiisSinglePage ? (
+            <p className="border-t border-gray-100 pt-3 text-xs text-gray-500">
+              Configure the RHAIIS job below, review the generated FournosJob YAML, and submit from the bottom of this form.
+            </p>
+          ) : (
+            <div className="flex items-center justify-between pt-2">
+              <button
+                type="button"
+                onClick={() => navigateSubmitStage('', 1)}
+                className="inline-flex items-center gap-1.5 rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+              >
+                <ArrowLeftIcon className="h-4 w-4" /> Back
+              </button>
+              <button
+                type="button"
+                disabled={!project || !cluster.trim() || !owner.trim() || !buildSourceValid}
+                onClick={() => navigateSubmitStage('forge', 3)}
+                title={!owner.trim() ? 'Sign in to submit a job' : !buildSourceValid ? `${projectUiSettings.buildSourceLabel} is required` : undefined}
+                className="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:opacity-50"
+              >
+                Next: Project Details
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -912,20 +1358,32 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
         />
       )}
 
-      {/* DynamicSubmitForm stays mounted across steps 3/4 (of the "forge"
-          flow) so its internal field state survives navigating back to
-          review it — it renders nothing itself outside those steps. */}
+      {/* RHAIIS shares the basics panel above and renders project configuration,
+          YAML preview, and submission together. Other projects use the wizard. */}
       {jobType === 'forge' && dynamicSchema && (
+        (rhaiisSinglePage && step === 2) || (!rhaiisSinglePage && (step === 3 || step === 4))
+      ) && (
         <DynamicSubmitForm
           project={project}
           schema={dynamicSchema}
-          basics={{ cluster, pipeline, owner, priority, exclusive, pullSha, prLabel: prSearch || pullSha, scheduling }}
-          step={step - 1}
-          onBack={() => setStep(step - 1)}
-          onNext={() => setStep(step + 1)}
+          basics={{ cluster, clusterGpuType: selectedCluster?.gpu_type || '', pipeline, owner, priority, exclusive, pullSha, pullRequest, useLatestMain, prLabel: prSearch || pullSha, scheduling, workItems, runGroupIds, runGroups }}
+          step={rhaiisSinglePage ? 2 : step - 1}
+          singlePage={rhaiisSinglePage}
+          onBack={() => navigateSubmitStage('forge', step - 1)}
+          onNext={() => navigateSubmitStage('forge', step + 1)}
           onSubmitted={onSubmitted}
+          onMatrixConstraintsChange={setMatrixClusterConstraints}
+          onRhaiisCptModeChange={handleRhaiisCptModeChange}
+          matrixClusterValid={matrixClusterValid}
           onOpenScheduleModal={() => setScheduleModalOpen(true)}
+          matrixPipelinePortalTarget={rhaiisSinglePage ? rhaiisPipelineSetupTarget : null}
         />
+      )}
+
+      {rhaiisSinglePage && step === 2 && !dynamicSchema && (
+        <div className="rounded-lg border border-gray-200 bg-white p-4 text-sm text-gray-500">
+          {isFetchingUiSchema ? 'Loading the RHAIIS submit form…' : 'The RHAIIS submit form could not be loaded. Refresh the project form configuration and try again.'}
+        </div>
       )}
 
       {jobType === 'forge' && !dynamicSchema && step === 3 && (
@@ -963,14 +1421,14 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
           <div className="flex justify-between">
             <button
               type="button"
-              onClick={() => setStep(2)}
+              onClick={() => navigateSubmitStage('forge', 2)}
               className="inline-flex items-center gap-1.5 rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
             >
               <ArrowLeftIcon className="h-4 w-4" /> Back
             </button>
             <button
               type="button"
-              onClick={() => setStep(4)}
+              onClick={() => navigateSubmitStage('forge', 4)}
               className="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500"
             >
               Next: Review
@@ -984,12 +1442,20 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
           <div className="space-y-4 min-w-0">
             <ReviewSection title="Basics">
               <ReviewRow label="Project" value={project} missing={!project} />
-              <ReviewRow label="Cluster" value={cluster} missing={!cluster} />
+              <ReviewRow label="Cluster" value={cluster} missing={!cluster.trim()} />
               <ReviewRow label="Pipeline" value={pipeline} />
               {owner && <ReviewRow label="Requested by" value={owner} />}
-              <ReviewRow label="Priority" value={priority} />
+              <ReviewRow label="Priority" value={priority || 'Cluster default (no priority class)'} />
               {exclusive && <ReviewRow label="Exclusive" value="Yes" />}
-              {pullSha && <ReviewRow label="Pull Request" value={prSearch || pullSha} mono={!prSearch} />}
+              {projectUiSettings.requiresBuildSource && useLatestMain && <ReviewRow label={projectUiSettings.buildSourceLabel} value="Latest main (un-pinned)" />}
+              {pullSha && <ReviewRow label={projectUiSettings.buildSourceLabel} value={prSearch || pullSha} mono={!prSearch} />}
+              {workItems.map((item) => (
+                <ReviewRow key={`${item.provider}-${item.key || item.url}`} label="Work item" value={item.key || item.url} />
+              ))}
+              {runGroupIds.map((id) => {
+                const group = runGroups.find((candidate) => candidate.id === id)
+                return group ? <ReviewRow key={id} label={group.group_type} value={group.display_name} /> : null
+              })}
               <ReviewRow
                 label="Schedule"
                 value={
@@ -1019,7 +1485,7 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
             <div className="flex justify-between">
               <button
                 type="button"
-                onClick={() => setStep(3)}
+                onClick={() => navigateSubmitStage('forge', 3)}
                 className="inline-flex items-center gap-1.5 rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
               >
                 <ArrowLeftIcon className="h-4 w-4" /> Back
@@ -1028,14 +1494,14 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
                 <button
                   type="button"
                   onClick={() => setScheduleModalOpen(true)}
-                  disabled={!cluster}
+                  disabled={!cluster.trim()}
                   className="inline-flex items-center gap-1.5 rounded-md border border-gray-300 bg-white px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-                  title={!cluster ? 'Pick a cluster first' : undefined}
+                  title={!cluster.trim() ? 'Pick a cluster first' : undefined}
                 >
                   <ClockIcon className="h-4 w-4" />
                   Defer / Set Recurring…
                 </button>
-                <button type="submit" disabled={submitJob.isPending || !project || !cluster || !owner.trim()} className="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:opacity-50">
+                <button type="submit" disabled={submitJob.isPending || !project || !cluster.trim() || !owner.trim() || !buildSourceValid} className="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:opacity-50">
                   {submitJob.isPending ? <ArrowPathIcon className="h-4 w-4 animate-spin" /> : <PlayIcon className="h-4 w-4" />}
                   Submit Job
                 </button>
@@ -1053,7 +1519,8 @@ function SubmitForm({ onSubmitted }: { onSubmitted?: (name: string) => void }) {
                   owner,
                   priority,
                   exclusive,
-                  pullSha,
+                  pullSha: useLatestMain ? 'main' : pullSha,
+                  pullRequest,
                   args: preset ? [preset] : [],
                   configOverrides: withVersionOverride(project, showVersion ? version : '', configOverrides),
                   schedule: scheduling.mode === 'recurring' ? scheduling.scheduleUtc : '',
@@ -1359,23 +1826,48 @@ function SchedulesTab() {
 // ─── Main Component ─────────────────────────────────────────────────────
 
 export default function Testing() {
+  const navigate = useNavigate()
   const [searchParams, setSearchParams] = useSearchParams()
   const activeTab = searchParams.get('tab') || 'live'
-  const [page, setPage] = useState(1)
-  const [filterProject, setFilterProject] = useState('')
-  const [filterCluster, setFilterCluster] = useState('')
-  const [filterStatus, setFilterStatus] = useState('')
+  const isJobsTab = activeTab === 'live' || activeTab === 'history' || activeTab === 'queued'
+  const {
+    data: liveJobSummary,
+    isLoading: liveJobSummaryLoading,
+    isError: liveJobSummaryError,
+    refetch: refetchLiveJobSummary,
+  } = useFournosLiveJobSummary(activeTab === 'queued')
+  const initialHistoryRef = useRef(historyViewFromParams(searchParams))
+  const initialHistory = initialHistoryRef.current
+  const parsedInitialPage = Number(searchParams.get('page'))
+  const [page, setPage] = useState(Number.isInteger(parsedInitialPage) && parsedInitialPage > 0 ? parsedInitialPage : 1)
+  const [filterProject, setFilterProject] = useState(initialHistory.project)
+  const [filterCluster, setFilterCluster] = useState(initialHistory.cluster)
+  const [filterStatus, setFilterStatus] = useState(initialHistory.status)
+  const [requesterScope, setRequesterScope] = useState<'all' | 'mine'>(initialHistory.requester_scope)
+  const [historyQuery, setHistoryQuery] = useState(initialHistory.query)
+  const [historyIdentity, setHistoryIdentity] = useState(initialHistory.identity)
+  const [historyFailure, setHistoryFailure] = useState(initialHistory.failure_outcome)
+  const [historyRepository, setHistoryRepository] = useState(initialHistory.repository)
+  const [historyPrNumber, setHistoryPrNumber] = useState(initialHistory.pr_number ? String(initialHistory.pr_number) : '')
+  const [historySourceSha, setHistorySourceSha] = useState(initialHistory.source_sha)
+  const [historyForge, setHistoryForge] = useState(initialHistory.forge)
+  const [historyWorkItemProvider, setHistoryWorkItemProvider] = useState(initialHistory.work_item_provider)
+  const [historyWorkItemKey, setHistoryWorkItemKey] = useState(initialHistory.work_item_key)
+  const [historyTags, setHistoryTags] = useState(initialHistory.tags.join(', '))
+  const [historyPerPage, setHistoryPerPage] = useState(initialHistory.per_page)
+  const authenticated = isAuthenticated()
+  const { data: historyFilterOptions } = useHistoryFilterOptions(activeTab === 'history')
   // History-only date + local time-of-day range filter. Empty historyDate
   // means "no time filter" — from/to only matter once a date is picked.
-  const [historyDate, setHistoryDate] = useState('')
-  const [historyFromTime, setHistoryFromTime] = useState('00:00')
-  const [historyToTime, setHistoryToTime] = useState('23:59')
+  const [historyDate, setHistoryDate] = useState(initialHistory.history_date)
+  const [historyFromTime, setHistoryFromTime] = useState(initialHistory.from_time)
+  const [historyToTime, setHistoryToTime] = useState(initialHistory.to_time)
   // Live/History are server-paginated, so sorting has to be sent to the API
   // rather than done in-browser (client-side sort would only reorder the
   // current page). Kept as two separate states since their sortable
   // columns differ slightly (Age vs. Date).
   const [liveSort, setLiveSort] = useState<SortState>({ by: 'age', dir: 'desc' })
-  const [historySort, setHistorySort] = useState<SortState>({ by: 'date', dir: 'desc' })
+  const [historySort, setHistorySort] = useState<SortState>({ by: initialHistory.sort_by, dir: initialHistory.sort_dir })
   const activeSort = activeTab === 'live' ? liveSort : historySort
   const setActiveSort = activeTab === 'live' ? setLiveSort : setHistorySort
   const handleSort = (key: string) => {
@@ -1383,6 +1875,218 @@ export default function Testing() {
     setPage(1)
   }
   const tz = browserTimezone()
+  const historyUrlHasState = hasHistoryUrlState(searchParams)
+  const [preferenceApplied, setPreferenceApplied] = useState(
+    !authenticated || historyUrlHasState
+  )
+  const lastSavedStateRef = useRef<string | null>(
+    historyUrlHasState ? JSON.stringify(initialHistory) : null
+  )
+  const previousAuthenticatedRef = useRef(authenticated)
+  const observedUrlRef = useRef(searchParams.toString())
+  const applyingUrlRef = useRef(false)
+  const suppressPreferenceSaveRef = useRef(false)
+  const [debouncedTextFilters, setDebouncedTextFilters] = useState({
+    query: initialHistory.query,
+    identity: initialHistory.identity,
+    repository: initialHistory.repository,
+    sourceSha: initialHistory.source_sha,
+    forge: initialHistory.forge,
+    tags: initialHistory.tags.join(','),
+  })
+
+  const historyViewState = useMemo<HistoryViewState>(() => {
+    const prNumber = Number(historyPrNumber)
+    return {
+      query: historyQuery.trim(),
+      project: filterProject,
+      cluster: filterCluster,
+      status: filterStatus,
+      requester_scope: requesterScope,
+      identity: historyIdentity.trim(),
+      failure_outcome: historyFailure,
+      repository: historyRepository.trim(),
+      pr_number: Number.isInteger(prNumber) && prNumber > 0 ? prNumber : null,
+      source_sha: historySourceSha.trim(),
+      forge: historyForge.trim(),
+      work_item_provider: historyWorkItemProvider.trim(),
+      work_item_key: historyWorkItemKey.trim().toUpperCase(),
+      tags: historyTags.split(',').map((tag) => tag.trim()).filter(Boolean).slice(0, 20),
+      history_date: historyDate,
+      from_time: historyFromTime,
+      to_time: historyToTime,
+      sort_by: historySort.by as HistoryViewState['sort_by'],
+      sort_dir: historySort.dir,
+      per_page: historyPerPage,
+    }
+  }, [
+    historyQuery, filterProject, filterCluster, filterStatus, requesterScope,
+    historyIdentity, historyFailure, historyRepository, historyPrNumber,
+    historySourceSha, historyForge, historyWorkItemProvider, historyWorkItemKey, historyTags, historyDate,
+    historyFromTime, historyToTime, historySort, historyPerPage,
+  ])
+
+  const applyHistoryView = useCallback((state: HistoryViewState) => {
+    setHistoryQuery(state.query)
+    setFilterProject(state.project)
+    setFilterCluster(state.cluster)
+    setFilterStatus(state.status)
+    setRequesterScope(state.requester_scope)
+    setHistoryIdentity(state.identity)
+    setHistoryFailure(state.failure_outcome)
+    setHistoryRepository(state.repository)
+    setHistoryPrNumber(state.pr_number ? String(state.pr_number) : '')
+    setHistorySourceSha(state.source_sha)
+    setHistoryForge(state.forge)
+    setHistoryWorkItemProvider(state.work_item_provider)
+    setHistoryWorkItemKey(state.work_item_key)
+    setHistoryTags(state.tags.join(', '))
+    setHistoryDate(state.history_date)
+    setHistoryFromTime(state.from_time)
+    setHistoryToTime(state.to_time)
+    setHistorySort({ by: state.sort_by, dir: state.sort_dir })
+    setHistoryPerPage(state.per_page)
+    setDebouncedTextFilters({
+      query: state.query,
+      identity: state.identity,
+      repository: state.repository,
+      sourceSha: state.source_sha,
+      forge: state.forge,
+      tags: state.tags.join(','),
+    })
+    setPage(1)
+  }, [])
+
+  const preferenceQuery = useHistoryPreference(
+    authenticated && activeTab === 'history' && !historyUrlHasState && !preferenceApplied
+  )
+  const { mutate: saveHistoryPreference, isPending: preferenceSaving } = useSaveHistoryPreference()
+  const { mutate: resetHistoryPreference, isPending: preferenceResetting } = useResetHistoryPreference()
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => {
+      setDebouncedTextFilters({
+        query: historyQuery.trim(),
+        identity: historyIdentity.trim(),
+        repository: historyRepository.trim(),
+        sourceSha: historySourceSha.trim(),
+        forge: historyForge.trim(),
+        tags: historyViewState.tags.join(','),
+      })
+    }, 300)
+    return () => window.clearTimeout(timeout)
+  }, [historyQuery, historyIdentity, historyRepository, historySourceSha, historyForge, historyViewState.tags])
+
+  useEffect(() => {
+    if (authenticated && !previousAuthenticatedRef.current && activeTab === 'history' && !historyUrlHasState) {
+      lastSavedStateRef.current = null
+      setPreferenceApplied(false)
+    }
+    previousAuthenticatedRef.current = authenticated
+  }, [authenticated, activeTab, historyUrlHasState])
+
+  useEffect(() => {
+    if (activeTab !== 'history' || preferenceApplied) return
+    if (!authenticated || historyUrlHasState) {
+      lastSavedStateRef.current = JSON.stringify(historyViewState)
+      setPreferenceApplied(true)
+      return
+    }
+    if (preferenceQuery.data) {
+      applyHistoryView(preferenceQuery.data.state)
+      lastSavedStateRef.current = JSON.stringify(preferenceQuery.data.state)
+      setPreferenceApplied(true)
+    } else if (preferenceQuery.isError) {
+      lastSavedStateRef.current = JSON.stringify(historyViewState)
+      setPreferenceApplied(true)
+    }
+  }, [
+    activeTab, preferenceApplied, authenticated, historyUrlHasState,
+    preferenceQuery.data, preferenceQuery.isError, applyHistoryView,
+    historyViewState,
+  ])
+
+  useEffect(() => {
+    const currentUrl = searchParams.toString()
+    if (currentUrl === observedUrlRef.current) return
+    observedUrlRef.current = currentUrl
+    if (activeTab !== 'history' || !preferenceApplied) return
+
+    const urlState = historyViewFromParams(searchParams)
+    const urlPage = Number(searchParams.get('page'))
+    const normalizedPage = Number.isInteger(urlPage) && urlPage > 0 ? urlPage : 1
+    if (JSON.stringify(urlState) !== JSON.stringify(historyViewState) || normalizedPage !== page) {
+      applyingUrlRef.current = true
+      applyHistoryView(urlState)
+      setPage(normalizedPage)
+      lastSavedStateRef.current = JSON.stringify(urlState)
+    }
+  }, [searchParams, activeTab, preferenceApplied, historyViewState, page, applyHistoryView])
+
+  useEffect(() => {
+    if (activeTab !== 'history' || !preferenceApplied) return
+    if (applyingUrlRef.current) {
+      applyingUrlRef.current = false
+      return
+    }
+    const next = new URLSearchParams(searchParams)
+    HISTORY_URL_KEYS.forEach((key) => next.delete(key))
+    next.set('tab', 'history')
+    const setWhen = (key: string, value: string, condition = Boolean(value)) => {
+      if (condition) next.set(key, value)
+    }
+    setWhen('q', historyViewState.query)
+    setWhen('project', historyViewState.project)
+    setWhen('cluster', historyViewState.cluster)
+    setWhen('status', historyViewState.status)
+    setWhen('scope', historyViewState.requester_scope, historyViewState.requester_scope === 'mine')
+    setWhen('identity', historyViewState.identity, authenticated && Boolean(historyViewState.identity))
+    setWhen('failure', historyViewState.failure_outcome)
+    setWhen('repository', historyViewState.repository)
+    setWhen('pr', String(historyViewState.pr_number || ''), historyViewState.pr_number !== null)
+    setWhen('sha', historyViewState.source_sha)
+    setWhen('forge', historyViewState.forge)
+    setWhen('work_provider', historyViewState.work_item_provider, authenticated && Boolean(historyViewState.work_item_provider))
+    setWhen('work_item', historyViewState.work_item_key, authenticated && Boolean(historyViewState.work_item_key))
+    setWhen('tags', historyViewState.tags.join(','), historyViewState.tags.length > 0)
+    setWhen('date', historyViewState.history_date)
+    setWhen('from', historyViewState.from_time, Boolean(historyViewState.history_date) && historyViewState.from_time !== '00:00')
+    setWhen('to', historyViewState.to_time, Boolean(historyViewState.history_date) && historyViewState.to_time !== '23:59')
+    setWhen('sort', historyViewState.sort_by, historyViewState.sort_by !== 'date')
+    setWhen('dir', historyViewState.sort_dir, historyViewState.sort_dir !== 'desc')
+    setWhen('per_page', String(historyViewState.per_page), historyViewState.per_page !== 100)
+    setWhen('page', String(page), page > 1)
+    if (next.toString() !== searchParams.toString()) {
+      observedUrlRef.current = next.toString()
+      setSearchParams(next, { replace: true })
+    }
+  }, [activeTab, authenticated, preferenceApplied, historyViewState, page, searchParams, setSearchParams])
+
+  useEffect(() => {
+    if (!authenticated || activeTab !== 'history' || !preferenceApplied || preferenceSaving) return
+    const serialized = JSON.stringify(historyViewState)
+    if (lastSavedStateRef.current === null) {
+      lastSavedStateRef.current = serialized
+      return
+    }
+    if (serialized === lastSavedStateRef.current) return
+    const timeout = window.setTimeout(() => {
+      if (suppressPreferenceSaveRef.current) return
+      saveHistoryPreference(historyViewState, {
+        onSuccess: () => { lastSavedStateRef.current = serialized },
+      })
+    }, 700)
+    return () => window.clearTimeout(timeout)
+  }, [authenticated, activeTab, preferenceApplied, preferenceSaving, historyViewState, saveHistoryPreference])
+
+  useEffect(() => {
+    if (!authenticated) {
+      if (requesterScope === 'mine') setRequesterScope('all')
+      if (historyIdentity) setHistoryIdentity('')
+      if (historyWorkItemProvider) setHistoryWorkItemProvider('')
+      if (historyWorkItemKey) setHistoryWorkItemKey('')
+    }
+  }, [authenticated, requesterScope, historyIdentity, historyWorkItemProvider, historyWorkItemKey])
 
   const { data: clustersData } = useClusters()
   const { data: forgeProjects } = useForgeProjects()
@@ -1391,15 +2095,43 @@ export default function Testing() {
     () => (clustersData?.clusters || []).map((c: Cluster) => c.name),
     [clustersData]
   )
+  const queuedClusterRows = useMemo(() => {
+    const countsByCluster = liveJobSummary?.by_cluster || {}
+    const countsByKey = new Map(
+      Object.entries(countsByCluster).map(([name, counts]) => [normalizeClusterName(name), counts])
+    )
+    const clusterNamesByKey = new Map(
+      (clustersData?.clusters || []).map((cluster: Cluster) => [
+        normalizeClusterName(cluster.name),
+        cluster.name,
+      ]),
+    )
+    Object.keys(countsByCluster).forEach((name) => {
+      const normalizedName = normalizeClusterName(name)
+      if (normalizedName && !clusterNamesByKey.has(normalizedName)) {
+        clusterNamesByKey.set(normalizedName, name.trim())
+      }
+    })
+    return [...clusterNamesByKey.entries()]
+      .map(([normalizedName, cluster]) => {
+        const counts = countsByKey.get(normalizedName)
+        return {
+          cluster,
+          queued: counts?.queued || 0,
+          running: counts?.running || 0,
+          active: counts?.active || 0,
+        }
+      })
+      .sort((a, b) => b.queued - a.queued || b.active - a.active || a.cluster.localeCompare(b.cluster))
+  }, [liveJobSummary?.by_cluster, clustersData?.clusters])
   const filterProjectNames = useMemo(
     () => (forgeProjects || []).map((p: ForgeProject) => p.name),
     [forgeProjects]
   )
 
-  // Converted to UTC right before hitting the API — same pattern as every
-  // other scheduling control (SchedulingCalendar, timezone.ts). "To" rolls
-  // over to the next calendar day when it's <= "From", so a range like
-  // 22:00 -> 02:00 is treated as spanning midnight rather than empty.
+  // History shows every date by default. Choosing a date applies the existing
+  // local-date/time filter; convert that selection to UTC before sending it to
+  // the API. "To" rolls into the next day when <= "From".
   const { historyStartUtc, historyEndUtc } = useMemo(() => {
     if (activeTab !== 'history' || !historyDate) return { historyStartUtc: undefined, historyEndUtc: undefined }
     const [y, mo, d] = historyDate.split('-').map(Number)
@@ -1411,72 +2143,141 @@ export default function Testing() {
     return { historyStartUtc: startUtc, historyEndUtc: endUtc }
   }, [activeTab, historyDate, historyFromTime, historyToTime, tz])
 
+  const historyReady = activeTab !== 'history' || preferenceApplied
   const { data: jobsData, isLoading, isError, error, refetch } = useFournosJobs({
     tab: activeTab === 'live' || activeTab === 'history' ? activeTab : undefined,
     project: filterProject || undefined,
     cluster: filterCluster || undefined,
     status: filterStatus || undefined,
+    requester_scope: requesterScope,
+    q: activeTab === 'history' ? debouncedTextFilters.query || undefined : undefined,
+    identity: activeTab === 'history' && authenticated ? debouncedTextFilters.identity || undefined : undefined,
+    failure_outcome: activeTab === 'history' ? historyFailure || undefined : undefined,
+    repository: activeTab === 'history' ? debouncedTextFilters.repository || undefined : undefined,
+    pr_number: activeTab === 'history' ? historyViewState.pr_number ?? undefined : undefined,
+    source_sha: activeTab === 'history' && /^[0-9a-fA-F]{4,64}$/.test(debouncedTextFilters.sourceSha) ? debouncedTextFilters.sourceSha : undefined,
+    forge: activeTab === 'history' ? debouncedTextFilters.forge || undefined : undefined,
+    work_item_provider: activeTab === 'history' && authenticated ? historyWorkItemProvider || undefined : undefined,
+    work_item_key: activeTab === 'history' && authenticated ? historyWorkItemKey || undefined : undefined,
+    tags: activeTab === 'history' ? debouncedTextFilters.tags || undefined : undefined,
     start_time: historyStartUtc,
     end_time: historyEndUtc,
     sort_by: activeSort.by || undefined,
     sort_dir: activeSort.dir,
     page,
-    per_page: 50,
-  })
+    per_page: activeTab === 'history' ? historyPerPage : 50,
+  }, (activeTab === 'live' || activeTab === 'history') && historyReady)
 
   const cancelJob = useCancelJob()
   const deleteJob = useDeleteHistoryJob()
   const rerunJob = useRerunJob()
 
   const setTab = (tab: string) => {
-    setSearchParams({ tab })
+    const next = new URLSearchParams(searchParams)
+    next.set('tab', tab)
+    next.delete('page')
+    setSearchParams(next)
     setPage(1)
+  }
+
+  const clearHistoryFilters = () => {
+    setHistoryQuery('')
+    setFilterProject('')
+    setFilterCluster('')
+    setFilterStatus('')
+    setRequesterScope('all')
+    setHistoryIdentity('')
+    setHistoryFailure('')
+    setHistoryRepository('')
+    setHistoryPrNumber('')
+    setHistorySourceSha('')
+    setHistoryForge('')
+    setHistoryWorkItemProvider('')
+    setHistoryWorkItemKey('')
+    setHistoryTags('')
+    setHistoryDate('')
+    setHistoryFromTime('00:00')
+    setHistoryToTime('23:59')
+    setPage(1)
+  }
+
+  const resetSavedHistoryView = () => {
+    suppressPreferenceSaveRef.current = true
+    resetHistoryPreference(undefined, {
+      onSuccess: () => {
+        applyHistoryView(DEFAULT_HISTORY_VIEW)
+        lastSavedStateRef.current = JSON.stringify(DEFAULT_HISTORY_VIEW)
+        suppressPreferenceSaveRef.current = false
+      },
+      onError: () => { suppressPreferenceSaveRef.current = false },
+    })
   }
 
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900 font-display">Testing</h1>
+          <h1 className="text-2xl font-bold text-gray-900 font-display">Fournos Dashboard</h1>
           <p className="mt-1 text-sm text-gray-500">
             Submit, monitor, and review FournosJob test runs
           </p>
         </div>
-        {(activeTab === 'live' || activeTab === 'history') && (
-          <button onClick={() => refetch()} className="inline-flex items-center gap-1 text-sm text-gray-500 hover:text-gray-700">
+        {isJobsTab && (
+          <button
+            onClick={() => { void (activeTab === 'queued' ? refetchLiveJobSummary() : refetch()) }}
+            className="inline-flex items-center gap-1 text-sm text-gray-500 hover:text-gray-700"
+          >
             <ArrowPathIcon className="h-4 w-4" /> Refresh
           </button>
         )}
       </div>
 
-      {/* Tab bar */}
-      <div className="border-b border-gray-200">
-        <nav className="-mb-px flex space-x-8">
-          {TABS.map((tab) => {
-            if (tab.id === 'submit' && !isAuthenticated()) return null
-            return (
-              <button
-                key={tab.id}
-                onClick={() => setTab(tab.id)}
-                className={clsx(
-                  'whitespace-nowrap border-b-2 py-3 px-1 text-sm font-medium flex items-center gap-1.5',
-                  activeTab === tab.id
-                    ? 'border-indigo-500 text-indigo-600'
-                    : 'border-transparent text-gray-500 hover:border-gray-300 hover:text-gray-700'
-                )}
-              >
-                <tab.icon className="h-4 w-4" />
-                {tab.label}
-              </button>
-            )
-          })}
-        </nav>
-      </div>
+      {isJobsTab && (
+        <div className="inline-flex items-center gap-2" role="tablist" aria-label="Jobs views">
+          {([
+            { id: 'live', label: 'Live', icon: PlayIcon },
+            { id: 'history', label: 'History', icon: ClockIcon },
+            { id: 'queued', label: 'Queued', icon: QueueListIcon },
+          ] as const).map((view) => (
+            <button
+              key={view.id}
+              type="button"
+              role="tab"
+              aria-selected={activeTab === view.id}
+              onClick={() => setTab(view.id)}
+              className={clsx(
+                'inline-flex min-w-28 items-center justify-center gap-2 rounded-lg border px-5 py-2.5 text-sm font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-2',
+                activeTab === view.id
+                  ? 'border-indigo-700 bg-indigo-600 text-white shadow-sm'
+                  : 'border-gray-300 bg-white text-gray-700 hover:border-indigo-300 hover:bg-indigo-50 hover:text-indigo-700'
+              )}
+            >
+              <view.icon className="h-4 w-4" aria-hidden="true" />
+              {view.label}
+            </button>
+          ))}
+        </div>
+      )}
 
       {/* Filters (for live/history tabs) */}
       {(activeTab === 'live' || activeTab === 'history') && (
         <div className="flex flex-wrap items-center gap-3 rounded-lg border border-gray-200 bg-gray-50/60 px-3 py-2.5">
           <span className="text-xs font-medium uppercase tracking-wide text-gray-400">Filters</span>
+          <JobNameSearch />
+          {activeTab === 'history' && (
+            <label className="relative w-64">
+              <MagnifyingGlassIcon className="pointer-events-none absolute left-2.5 top-2 h-4 w-4 text-gray-400" />
+              <input
+                type="search"
+                value={historyQuery}
+                maxLength={200}
+                onChange={(e) => { setHistoryQuery(e.target.value); setPage(1) }}
+                placeholder="Search run history"
+                aria-label="Search run history"
+                className="w-full rounded-md border-gray-300 py-1.5 pl-8 pr-3 text-sm shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+              />
+            </label>
+          )}
           <SearchableSelect
             value={filterProject}
             onChange={(v) => { setFilterProject(v); setPage(1) }}
@@ -1484,6 +2285,26 @@ export default function Testing() {
             placeholder="All projects"
             className="w-44"
           />
+          {authenticated && (
+            <div className="inline-flex rounded-md border border-gray-300 bg-white p-0.5" role="group" aria-label="Requester filter">
+              {(['all', 'mine'] as const).map((scope) => (
+                <button
+                  key={scope}
+                  type="button"
+                  onClick={() => { setRequesterScope(scope); setPage(1) }}
+                  aria-pressed={requesterScope === scope}
+                  className={clsx(
+                    'rounded px-2.5 py-1 text-xs font-medium transition-colors',
+                    requesterScope === scope
+                      ? 'bg-indigo-50 text-indigo-700'
+                      : 'text-gray-500 hover:bg-gray-50 hover:text-gray-700'
+                  )}
+                >
+                  {scope === 'all' ? 'All jobs' : 'My jobs'}
+                </button>
+              ))}
+            </div>
+          )}
           <SearchableSelect
             value={filterCluster}
             onChange={(v) => { setFilterCluster(v); setPage(1) }}
@@ -1494,7 +2315,7 @@ export default function Testing() {
           <SearchableSelect
             value={filterStatus}
             onChange={(v) => { setFilterStatus(v); setPage(1) }}
-            options={ALL_STATUSES}
+            options={activeTab === 'history' ? HISTORY_STATUSES : ALL_STATUSES}
             placeholder="All statuses"
             className="w-44"
           />
@@ -1520,6 +2341,7 @@ export default function Testing() {
                 >
                   Today
                 </button>
+                {!historyDate && <span className="text-xs text-gray-400">All dates</span>}
               </div>
               {historyDate && (
                 <div className="flex items-center gap-1.5">
@@ -1541,11 +2363,107 @@ export default function Testing() {
               )}
             </>
           )}
-          {(filterProject || filterCluster || filterStatus || historyDate) && (
+          {activeTab === 'history' && (
+            <details className="w-full border-t border-gray-200 pt-2">
+              <summary className="cursor-pointer select-none text-xs font-medium text-gray-600 hover:text-gray-800">
+                Filter list
+              </summary>
+              <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                {authenticated && (
+                  <EditableCombobox
+                    value={historyIdentity}
+                    maxLength={255}
+                    onChange={(value) => { setHistoryIdentity(value); setPage(1) }}
+                    options={historyFilterOptions?.identities || []}
+                    placeholder="Owner or requester"
+                    ariaLabel="Owner or requester"
+                  />
+                )}
+                <select
+                  value={historyFailure}
+                  onChange={(e) => { setHistoryFailure(e.target.value); setPage(1) }}
+                  aria-label="Failure outcome"
+                  className="rounded-md border-gray-300 text-sm shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+                >
+                  <option value="">All failure outcomes</option>
+                  <option value="failed">Failed</option>
+                  <option value="cancelled">Cancelled</option>
+                  <option value="infrastructure_error">Infrastructure error</option>
+                  <option value="unknown">Unknown</option>
+                </select>
+                <EditableCombobox
+                  value={historyRepository}
+                  maxLength={255}
+                  onChange={(value) => { setHistoryRepository(value); setPage(1) }}
+                  options={historyFilterOptions?.repositories || []}
+                  placeholder="Repository (owner/name)"
+                  ariaLabel="Source repository"
+                />
+                <EditableCombobox
+                  value={historyPrNumber}
+                  onChange={(value) => { setHistoryPrNumber(value.replace(/\D/g, '')); setPage(1) }}
+                  options={(historyFilterOptions?.pr_numbers || []).map(String)}
+                  inputMode="numeric"
+                  placeholder="PR number"
+                  ariaLabel="Pull request number"
+                />
+                <EditableCombobox
+                  value={historySourceSha}
+                  maxLength={64}
+                  onChange={(value) => {
+                    setHistorySourceSha(value.replace(/[^0-9a-fA-F]/g, '').slice(0, 64))
+                    setPage(1)
+                  }}
+                  options={historyFilterOptions?.source_shas || []}
+                  placeholder="Requested/submitted SHA"
+                  ariaLabel="Source commit SHA"
+                />
+                <EditableCombobox
+                  value={historyForge}
+                  maxLength={255}
+                  onChange={(value) => { setHistoryForge(value); setPage(1) }}
+                  options={historyFilterOptions?.forge || []}
+                  placeholder="Forge version or image digest"
+                  ariaLabel="Forge version or image digest"
+                />
+                {authenticated && (
+                  <EditableCombobox
+                    value={historyWorkItemProvider}
+                    maxLength={50}
+                    onChange={(value) => { setHistoryWorkItemProvider(value.toLowerCase()); setPage(1) }}
+                    options={historyFilterOptions?.work_item_providers || ['jira']}
+                    placeholder="Work-item provider"
+                    ariaLabel="Work-item provider"
+                  />
+                )}
+                {authenticated && (
+                  <EditableCombobox
+                    value={historyWorkItemKey}
+                    maxLength={100}
+                    onChange={(value) => { setHistoryWorkItemKey(value.toUpperCase()); setPage(1) }}
+                    options={historyFilterOptions?.work_item_keys || []}
+                    placeholder="Work-item key"
+                    ariaLabel="Work-item key"
+                  />
+                )}
+                <EditableCombobox
+                  value={historyTags}
+                  onChange={(value) => { setHistoryTags(value); setPage(1) }}
+                  options={historyFilterOptions?.tags || []}
+                  multiple
+                  placeholder="Tags (comma-separated)"
+                  ariaLabel="Tags"
+                />
+              </div>
+            </details>
+          )}
+          {(
+            (activeTab === 'live' && (filterProject || filterCluster || filterStatus || requesterScope === 'mine')) ||
+            (activeTab === 'history' && (filterProject || filterCluster || filterStatus || historyDate || requesterScope === 'mine' || historyQuery || historyIdentity || historyFailure || historyRepository || historyPrNumber || historySourceSha || historyForge || historyWorkItemProvider || historyWorkItemKey || historyTags))
+          ) && (
             <button
-              onClick={() => {
-                setFilterProject(''); setFilterCluster(''); setFilterStatus('')
-                setHistoryDate(''); setHistoryFromTime('00:00'); setHistoryToTime('23:59')
+              onClick={activeTab === 'history' ? clearHistoryFilters : () => {
+                setFilterProject(''); setFilterCluster(''); setFilterStatus(''); setRequesterScope('all'); setPage(1)
               }}
               className="inline-flex items-center gap-1 text-xs font-medium text-gray-400 hover:text-gray-600"
               title="Clear filters"
@@ -1553,8 +2471,31 @@ export default function Testing() {
               <XMarkIcon className="h-3.5 w-3.5" /> Clear
             </button>
           )}
-          <span className="ml-auto text-xs text-gray-400">
+          {activeTab === 'history' && authenticated && (
+            <button
+              type="button"
+              onClick={resetSavedHistoryView}
+              disabled={preferenceResetting || preferenceSaving}
+              className="text-xs font-medium text-gray-400 hover:text-gray-600 disabled:opacity-50"
+            >
+              {preferenceResetting ? 'Resetting...' : 'Reset saved view'}
+            </button>
+          )}
+          {activeTab === 'history' && (
+            <label className="ml-auto flex items-center gap-1 text-xs text-gray-400">
+              Rows
+              <select
+                value={historyPerPage}
+                onChange={(e) => { setHistoryPerPage(Number(e.target.value)); setPage(1) }}
+                className="rounded border-gray-300 py-1 pl-1.5 pr-6 text-xs"
+              >
+                {[25, 50, 100, 200].map((value) => <option key={value} value={value}>{value}</option>)}
+              </select>
+            </label>
+          )}
+          <span className={clsx('text-xs text-gray-400', activeTab !== 'history' && 'ml-auto')}>
             {jobsData?.total ?? 0} {activeTab === 'live' ? 'active' : 'archived'} jobs
+            {activeTab === 'history' && authenticated && preferenceSaving ? ' · Saving view…' : ''}
           </span>
         </div>
       )}
@@ -1596,6 +2537,7 @@ export default function Testing() {
                 sort={liveSort}
                 onSort={handleSort}
                 onCancel={(name) => { if (confirm(`Cancel job "${name}"?`)) cancelJob.mutate(name) }}
+                onEdit={(name) => navigate(`/testing/jobs/${encodeURIComponent(name)}?edit=1`)}
               />
               {(jobsData?.total ?? 0) > 50 && (
                 <div className="flex items-center justify-between px-4 py-3 border-t border-gray-200">
@@ -1609,7 +2551,7 @@ export default function Testing() {
         )}
 
         {activeTab === 'history' && !isError && (
-          isLoading ? (
+          (isLoading || !historyReady) ? (
             <div className="text-center py-12 text-gray-400">Loading history...</div>
           ) : (
             <>
@@ -1620,19 +2562,94 @@ export default function Testing() {
                 onSort={handleSort}
                 onDelete={(name) => { if (confirm(`Delete job "${name}" from history?`)) deleteJob.mutate(name) }}
                 onRerun={(name) => rerunJob.mutate(name)}
+                onEdit={(name) => navigate(`/testing/jobs/${encodeURIComponent(name)}?edit=1`)}
               />
-              {(jobsData?.total ?? 0) > 50 && (
+              {(jobsData?.total ?? 0) > historyPerPage && (
                 <div className="flex items-center justify-between px-4 py-3 border-t border-gray-200">
                   <button disabled={page <= 1} onClick={() => setPage(p => p - 1)} className="text-sm text-gray-500 disabled:opacity-40">Previous</button>
-                  <span className="text-sm text-gray-500">Page {page} of {Math.ceil((jobsData?.total ?? 0) / 50)}</span>
-                  <button disabled={(jobsData?.jobs.length ?? 0) < 50} onClick={() => setPage(p => p + 1)} className="text-sm text-gray-500 disabled:opacity-40">Next</button>
+                  <span className="text-sm text-gray-500">Page {page} of {Math.ceil((jobsData?.total ?? 0) / historyPerPage)}</span>
+                  <button disabled={(jobsData?.jobs.length ?? 0) < historyPerPage} onClick={() => setPage(p => p + 1)} className="text-sm text-gray-500 disabled:opacity-40">Next</button>
                 </div>
               )}
             </>
           )
         )}
 
+        {activeTab === 'queued' && (
+          liveJobSummaryLoading ? (
+            <div className="text-center py-12 text-gray-400">Loading cluster queue summary...</div>
+          ) : liveJobSummaryError ? (
+            <div className="text-center py-12 px-4">
+              <p className="font-medium text-red-700">Failed to load queued job counts</p>
+              <p className="mt-1 text-sm text-gray-500">The cluster queue summary could not be retrieved.</p>
+              <button
+                type="button"
+                onClick={() => { void refetchLiveJobSummary() }}
+                className="mt-4 inline-flex items-center gap-1 rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-700"
+              >
+                <ArrowPathIcon className="h-4 w-4" /> Retry
+              </button>
+            </div>
+          ) : (
+            <>
+              <div className="flex flex-col gap-2 border-b border-gray-200 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <h2 className="font-semibold text-gray-900">Queue by cluster</h2>
+                  <p className="mt-1 text-sm text-gray-500">
+                    Queued counts include Pending, Resolving, and Admitted jobs; running jobs are shown for context.
+                  </p>
+                </div>
+                <Link to="/clusters" className="text-sm font-medium text-primary-600 hover:text-primary-700">
+                  Check cluster capacity →
+                </Link>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="min-w-full divide-y divide-gray-200">
+                  <thead className="bg-gray-50">
+                    <tr>
+                      <th className="px-5 py-3 text-left text-xs font-medium uppercase tracking-wider text-gray-500">Cluster</th>
+                      <th className="px-5 py-3 text-right text-xs font-medium uppercase tracking-wider text-gray-500">Queued / waiting</th>
+                      <th className="px-5 py-3 text-right text-xs font-medium uppercase tracking-wider text-gray-500">Running</th>
+                      <th className="px-5 py-3 text-right text-xs font-medium uppercase tracking-wider text-gray-500">Active total</th>
+                      <th className="px-5 py-3 text-right text-xs font-medium uppercase tracking-wider text-gray-500">Activity</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-200 bg-white">
+                    {queuedClusterRows.map((row) => (
+                      <tr key={row.cluster} className="hover:bg-gray-50">
+                        <td className="whitespace-nowrap px-5 py-3 font-medium text-gray-900">{row.cluster}</td>
+                        <td className="px-5 py-3 text-right">
+                          <span className={clsx(
+                            'inline-flex min-w-8 justify-center rounded-full px-2 py-0.5 text-sm font-semibold',
+                            row.queued > 0 ? 'bg-amber-100 text-amber-800' : 'bg-gray-100 text-gray-600',
+                          )}>
+                            {row.queued}
+                          </span>
+                        </td>
+                        <td className="px-5 py-3 text-right text-sm text-gray-700">{row.running}</td>
+                        <td className="px-5 py-3 text-right text-sm font-medium text-gray-900">{row.active}</td>
+                        <td className="px-5 py-3 text-right">
+                          <span className={clsx(
+                            'inline-flex rounded-full px-2.5 py-1 text-xs font-medium',
+                            row.active === 0 ? 'bg-emerald-50 text-emerald-700' : row.queued > 0 ? 'bg-amber-50 text-amber-800' : 'bg-blue-50 text-blue-700',
+                          )}>
+                            {row.active === 0 ? 'No active jobs' : row.queued > 0 ? 'Queue present' : 'Running'}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <p className="border-t border-gray-200 px-5 py-3 text-xs text-gray-500">
+                Counts refresh every 30 seconds. Job activity is a quick signal, not a guarantee of GPU capacity or schedulability.
+              </p>
+            </>
+          )
+        )}
+
         {activeTab === 'schedules' && <SchedulesTab />}
+        {activeTab === 'cpt' && <CptJobsPanel />}
       </div>
       )}
     </div>

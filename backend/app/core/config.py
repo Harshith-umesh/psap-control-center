@@ -17,6 +17,13 @@ class Settings(BaseSettings):
     KUBECONFIG_STORAGE_PATH: str = "./kubeconfigs"
     
     MLFLOW_BASE_URL: Optional[str] = None
+    MLFLOW_TRACKING_URI: Optional[str] = None
+    MLFLOW_TRACKING_USERNAME: Optional[str] = None
+    MLFLOW_TRACKING_PASSWORD: Optional[str] = None
+    MLFLOW_WORKSPACE: Optional[str] = None
+    MLFLOW_TRACKING_INSECURE_TLS: bool = False
+    MLFLOW_FAILURE_ENRICHMENT_ENABLED: bool = True
+    MLFLOW_REQUEST_TIMEOUT_SECONDS: float = 10.0
     
     ADMIN_USERNAME: str = ""
     ADMIN_PASSWORD: str = ""
@@ -46,6 +53,11 @@ class Settings(BaseSettings):
     FOURNOS_API_VERSION: str = "v1"
     FOURNOS_JOB_PLURAL: str = "fournosjobs"
     FOURNOS_K8S_TIMEOUT: int = 30
+    # When unset, let the Fournos operator apply its configured default TTL.
+    FOURNOS_DEFAULT_JOB_TTL: Optional[str] = None
+    TARGET_CLUSTER_SECRETS_NAMESPACE: str = "psap-secrets"
+    # Optional read-only source used by the one-time Fournos history backfill.
+    FOURNOS_ARCHIVE_DATABASE_URL: Optional[str] = None
 
     # Tekton CRD settings
     TEKTON_API_GROUP: str = "tekton.dev"
@@ -64,6 +76,12 @@ class Settings(BaseSettings):
     GITHUB_SYNC_FAILURE_BACKOFF_SECONDS: int = 5 * 60
 
     FOURNOS_DEFAULT_PIPELINES: str = "forge-full,forge-prepare-test,forge-test-only,forge-prepare-only,forge-replot,nightly"
+
+    # Optional, read-only external work-item associations for test runs.
+    # Hosts are deployment configuration rather than UI constants so each
+    # environment can explicitly choose which Jira deployment it trusts.
+    WORK_ITEM_ALLOWED_HOSTS: str = ""
+    WORK_ITEM_JIRA_BASE_URL: Optional[str] = None
 
     class Config:
         env_file = ".env"

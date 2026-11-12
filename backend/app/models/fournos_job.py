@@ -6,13 +6,20 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from sqlalchemy import (
-    Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text, Index,
-    func,
+    Boolean, Column, DateTime, Float, ForeignKey, Integer, JSON, String, Text,
+    Index, UniqueConstraint, func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
+
+
+# Keep PostgreSQL as the primary type so production queries retain JSONB and
+# ARRAY operators/comparators, while allowing SQLite local development to
+# initialize the same model with portable JSON storage.
+_JSON = JSONB().with_variant(JSON(), "sqlite")
+_STRING_LIST = ARRAY(String).with_variant(JSON(), "sqlite")
 
 
 class FournosJob(Base):
@@ -29,6 +36,22 @@ class FournosJob(Base):
     requester_email = Column(String(255), default="", index=True)
     requester_name = Column(String(255), default="")
     auth_provider = Column(String(50), default="")
+    source_repository = Column(String(255), default="", index=True)
+    source_pr_number = Column(Integer, nullable=True, index=True)
+    source_pr_url = Column(String(1024), default="")
+    source_head_branch = Column(String(255), default="")
+    source_requested_sha = Column(String(64), default="", index=True)
+    source_resolved_sha = Column(String(64), default="", index=True)
+    # Observed execution evidence, kept separate from the source revision the
+    # requester selected.  A merged-code run normally executes the Forge
+    # commit baked into the container image; MLflow and the pod image digest
+    # are therefore the authoritative record of what actually ran.
+    forge_execution = Column(_JSON, default=dict)
+    forge_provenance_state = Column(
+        String(50), default="pending", nullable=False
+    )
+    forge_provenance_attempts = Column(Integer, default=0, nullable=False)
+    forge_provenance_attempted_at = Column(DateTime(timezone=True), nullable=True)
     status = Column(String(50), default="Pending", index=True)
     message = Column(Text, default="")
     created_at = Column(
@@ -39,22 +62,29 @@ class FournosJob(Base):
     duration_seconds = Column(Float, nullable=True)
     mlflow_url = Column(String(1024), default="")
     ci_artifacts_url = Column(String(1024), default="")
-    config_overrides = Column(JSONB, default=dict)
-    tags = Column(ARRAY(String), default=list)
-    fjob_spec = Column(JSONB, default=dict)
-    fjob_status = Column(JSONB, default=dict)
+    config_overrides = Column(_JSON, default=dict)
+    tags = Column(_STRING_LIST, default=list)
+    fjob_spec = Column(_JSON, default=dict)
+    fjob_status = Column(_JSON, default=dict)
     # Snapshot of the merged pipeline stage list (same shape the live
     # job-detail endpoint builds via pipeline_definitions.merge_pipeline_
     # stages) taken when the job reaches a terminal phase (with a small retry
     # window for transient K8s failures). The PipelineRun/TaskRuns themselves
     # may be gone by the time a job is opened from History, so this is the
     # durable copy used to render the timeline and failed step.
-    stages = Column(JSONB, default=list)
+    stages = Column(_JSON, default=list)
     # Failed/missing PipelineRun snapshots are retried a small, bounded number
     # of times. Keeping this state in the DB prevents every watcher restart or
     # full-sync pass from creating another Kubernetes API storm.
     stage_snapshot_attempts = Column(Integer, default=0, nullable=False)
     stage_snapshot_attempted_at = Column(DateTime(timezone=True), nullable=True)
+    failure_outcome = Column(String(50), default="", index=True)
+    failure_summary = Column(_JSON, default=dict)
+    failure_enrichment_state = Column(
+        String(50), default="pending", nullable=False
+    )
+    failure_enrichment_attempts = Column(Integer, default=0, nullable=False)
+    failure_enrichment_attempted_at = Column(DateTime(timezone=True), nullable=True)
     error_message = Column(Text, default="")
     triggered_by_schedule = Column(String(255), nullable=True, index=True)
     trigger_type = Column(String(50), default="manual")
@@ -63,11 +93,32 @@ class FournosJob(Base):
     # can collide with real deferred jobs) so the History tab can exclude
     # locks the same way it excludes recurring-parent templates.
     is_lock = Column(Boolean, default=False, index=True)
+    # Matrix/CPT submissions are tracked separately from ordinary FournosJobs.
+    # Every child carries the submission id and a snapshot of its dimensions so
+    # the CPT view can aggregate old and new attempts even after the live FJob
+    # has been archived from Kubernetes.
+    cpt_run_id = Column(String(36), nullable=True, index=True)
+    cpt_group_id = Column(String(24), nullable=True, index=True)
+    cpt_run_metadata = Column(_JSON, nullable=False, default=dict)
+    cpt_stop_requested_at = Column(DateTime(timezone=True), nullable=True)
+    cpt_stop_message = Column(Text, default="")
 
     events = relationship(
         "FournosJobEvent",
         back_populates="job",
         cascade="all, delete-orphan",
+    )
+    work_items = relationship(
+        "FournosJobWorkItem",
+        back_populates="job",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+    group_memberships = relationship(
+        "FournosJobGroupMembership",
+        back_populates="job",
+        cascade="all, delete-orphan",
+        lazy="selectin",
     )
 
     __table_args__ = (
@@ -85,6 +136,10 @@ class FournosJob(Base):
             func.coalesce(completed_at, created_at),
         ),
         Index("ix_fournos_jobs_trigger_type", "trigger_type"),
+        Index(
+            "ix_fournos_jobs_source_pr",
+            "source_repository", "source_pr_number",
+        ),
         # Composite index matching the History query's WHERE + ORDER BY
         # shape (status IN (...) AND is_lock = false AND trigger_type != ...
         # ORDER BY completed_at DESC) so it can be satisfied with an index
@@ -93,10 +148,46 @@ class FournosJob(Base):
             "ix_fournos_jobs_history",
             "status", "is_lock", "trigger_type", "completed_at",
         ),
+        Index("ix_fournos_jobs_cpt_run_created", "cpt_run_id", "created_at"),
     )
 
     def __repr__(self):
         return f"<FournosJob({self.name} status={self.status})>"
+
+
+class FournosCptRunJobArchive(Base):
+    """CPT submission rows retained by the FourNos dashboard.
+
+    Most entries point at a FournosJob and are enriched by the regular job
+    watcher. Rows with no job name are still useful: they represent models
+    whose FournosJob could not be created and must remain visible as failed
+    submissions in the CPT matrix.
+    """
+
+    __tablename__ = "fournos_cpt_run_job_archive"
+
+    id = Column(String(36), primary_key=True)
+    run_id = Column(String(36), nullable=False, index=True)
+    cpt_group_id = Column(String(24), nullable=True, index=True)
+    position = Column(Integer, nullable=False, default=0)
+    job_name = Column(String(255), nullable=True, index=True)
+    model_name = Column(String(512), default="")
+    model_preset = Column(String(512), default="")
+    workloads = Column(_JSON, nullable=False, default=list)
+    submission_status = Column(String(50), default="Submitting")
+    status = Column(String(50), default="Pending", index=True)
+    message = Column(Text, default="")
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+    )
+    cpt_run_metadata = Column(_JSON, nullable=False, default=dict)
+    stop_requested_at = Column(DateTime(timezone=True), nullable=True)
+    stop_message = Column(Text, default="")
+
+    __table_args__ = (
+        Index("ix_fournos_cpt_archive_run_created", "run_id", "created_at"),
+    )
 
 
 class FournosJobEvent(Base):
@@ -120,3 +211,136 @@ class FournosJobEvent(Base):
 
     def __repr__(self):
         return f"<FournosJobEvent({self.phase} @ {self.timestamp})>"
+
+
+class FournosJobWorkItem(Base):
+    """A safe, read-only reference to work tracked outside Control Center."""
+
+    __tablename__ = "fournos_job_work_items"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    job_id = Column(
+        String(36),
+        ForeignKey("fournos_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    provider = Column(String(50), nullable=False, index=True)
+    key = Column(String(100), nullable=False, index=True)
+    url = Column(String(1024), nullable=False)
+    created_by_subject = Column(String(255), default="")
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    job = relationship("FournosJob", back_populates="work_items")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id", "provider", "key",
+            name="uq_fournos_job_work_item",
+        ),
+        Index(
+            "ix_fournos_job_work_items_provider_key",
+            "provider", "key",
+        ),
+    )
+
+
+class FournosRunGroup(Base):
+    """A reusable, product-neutral grouping for related test runs."""
+
+    __tablename__ = "fournos_run_groups"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    group_type = Column(String(50), nullable=False, index=True)
+    key = Column(String(100), nullable=False)
+    display_name = Column(String(255), nullable=False)
+    description = Column(Text, default="")
+    created_by_subject = Column(String(255), nullable=False, index=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+    archived = Column(Boolean, nullable=False, default=False, index=True)
+
+    memberships = relationship(
+        "FournosJobGroupMembership",
+        back_populates="group",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "group_type", "key", name="uq_fournos_run_group_type_key"
+        ),
+        Index(
+            "ix_fournos_run_groups_type_archived",
+            "group_type", "archived",
+        ),
+    )
+
+
+class FournosJobGroupMembership(Base):
+    """Links one durable run record to a reusable run group."""
+
+    __tablename__ = "fournos_job_group_memberships"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    job_id = Column(
+        String(36),
+        ForeignKey("fournos_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    group_id = Column(
+        String(36),
+        ForeignKey("fournos_run_groups.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    created_by_subject = Column(String(255), default="")
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    job = relationship("FournosJob", back_populates="group_memberships")
+    group = relationship(
+        "FournosRunGroup", back_populates="memberships", lazy="joined"
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id", "group_id", name="uq_fournos_job_group_membership"
+        ),
+        Index(
+            "ix_fournos_job_group_memberships_group_job",
+            "group_id", "job_id",
+        ),
+    )
+
+
+class FournosHistoryPreference(Base):
+    """Latest History view saved for one authenticated principal."""
+
+    __tablename__ = "fournos_history_preferences"
+
+    subject = Column(String(255), primary_key=True)
+    schema_version = Column(Integer, nullable=False, default=1)
+    state = Column(_JSON, nullable=False, default=dict)
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )

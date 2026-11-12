@@ -1,11 +1,16 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowLeftIcon, ArrowPathIcon, ClockIcon, PlayIcon } from '@heroicons/react/24/outline'
 import clsx from 'clsx'
+import { Link } from 'react-router-dom'
+import { createPortal } from 'react-dom'
 import ReviewRow, { ReviewSection } from './ReviewRow'
 import YamlPreview from './YamlPreview'
+import { getProjectSubmitAdapter } from './rhaiis/rhaiisSubmitAdapter'
+import { normalizeClusterName } from '../utils/cptClusterOptions'
 import { useSubmitJob, useSubmitMatrix } from '../hooks/useFournos'
-import { buildMatrixJobPreviews, buildSingleJobPreview, toYamlPreview } from '../utils/fournosJobPreview'
-import type { JobScheduling, ProjectUiSchema, UiField, UiMode, UiOption, UiPipeline, UiQuickPreset, UiVisibleIf } from '../types'
+import { buildMatrixJobPreviews, buildSingleJobPreview, mergeMatrixConfigOverrides, toYamlPreview } from '../utils/fournosJobPreview'
+import { getMatrixWorkloadOptions } from '../utils/matrixWorkloads'
+import type { JobScheduling, ProjectUiSchema, PullRequestSelection, RunGroupReference, SubmitMatrixResponse, UiField, UiMode, UiOption, UiPipeline, UiQuickPreset, UiVisibleIf, WorkItemReference } from '../types'
 
 // ─── Generic, schema-driven submit form ────────────────────────────────
 //
@@ -28,15 +33,27 @@ import type { JobScheduling, ProjectUiSchema, UiField, UiMode, UiOption, UiPipel
 
 export interface SubmitBasics {
   cluster: string
+  clusterGpuType?: string
   pipeline: string
   owner: string
   priority: string
   exclusive: boolean
   pullSha: string
+  pullRequest: PullRequestSelection | null
+  useLatestMain: boolean
   /** Human-readable label for the review step, e.g. "#123 — title (author)". */
   prLabel: string
   /** When this job (or recurring template) should run — see ClusterScheduleModal. */
   scheduling: JobScheduling
+  workItems: WorkItemReference[]
+  runGroupIds: string[]
+  runGroups: RunGroupReference[]
+}
+
+export interface MatrixClusterConstraints {
+  allowedClusterNames: string[]
+  accelerator: string
+  gpuType: string
 }
 
 /** SubmitJobRequest/SubmitMatrixRequest's schedule/scheduled_start_time pair for a given choice. */
@@ -59,7 +76,9 @@ function fieldsOf(mode: UiMode): UiField[] {
 
 function matchesCondition(cond: UiVisibleIf, values: Record<string, unknown>): boolean {
   const current = values[cond.field]
-  if (cond.equals !== undefined) return current === cond.equals
+  // Pydantic serializes an omitted optional `equals` as null. Treat that as
+  // absent so a condition such as `{one_of: [...]}` is evaluated correctly.
+  if (cond.equals !== undefined && cond.equals !== null) return current === cond.equals
   if (cond.one_of) return cond.one_of.includes(current)
   return true
 }
@@ -141,6 +160,14 @@ function formatFieldValueForReview(field: UiField, value: unknown): string | nul
   return String(value)
 }
 
+function rawOptionValue(field: UiField, value: unknown): unknown {
+  const option = field.options.find((item) => item.value === value)
+  if (option && field.maps_to && Object.prototype.hasOwnProperty.call(option.overrides, field.maps_to)) {
+    return option.overrides[field.maps_to]
+  }
+  return value
+}
+
 export default function DynamicSubmitForm({
   project,
   schema,
@@ -149,7 +176,12 @@ export default function DynamicSubmitForm({
   onBack,
   onNext,
   onSubmitted,
+  onMatrixConstraintsChange,
+  onRhaiisCptModeChange,
+  matrixClusterValid,
   onOpenScheduleModal,
+  singlePage = false,
+  matrixPipelinePortalTarget,
 }: {
   project: string
   schema: ProjectUiSchema
@@ -159,13 +191,21 @@ export default function DynamicSubmitForm({
   onBack: () => void
   onNext: () => void
   onSubmitted?: (name: string) => void
+  onMatrixConstraintsChange?: (constraints: MatrixClusterConstraints | null) => void
+  onRhaiisCptModeChange?: (isCptMode: boolean) => void
+  matrixClusterValid?: boolean
   /** Opens the shared ClusterScheduleModal (owned by the parent page) — the
    * "Defer / Set Recurring…" decision lives on this review step, once
    * every other field is finalized, not earlier in the wizard. */
   onOpenScheduleModal: () => void
+  /** Renders project fields and YAML/submit controls together, without a review step. */
+  singlePage?: boolean
+  /** Optional parent-page slot for placing RHAIIS mode/pipeline selection before shared cluster settings. */
+  matrixPipelinePortalTarget?: HTMLDivElement | null
 }) {
   const submitJob = useSubmitJob()
   const submitMatrix = useSubmitMatrix()
+  const [matrixSubmissionResult, setMatrixSubmissionResult] = useState<SubmitMatrixResponse | null>(null)
 
   const allModes = schema.modes
 
@@ -177,9 +217,21 @@ export default function DynamicSubmitForm({
     [allModes, activeModeId]
   )
   const isMatrix = activeMode?.kind === 'matrix'
+  const projectAdapter = useMemo(() => getProjectSubmitAdapter(project), [project])
 
   const [values, setValues] = useState<Record<string, unknown>>({})
   const [quickPresetKey, setQuickPresetKey] = useState('')
+  const activeFields = useMemo(() => (activeMode ? fieldsOf(activeMode) : []), [activeMode])
+  const modelField = activeFields.find((field) => field.key === 'model')
+  const workloadField = activeFields.find((field) => field.key === 'workload')
+  const engineField = activeFields.find((field) => field.key === 'engine')
+  const derived = projectAdapter?.getDerivedState(basics, activeFields, values) || {
+    gpuType: basics.clusterGpuType || '',
+    selectedModelTp: 1,
+    tpSize: 1,
+    gpuCount: 1,
+  }
+  const autoEngineVersionRef = useRef('')
 
   // Matrix-mode-only selection state
   const [pipelineKey, setPipelineKey] = useState('')
@@ -189,6 +241,33 @@ export default function DynamicSubmitForm({
     () => activeMode?.pipelines.find((p) => p.key === pipelineKey),
     [activeMode, pipelineKey]
   )
+  const selectedPipelineClusterSupported = !!selectedPipeline?.clusters?.some(
+    (allowedCluster) => normalizeClusterName(allowedCluster) === normalizeClusterName(basics.cluster)
+  )
+  const matrixWorkloads = useMemo(
+    () => getMatrixWorkloadOptions(project, selectedPipeline),
+    [project, selectedPipeline]
+  )
+  const isRhaiisCpt = project.trim().toLowerCase() === 'rhaiis' && isMatrix && activeMode?.id === 'cpt'
+  const matrixRows = useMemo(() => {
+    if (!selectedPipeline) return []
+    return selectedPipeline.models.map((model) => {
+      const availableWorkloads = model.workloads?.length
+        ? model.workloads
+        : selectedPipeline.workloads
+      const selected = selectedModels.includes(model.key)
+      const workloads = selected
+        ? selectedWorkloads.filter((workload) => availableWorkloads.includes(workload))
+        : []
+      return { model, availableWorkloads, selected, workloads }
+    })
+  }, [selectedPipeline, selectedModels, selectedWorkloads])
+  const activeMatrixRows = matrixRows.filter((row) => row.selected && row.workloads.length > 0)
+  const matrixJobCount = activeMatrixRows.length
+  const matrixWorkloadExecutionCount = activeMatrixRows.reduce(
+    (total, row) => total + row.workloads.length,
+    0
+  )
 
   useEffect(() => {
     if (!activeMode) return
@@ -196,10 +275,11 @@ export default function DynamicSubmitForm({
     for (const field of fieldsOf(activeMode)) {
       initial[field.key] = defaultValueFor(field)
     }
+    Object.assign(initial, projectAdapter?.getInitialValues(activeMode) || {})
     setValues(initial)
     setQuickPresetKey('')
-    setPipelineKey(activeMode.pipelines[0]?.key || '')
-  }, [activeMode])
+    setPipelineKey('')
+  }, [activeMode, projectAdapter])
 
   useEffect(() => {
     if (!selectedPipeline) {
@@ -208,11 +288,52 @@ export default function DynamicSubmitForm({
       return
     }
     setSelectedModels(selectedPipeline.models.map((m) => m.key))
-    setSelectedWorkloads(selectedPipeline.workloads)
-  }, [selectedPipeline])
+    setSelectedWorkloads(matrixWorkloads)
+    setValues((prev) => ({
+      ...prev,
+      ...(selectedPipeline.engine ? { engine: selectedPipeline.engine } : {}),
+      ...(selectedPipeline.accelerator ? { accelerator: selectedPipeline.accelerator } : {}),
+    }))
+  }, [selectedPipeline, matrixWorkloads])
+
+  useEffect(() => {
+    if (!isRhaiisCpt || !selectedPipeline) {
+      onMatrixConstraintsChange?.(null)
+      return
+    }
+    onMatrixConstraintsChange?.({
+      allowedClusterNames: selectedPipeline.clusters || [],
+      accelerator: String(selectedPipeline.accelerator || values.accelerator || ''),
+      gpuType: String(selectedPipeline.gpu_type || ''),
+    })
+  }, [isRhaiisCpt, selectedPipeline, values.accelerator, onMatrixConstraintsChange])
+
+  useEffect(() => {
+    onRhaiisCptModeChange?.(isRhaiisCpt)
+  }, [isRhaiisCpt, onRhaiisCptModeChange])
 
   const setFieldValue = (key: string, value: unknown) => {
     setValues((prev) => ({ ...prev, [key]: value }))
+  }
+
+  const handleFieldChange = (field: UiField, value: unknown) => {
+    setFieldValue(field.key, value)
+    if (projectAdapter) {
+      const result = projectAdapter.handleFieldChange({
+        field,
+        value,
+        values,
+        modelField,
+        engineField,
+        autoEngineVersion: autoEngineVersionRef.current,
+      })
+      if (result.autoEngineVersion !== undefined) {
+        autoEngineVersionRef.current = result.autoEngineVersion
+      }
+      if (Object.keys(result.updates).length > 0) {
+        setValues((prev) => ({ ...prev, ...result.updates }))
+      }
+    }
   }
 
   // If a `restrict_if` rule now excludes a field's currently-selected
@@ -248,7 +369,10 @@ export default function DynamicSubmitForm({
         if (!field) continue
         if (field.type === 'multiselect') {
           const arr = Array.isArray(next[fieldKey]) ? [...(next[fieldKey] as string[])] : []
-          if (typeof fillValue === 'string' && !arr.includes(fillValue)) arr.push(fillValue)
+          const incoming = Array.isArray(fillValue) ? fillValue : [fillValue]
+          for (const item of incoming) {
+            if (typeof item === 'string' && !arr.includes(item)) arr.push(item)
+          }
           next[fieldKey] = arr
         } else {
           next[fieldKey] = fillValue
@@ -274,21 +398,37 @@ export default function DynamicSubmitForm({
       }
     }
 
+    projectAdapter?.appendBasicsArgs(args, basics)
+
     for (const field of fieldsOf(activeMode)) {
       if (!isFieldVisible(field, values)) continue
       const value = values[field.key]
+
+      if (projectAdapter?.skipField(field)) continue
 
       if (field.maps_to) {
         if (value === undefined || value === '' || value === null) continue
         const key = resolveMapsTo(field.maps_to, values)
         if (!key) continue
-        overrides[key] = stringifyValue(value)
+        overrides[key] = stringifyValue(
+          field.type === 'multiselect' && Array.isArray(value)
+            ? value.map((item) => rawOptionValue(field, item))
+            : rawOptionValue(field, value)
+        )
       } else if (field.type === 'select' || field.type === 'radio') {
         if (typeof value === 'string' && value) args.push(value)
       } else if (field.type === 'multiselect' && Array.isArray(value)) {
         for (const v of value) if (typeof v === 'string' && v) args.push(v)
       }
     }
+
+    projectAdapter?.augmentSubmission({
+      values,
+      modelField,
+      workloadField,
+      derived,
+      overrides,
+    })
 
     return { args, overrides }
   }
@@ -298,33 +438,51 @@ export default function DynamicSubmitForm({
     if (!activeMode) return
 
     if (isMatrix) {
-      if (!selectedPipeline || selectedModels.length === 0 || selectedWorkloads.length === 0) return
+      if (
+        !selectedPipeline ||
+        matrixJobCount === 0 ||
+        matrixWorkloadExecutionCount === 0 ||
+        ((selectedPipeline.clusters?.length || 0) > 0 && !selectedPipelineClusterSupported)
+      ) return
       const { args, overrides } = collectSharedArgsAndOverrides()
-      const modelByKey = new Map(selectedPipeline.models.map((m) => [m.key, m]))
       try {
+        setMatrixSubmissionResult(null)
         const result = await submitMatrix.mutateAsync({
           project,
           cluster: basics.cluster,
           pipeline: basics.pipeline,
           args,
-          config_overrides: { ...overrides, ...stringifyOverrides(selectedPipeline.overrides) },
-          models: selectedModels.map((key) => {
-            const m = modelByKey.get(key)
+          config_overrides: mergeMatrixConfigOverrides(selectedPipeline.overrides, overrides),
+          matrix_mode_id: activeMode.id,
+          selected_pipeline_key: selectedPipeline.key,
+          matrix_pipeline_key: activeMode.id === 'cpt' ? selectedPipeline.key : '',
+          version_label: String(values.version || '').trim(),
+          accelerator: String(values.accelerator || '').trim(),
+          engine: String(values.engine || '').trim(),
+          engine_version: String(values.engine_version || '').trim(),
+          configured_model_count: selectedPipeline.models.length,
+          models: activeMatrixRows.map(({ model: m }) => {
             return {
-              key,
+              key: m.key,
+              label: m.label || m.key,
               overrides: m?.overrides || {},
-              gpu_count: m?.tp ?? null,
+              gpu_count: m?.tp ?? derived.gpuCount,
+              workloads: m?.workloads?.length ? m.workloads : selectedPipeline.workloads,
             }
           }),
           workloads: selectedWorkloads,
           owner: basics.owner,
           priority: basics.priority,
           exclusive: basics.exclusive,
+          pull_request: basics.pullRequest,
           pull_sha: basics.pullSha,
-          gpu_type: '',
+          work_items: basics.workItems,
+          run_group_ids: basics.runGroupIds,
+          use_latest_main: basics.useLatestMain,
+          gpu_type: derived.gpuType,
           ...schedulingRequestFields(basics.scheduling),
         })
-        onSubmitted?.(result.jobs?.[0]?.job_name || '')
+        setMatrixSubmissionResult(result)
       } catch {
         // error surfaced below via submitMatrix.error
       }
@@ -343,8 +501,14 @@ export default function DynamicSubmitForm({
         owner: basics.owner,
         exclusive: basics.exclusive,
         config_overrides: configOverrides,
+        pull_request: basics.pullRequest,
         pull_sha: basics.pullSha,
+        work_items: basics.workItems,
+        run_group_ids: basics.runGroupIds,
+        use_latest_main: basics.useLatestMain,
         priority: basics.priority,
+        gpu_type: derived.gpuType,
+        gpu_count: derived.gpuCount,
         ...schedulingRequestFields(basics.scheduling),
       })
       onSubmitted?.(result.job_name)
@@ -359,35 +523,191 @@ export default function DynamicSubmitForm({
     ) : null
   }
 
-  if (step !== 2 && step !== 3) return null
+  if (!singlePage && step !== 2 && step !== 3) return null
 
+  const buildSourceValid = !projectAdapter?.requiresBuildSource || basics.useLatestMain || !!basics.pullSha.trim()
+  const requiredFieldsValid = activeFields
+    .filter((field) => field.required && isFieldVisible(field, values))
+    .every((field) => {
+      const value = values[field.key]
+      return field.type === 'multiselect'
+        ? Array.isArray(value) && value.length > 0
+        : value !== undefined && value !== null && value !== ''
+    })
+  const projectFieldsValid = projectAdapter?.validate(activeMode, values, derived) ?? true
+  const formValid = requiredFieldsValid && projectFieldsValid
   const canSubmit = isMatrix
-    ? !submitMatrix.isPending && !!basics.cluster && !!basics.owner.trim() && !!selectedPipeline && selectedModels.length > 0 && selectedWorkloads.length > 0
-    : !submitJob.isPending && !!basics.cluster && !!basics.owner.trim()
+    ? !submitMatrix.isPending && !!basics.cluster.trim() && !!basics.owner.trim() && buildSourceValid && formValid && !!selectedPipeline && matrixJobCount > 0 && matrixWorkloadExecutionCount > 0 && (!(selectedPipeline.clusters?.length) || selectedPipelineClusterSupported) && (!isRhaiisCpt || matrixClusterValid !== false)
+    : !submitJob.isPending && !!basics.cluster.trim() && !!basics.owner.trim() && buildSourceValid && formValid
+
+  const matrixSubmissionFeedback = matrixSubmissionResult ? (() => {
+    const succeeded = matrixSubmissionResult.jobs.filter((job) => job.status === 'created' || job.status === 'succeeded').length
+    const failed = matrixSubmissionResult.jobs.length - succeeded
+    return (
+      <section
+        aria-live="polite"
+        className={clsx(
+          'rounded-lg border p-4',
+          failed ? 'border-amber-300 bg-amber-50' : 'border-green-200 bg-green-50'
+        )}
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 className={clsx('text-sm font-semibold', failed ? 'text-amber-900' : 'text-green-900')}>
+            {isRhaiisCpt ? 'CPT submission results' : 'Matrix submission results'}
+          </h3>
+          <span className={clsx('text-xs font-medium', failed ? 'text-amber-800' : 'text-green-800')}>
+            {succeeded}/{matrixSubmissionResult.total} job(s) submitted{failed ? ' · ' + failed + ' failed' : ''}
+          </span>
+        </div>
+        <ul className="mt-3 space-y-2">
+          {matrixSubmissionResult.jobs.map((job, index) => {
+            const created = job.status === 'created' || job.status === 'succeeded'
+            return (
+              <li key={job.model + '-' + (job.job_name || index)} className="flex flex-wrap items-baseline gap-x-2 text-sm">
+                <span className={created ? 'font-semibold text-green-700' : 'font-semibold text-red-700'}>
+                  {created ? '✓' : '✗'} {job.model}
+                </span>
+                {job.job_name && (
+                  <Link to={'/testing/jobs/' + encodeURIComponent(job.job_name)} className="font-mono text-xs text-indigo-700 hover:underline">
+                    {job.job_name}
+                  </Link>
+                )}
+                {!created && job.error && <span className="break-all text-xs text-red-700">{job.error}</span>}
+              </li>
+            )
+          })}
+        </ul>
+        {matrixSubmissionResult.cpt_group_id && (
+          <Link
+            to={'/testing?tab=cpt&group=' + encodeURIComponent(matrixSubmissionResult.cpt_group_id)}
+            className="mt-3 inline-flex text-sm font-semibold text-indigo-700 hover:underline"
+          >
+            Track this CPT run
+          </Link>
+        )}
+      </section>
+    )
+  })() : null
+
+  const buildYamlPreview = () => {
+    const { args, overrides } = collectSharedArgsAndOverrides()
+    const shared = {
+      project,
+      cluster: basics.cluster,
+      pipeline: basics.pipeline,
+      owner: basics.owner,
+      priority: basics.priority,
+      exclusive: basics.exclusive,
+      pullSha: basics.useLatestMain ? 'main' : basics.pullSha,
+      pullRequest: basics.pullRequest,
+      gpuType: derived.gpuType,
+      gpuCount: derived.gpuCount,
+      args,
+      configOverrides: overrides,
+      schedule: basics.scheduling.mode === 'recurring' ? basics.scheduling.scheduleUtc : '',
+      scheduledStartTime: basics.scheduling.mode === 'defer' ? basics.scheduling.scheduledStartTimeUtc : null,
+    }
+    if (!isMatrix) return toYamlPreview(buildSingleJobPreview(shared))
+    if (!selectedPipeline) return ''
+    return toYamlPreview(
+      buildMatrixJobPreviews({
+        ...shared,
+        models: activeMatrixRows.map(({ model, workloads }) => {
+          const modelOverrides = stringifyOverrides(model.overrides || {})
+          return {
+            key: model.key,
+            overrides: projectAdapter?.applyMatrixWorkloads
+              ? projectAdapter.applyMatrixWorkloads(modelOverrides, workloads)
+              : modelOverrides,
+            gpuCount: model?.tp ?? derived.gpuCount,
+            workloads,
+          }
+        }),
+        workloads: selectedWorkloads,
+      }),
+    )
+  }
+
+  const pipelineSetup = (
+    <>
+      {allModes.length > 1 && (
+        <div className="flex gap-2">
+          {allModes.map((m) => (
+            <button
+              key={m.id}
+              type="button"
+              onClick={() => setActiveModeId(m.id)}
+              className={clsx(
+                'px-3 py-1.5 rounded-md text-sm font-medium border',
+                m.id === activeModeId
+                  ? 'border-indigo-500 bg-indigo-50 text-indigo-700'
+                  : 'border-gray-300 bg-white text-gray-600 hover:border-gray-400'
+              )}
+            >
+              {m.label || m.id}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {isMatrix && (
+        <div className="rounded-lg border border-gray-200 p-4 space-y-3">
+          <div>
+            <h3 className="text-sm font-semibold text-gray-900">CPT Pipeline</h3>
+            <p className="mt-1 text-xs text-gray-500">
+              Choose a published pipeline first. Its model/workload matrix and supported cluster choices will be loaded below.
+            </p>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700">Pipeline</label>
+            {activeMode.pipelines.length > 0 ? (
+              <select
+                value={pipelineKey}
+                onChange={(e) => setPipelineKey(e.target.value)}
+                className="input mt-1"
+                required
+              >
+                <option value="">-- Select a CPT pipeline --</option>
+                {activeMode.pipelines.map((p) => (
+                  <option key={p.key} value={p.key}>
+                    {p.label && p.label !== p.key ? `${p.label} (${p.key})` : p.key}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <p className="mt-1 text-sm text-amber-700">
+                No CPT pipelines were resolved from Forge’s cpt.d catalog. Refresh the project form from the Basics panel and try again.
+              </p>
+            )}
+            {selectedPipeline?.clusters?.length ? (
+              <p className="mt-1 text-xs text-gray-500">
+                Available on: {selectedPipeline.clusters.join(', ')}
+                {!selectedPipelineClusterSupported && (
+                  <span className="ml-1 font-medium text-amber-700">
+                    Select one of these clusters below to submit this pipeline.
+                  </span>
+                )}
+              </p>
+            ) : null}
+            {isRhaiisCpt && matrixClusterValid === false && (
+              <p className="mt-2 text-xs font-medium text-amber-700">
+                Choose a registered cluster supported by this CPT pipeline and accelerator below.
+              </p>
+            )}
+          </div>
+        </div>
+      )}
+    </>
+  )
+  const usePipelineSetupPortal = singlePage && step === 2 && !!matrixPipelinePortalTarget
 
   return (
     <form onSubmit={handleSubmit} className="space-y-6">
       {step === 2 && (
         <>
-          {allModes.length > 1 && (
-            <div className="flex gap-2">
-              {allModes.map((m) => (
-                <button
-                  key={m.id}
-                  type="button"
-                  onClick={() => setActiveModeId(m.id)}
-                  className={clsx(
-                    'px-3 py-1.5 rounded-md text-sm font-medium border',
-                    m.id === activeModeId
-                      ? 'border-indigo-500 bg-indigo-50 text-indigo-700'
-                      : 'border-gray-300 bg-white text-gray-600 hover:border-gray-400'
-                  )}
-                >
-                  {m.label || m.id}
-                </button>
-              ))}
-            </div>
-          )}
+          {usePipelineSetupPortal && matrixPipelinePortalTarget
+            ? createPortal(pipelineSetup, matrixPipelinePortalTarget)
+            : pipelineSetup}
 
           {activeMode.quick_presets.length > 0 && (
             <div className="rounded-lg border border-gray-200 bg-gray-50 p-4">
@@ -413,206 +733,261 @@ export default function DynamicSubmitForm({
             </div>
           )}
 
+          {isMatrix && selectedPipeline && (
+            <div className="space-y-3 rounded-lg border border-gray-200 bg-white p-4">
+              <div>
+                <h3 className="text-sm font-semibold text-gray-900">Matrix Preview</h3>
+                <p className="mt-1 text-xs text-gray-500">
+                  Select models by row and workload profiles by column. A checkmark means that model runs that selected profile.
+                </p>
+              </div>
+              {selectedPipeline.models.length > 0 && matrixWorkloads.length > 0 ? (
+                <div className="overflow-x-auto rounded-md border border-gray-200">
+                  <table className="w-full min-w-[680px] border-collapse text-xs">
+                    <thead className="bg-gray-50 text-gray-600">
+                      <tr>
+                        <th scope="col" className="min-w-64 border-b border-gray-200 px-3 py-2 text-left font-semibold">
+                          Model
+                        </th>
+                        {matrixWorkloads.map((workload) => {
+                          const checked = selectedWorkloads.includes(workload)
+                          return (
+                            <th key={workload} scope="col" className="min-w-24 border-b border-l border-gray-200 px-2 py-2 text-center font-semibold">
+                              <label className="inline-flex cursor-pointer items-center justify-center gap-1 whitespace-nowrap">
+                                <input
+                                  type="checkbox"
+                                  aria-label={`Select workload ${workload}`}
+                                  checked={checked}
+                                  onChange={() =>
+                                    setSelectedWorkloads((prev) =>
+                                      checked ? prev.filter((item) => item !== workload) : [...prev, workload]
+                                    )
+                                  }
+                                />
+                                {workload}
+                              </label>
+                            </th>
+                          )
+                        })}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {matrixRows.map(({ model, availableWorkloads, selected }) => (
+                        <tr key={model.key} className="odd:bg-white even:bg-gray-50/50">
+                          <th scope="row" className="border-b border-gray-200 px-3 py-2 text-left font-normal text-gray-800">
+                            <label className="inline-flex cursor-pointer items-center gap-2">
+                              <input
+                                type="checkbox"
+                                aria-label={`Select model ${model.key}`}
+                                checked={selected}
+                                onChange={() =>
+                                  setSelectedModels((prev) =>
+                                    selected
+                                      ? prev.filter((key) => key !== model.key)
+                                      : [...prev, model.key]
+                                  )
+                                }
+                              />
+                              <span title={formatOverridesTooltip(model.overrides)}>{model.key}</span>
+                              {model.tp && model.tp > 1 && (
+                                <span className="whitespace-nowrap text-gray-400">({model.tp} GPU)</span>
+                              )}
+                              {Object.keys(model.overrides || {}).length > 0 && (
+                                <span className="text-indigo-600" title="This model has additional overrides">*</span>
+                              )}
+                            </label>
+                          </th>
+                          {matrixWorkloads.map((workload) => {
+                            const active = selected
+                              && selectedWorkloads.includes(workload)
+                              && availableWorkloads.includes(workload)
+                            return (
+                              <td key={workload} className="border-b border-l border-gray-200 px-2 py-2 text-center">
+                                {active
+                                  ? <span aria-label="Included" className="font-semibold text-green-700">✓</span>
+                                  : <span aria-label="Not included" className="text-gray-400">—</span>}
+                              </td>
+                            )
+                          })}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p className="text-sm text-amber-700">This pipeline does not define both models and workloads.</p>
+              )}
+              <div role="status" className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm font-semibold text-blue-700">
+                {matrixJobCount} model(s), {matrixWorkloadExecutionCount} workload execution(s) = {matrixJobCount} FournosJob(s)
+              </div>
+              {projectAdapter?.renderMatrixExtras?.(selectedWorkloads)}
+            </div>
+          )}
+
           {activeMode.sections.map((section) => (
             <div key={section.id} className="rounded-lg border border-gray-200 p-4 space-y-4">
               {section.label && (
-                <h3 className="text-sm font-semibold text-gray-900">{section.label}</h3>
+                <h3 className="text-sm font-semibold text-gray-900">
+                  {projectAdapter?.sectionLabel(section) || section.label}
+                </h3>
               )}
               <div className="grid grid-cols-1 gap-x-6 gap-y-4 sm:grid-cols-2">
                 {section.fields.map((field) => {
-                  if (field.type === 'hidden' || !isFieldVisible(field, values)) return null
+                  const presentation = projectAdapter?.fieldPresentation(field, values, activeMode) || {
+                    hidden: false,
+                    label: field.label || field.key,
+                    disabled: false,
+                  }
+                  if (field.type === 'hidden' || presentation.hidden || !isFieldVisible(field, values)) return null
+                  const options = visibleOptions(field, values)
+                  const fieldOptions = !isMatrix && projectAdapter?.orderFieldOptions
+                    ? projectAdapter.orderFieldOptions(field, options)
+                    : options
                   return (
-                    <div key={field.key} className={field.type === 'textarea' ? 'sm:col-span-2' : ''}>
-                      <label className="block text-sm font-medium text-gray-700">
-                        {field.label || field.key}
+                    <div key={field.key} className={clsx(field.type === 'textarea' ? 'sm:col-span-2' : '', field.key === 'model' || field.key === 'workload' ? 'sm:col-span-2' : '')}>
+                      <label
+                        className="block text-sm font-medium text-gray-700"
+                        title={field.help || undefined}
+                      >
+                        {presentation.label}
                         {field.required && <span className="text-red-500 ml-0.5">*</span>}
                       </label>
                       <FieldControl
                         field={field}
                         value={values[field.key]}
-                        onChange={(v) => setFieldValue(field.key, v)}
-                        options={visibleOptions(field, values)}
+                        onChange={(v) => handleFieldChange(field, v)}
+                        options={fieldOptions}
+                        disabled={presentation.disabled}
+                        lockedOption={
+                          isMatrix && field.key === 'engine'
+                            ? selectedPipeline?.engine || undefined
+                            : isMatrix && field.key === 'accelerator'
+                              ? selectedPipeline?.accelerator || undefined
+                              : undefined
+                        }
                       />
                       {field.help && <p className="mt-1 text-xs text-gray-400">{field.help}</p>}
+                      {projectAdapter?.renderFieldExtras({
+                        field,
+                        values,
+                        derived,
+                        setFieldValue,
+                        setValues,
+                      })}
                     </div>
                   )
+                })}
+                {projectAdapter?.renderSectionExtras(section, {
+                  values,
+                  derived,
+                  setFieldValue,
+                  setValues,
                 })}
               </div>
             </div>
           ))}
 
-          {isMatrix && (
-            <div className="space-y-4 rounded-lg border border-gray-200 p-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700">Pipeline</label>
-                {activeMode.pipelines.length > 0 ? (
-                  <select
-                    value={pipelineKey}
-                    onChange={(e) => setPipelineKey(e.target.value)}
-                    className="input mt-1"
-                  >
-                    {activeMode.pipelines.map((p) => (
-                      <option key={p.key} value={p.key}>
-                        {p.label || p.key}
-                      </option>
-                    ))}
-                  </select>
-                ) : (
-                  <p className="mt-1 text-xs text-gray-400">
-                    No pipelines are published for {schema.title || project} yet.
-                  </p>
-                )}
-              </div>
+          {!isMatrix && projectAdapter?.renderAdditionalConfig({
+            values,
+            derived,
+            setFieldValue,
+            setValues,
+          })}
 
-              {selectedPipeline && (
-                <>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1.5">Models</label>
-                    <div className="flex flex-wrap gap-1.5">
-                      {selectedPipeline.models.map((m) => {
-                        const checked = selectedModels.includes(m.key)
-                        return (
-                          <label
-                            key={m.key}
-                            title={formatOverridesTooltip(m.overrides)}
-                            className={clsx(
-                              'flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border cursor-pointer select-none',
-                              checked
-                                ? 'border-indigo-500 bg-indigo-50 text-indigo-700'
-                                : 'border-gray-300 bg-white text-gray-600 hover:border-gray-400'
-                            )}
-                          >
-                            <input
-                              type="checkbox"
-                              className="h-3 w-3 rounded border-gray-300 text-indigo-600"
-                              checked={checked}
-                              onChange={() =>
-                                setSelectedModels((prev) =>
-                                  checked ? prev.filter((k) => k !== m.key) : [...prev, m.key]
-                                )
-                              }
-                            />
-                            {m.label || m.key}
-                            {m.tp ? <span className="text-gray-400">tp{m.tp}</span> : null}
-                          </label>
-                        )
-                      })}
-                      {selectedPipeline.models.length === 0 && (
-                        <p className="text-xs text-gray-400">This pipeline declares no models.</p>
-                      )}
-                    </div>
-                  </div>
-
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1.5">Workloads</label>
-                    <div className="flex flex-wrap gap-1.5">
-                      {selectedPipeline.workloads.map((w) => {
-                        const checked = selectedWorkloads.includes(w)
-                        return (
-                          <label
-                            key={w}
-                            className={clsx(
-                              'flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium border cursor-pointer select-none',
-                              checked
-                                ? 'border-indigo-500 bg-indigo-50 text-indigo-700'
-                                : 'border-gray-300 bg-white text-gray-600 hover:border-gray-400'
-                            )}
-                          >
-                            <input
-                              type="checkbox"
-                              className="h-3 w-3 rounded border-gray-300 text-indigo-600"
-                              checked={checked}
-                              onChange={() =>
-                                setSelectedWorkloads((prev) =>
-                                  checked ? prev.filter((x) => x !== w) : [...prev, w]
-                                )
-                              }
-                            />
-                            {w}
-                          </label>
-                        )
-                      })}
-                      {selectedPipeline.workloads.length === 0 && (
-                        <p className="text-xs text-gray-400">This pipeline declares no workloads.</p>
-                      )}
-                    </div>
-                  </div>
-
-                  <p className="text-xs text-gray-400">
-                    Submits {selectedModels.length} job(s), one per model, each covering{' '}
-                    {selectedWorkloads.length} workload(s).
-                  </p>
-                </>
+          {singlePage ? (
+            <>
+              {(submitJob.error || submitMatrix.error) && (
+                <div role="alert" className="rounded-lg bg-red-50 p-4 text-sm text-red-700">
+                  {(submitJob.error || submitMatrix.error)?.message}
+                </div>
               )}
+              <YamlPreview yaml={buildYamlPreview()} title="FournosJob YAML Preview" defaultOpen={false} />
+              {!canSubmit && (
+                <p className="text-xs text-orange-600">Complete the required fields above before submitting.</p>
+              )}
+              <div className="flex flex-wrap items-center justify-between gap-3 border-t border-gray-200 pt-4">
+                <button
+                  type="button"
+                  onClick={onBack}
+                  className="inline-flex items-center gap-1.5 rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+                >
+                  <ArrowLeftIcon className="h-4 w-4" /> Back
+                </button>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={onOpenScheduleModal}
+                    disabled={!basics.cluster.trim()}
+                    className="inline-flex items-center gap-1.5 rounded-md border border-gray-300 bg-white px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                  >
+                    <ClockIcon className="h-4 w-4" /> Defer / Set Recurring…
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={!canSubmit}
+                    className="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700 disabled:opacity-50"
+                  >
+                    {submitJob.isPending || submitMatrix.isPending ? (
+                      <ArrowPathIcon className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <PlayIcon className="h-4 w-4" />
+                    )}
+                    {isMatrix ? 'Submit CPT Pipeline' : 'Submit Job'}
+                  </button>
+                </div>
+              </div>
+              {matrixSubmissionFeedback}
+            </>
+          ) : (
+            <div className="flex justify-between">
+              <button
+                type="button"
+                onClick={onBack}
+                className="inline-flex items-center gap-1.5 rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
+              >
+                <ArrowLeftIcon className="h-4 w-4" /> Back
+              </button>
+              <button
+                type="button"
+                onClick={onNext}
+                disabled={!formValid}
+                title={!formValid ? 'Complete the required project fields before continuing' : undefined}
+                className="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:opacity-50"
+              >
+                Next: Review
+              </button>
             </div>
           )}
-
-          <div className="flex justify-between">
-            <button
-              type="button"
-              onClick={onBack}
-              className="inline-flex items-center gap-1.5 rounded-md border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
-            >
-              <ArrowLeftIcon className="h-4 w-4" /> Back
-            </button>
-            <button
-              type="button"
-              onClick={onNext}
-              className="inline-flex items-center gap-2 rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-500"
-            >
-              Next: Review
-            </button>
-          </div>
         </>
       )}
 
       {step === 3 && (() => {
-        const { args, overrides } = collectSharedArgsAndOverrides()
-        const shared = {
-          project,
-          cluster: basics.cluster,
-          pipeline: basics.pipeline,
-          owner: basics.owner,
-          priority: basics.priority,
-          exclusive: basics.exclusive,
-          pullSha: basics.pullSha,
-          args,
-          configOverrides: overrides,
-          schedule: basics.scheduling.mode === 'recurring' ? basics.scheduling.scheduleUtc : '',
-          scheduledStartTime: basics.scheduling.mode === 'defer' ? basics.scheduling.scheduledStartTimeUtc : null,
-        }
-        const yamlText = isMatrix
-          ? selectedPipeline
-            ? toYamlPreview(
-                buildMatrixJobPreviews({
-                  ...shared,
-                  models: selectedModels.map((key) => {
-                    const m = selectedPipeline.models.find((mm) => mm.key === key)
-                    return {
-                      key,
-                      overrides: stringifyOverrides(m?.overrides || {}),
-                      gpuCount: m?.tp ?? null,
-                    }
-                  }),
-                  workloads: selectedWorkloads,
-                })
-              )
-            : ''
-          : toYamlPreview(buildSingleJobPreview(shared))
+        const yamlText = buildYamlPreview()
 
         return (
           <div className="lg:grid lg:grid-cols-[minmax(0,1fr)_380px] lg:gap-6 lg:items-start">
             <div className="space-y-4 min-w-0">
               <ReviewSection title="Basics">
                 <ReviewRow label="Project" value={project} />
-                <ReviewRow label="Cluster" value={basics.cluster} missing={!basics.cluster} />
+                <ReviewRow label="Cluster" value={basics.cluster} missing={!basics.cluster.trim()} />
                 <ReviewRow label="Pipeline" value={basics.pipeline} />
+                {projectAdapter?.renderReviewBasics(derived)}
                 {basics.owner && <ReviewRow label="Requested by" value={basics.owner} />}
-                <ReviewRow label="Priority" value={basics.priority} />
+                <ReviewRow label="Priority" value={basics.priority || 'Cluster default (no priority class)'} />
                 {basics.exclusive && <ReviewRow label="Exclusive" value="Yes" />}
-                {basics.pullSha && (
-                  <ReviewRow label="Pull Request" value={basics.prLabel} mono={!basics.prLabel || basics.prLabel === basics.pullSha} />
+                {projectAdapter?.requiresBuildSource && basics.useLatestMain && (
+                  <ReviewRow label={projectAdapter.buildSourceLabel} value="Latest main (un-pinned)" />
                 )}
+                {basics.pullSha && (
+                  <ReviewRow label={projectAdapter?.buildSourceLabel || 'Pull Request'} value={basics.prLabel} mono={!basics.prLabel || basics.prLabel === basics.pullSha} />
+                )}
+                {basics.workItems.map((item) => (
+                  <ReviewRow key={`${item.provider}-${item.key || item.url}`} label="Work item" value={item.key || item.url} />
+                ))}
+                {basics.runGroupIds.map((id) => {
+                  const group = basics.runGroups.find((candidate) => candidate.id === id)
+                  return group ? <ReviewRow key={id} label={group.group_type} value={group.display_name} /> : null
+                })}
                 <ReviewRow
                   label="Schedule"
                   value={
@@ -630,6 +1005,7 @@ export default function DynamicSubmitForm({
                   {(submitJob.error || submitMatrix.error)?.message}
                 </div>
               )}
+              {matrixSubmissionFeedback}
 
               {(allModes.length > 1 || quickPresetKey) && (
                 <ReviewSection>
@@ -663,6 +1039,8 @@ export default function DynamicSubmitForm({
                 )
               })}
 
+              {projectAdapter?.renderAdditionalReview(values, derived)}
+
               {isMatrix && (
                 <ReviewSection title="Matrix Selection">
                   <ReviewRow
@@ -672,15 +1050,20 @@ export default function DynamicSubmitForm({
                   />
                   <ReviewRow
                     label="Models"
-                    value={selectedModels
-                      .map((k) => selectedPipeline?.models.find((m) => m.key === k)?.label || k)
+                    value={activeMatrixRows
+                      .map(({ model }) => model.label || model.key)
                       .join(', ')}
-                    missing={selectedModels.length === 0}
+                    missing={matrixJobCount === 0}
                   />
                   <ReviewRow
                     label="Workloads"
                     value={selectedWorkloads.join(', ')}
                     missing={selectedWorkloads.length === 0}
+                  />
+                  <ReviewRow
+                    label="Workload executions"
+                    value={`${matrixWorkloadExecutionCount} across ${matrixJobCount} job(s)`}
+                    missing={matrixWorkloadExecutionCount === 0}
                   />
                 </ReviewSection>
               )}
@@ -703,9 +1086,9 @@ export default function DynamicSubmitForm({
                   <button
                     type="button"
                     onClick={onOpenScheduleModal}
-                    disabled={!basics.cluster}
+                    disabled={!basics.cluster.trim()}
                     className="inline-flex items-center gap-1.5 rounded-md border border-gray-300 bg-white px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-                    title={!basics.cluster ? 'Pick a cluster first' : undefined}
+                    title={!basics.cluster.trim() ? 'Pick a cluster first' : undefined}
                   >
                     <ClockIcon className="h-4 w-4" />
                     Defer / Set Recurring…
@@ -743,12 +1126,17 @@ function FieldControl({
   value,
   onChange,
   options,
+  disabled = false,
+  lockedOption,
 }: {
   field: UiField
   value: unknown
   onChange: (value: unknown) => void
   /** Defaults to `field.options` — pass a `visibleOptions(field, values)` result to apply `restrict_if`. */
   options?: UiOption[]
+  disabled?: boolean
+  /** Keep a pipeline-pinned option selected while showing other choices as unavailable. */
+  lockedOption?: string
 }) {
   const opts = options ?? field.options
   switch (field.type) {
@@ -760,6 +1148,7 @@ function FieldControl({
               type="checkbox"
               checked={!!value}
               onChange={(e) => onChange(e.target.checked)}
+              disabled={disabled}
               className="rounded border-gray-300 text-indigo-600"
             />
             {field.placeholder || 'Enabled'}
@@ -775,6 +1164,7 @@ function FieldControl({
           min={field.min ?? undefined}
           max={field.max ?? undefined}
           onChange={(e) => onChange(e.target.value === '' ? '' : Number(e.target.value))}
+          disabled={disabled}
           className="input mt-1"
           placeholder={field.placeholder}
         />
@@ -785,6 +1175,7 @@ function FieldControl({
         <textarea
           value={(value as string) || ''}
           onChange={(e) => onChange(e.target.value)}
+          disabled={disabled}
           rows={3}
           className="input mt-1 font-mono"
           placeholder={field.placeholder}
@@ -796,6 +1187,7 @@ function FieldControl({
         <select
           value={(value as string) || ''}
           onChange={(e) => onChange(e.target.value)}
+          disabled={disabled}
           className="input mt-1"
         >
           <option value="">{field.required ? 'Select...' : 'None'}</option>
@@ -810,22 +1202,31 @@ function FieldControl({
     case 'radio':
       return (
         <div className="mt-2 flex flex-wrap gap-1.5">
-          {opts.map((opt) => (
-            <button
-              key={opt.value}
-              type="button"
-              title={formatOverridesTooltip(opt.overrides)}
-              onClick={() => onChange(value === opt.value ? '' : opt.value)}
-              className={clsx(
-                'px-3 py-1.5 rounded-md text-xs font-medium border transition-colors',
-                value === opt.value
-                  ? 'border-indigo-500 bg-indigo-50 text-indigo-700'
-                  : 'border-gray-300 bg-white text-gray-600 hover:border-gray-400'
-              )}
-            >
-              {opt.label || opt.value}
-            </button>
-          ))}
+          {opts.map((opt) => {
+            const optionDisabled = disabled || (lockedOption !== undefined && opt.value !== lockedOption)
+            return (
+              <button
+                key={opt.value}
+                type="button"
+                title={formatOverridesTooltip(opt.overrides)}
+                disabled={optionDisabled}
+                onClick={() => onChange(
+                  lockedOption !== undefined
+                    ? opt.value
+                    : value === opt.value ? '' : opt.value
+                )}
+                className={clsx(
+                  'px-3 py-1.5 rounded-md text-xs font-medium border transition-colors',
+                  value === opt.value
+                    ? 'border-indigo-500 bg-indigo-50 text-indigo-700'
+                    : 'border-gray-300 bg-white text-gray-600 hover:border-gray-400',
+                  optionDisabled && 'cursor-not-allowed opacity-40 hover:border-gray-300'
+                )}
+              >
+                {opt.label || opt.value}
+              </button>
+            )
+          })}
           {opts.length === 0 && <p className="text-xs text-gray-400">None available.</p>}
         </div>
       )
@@ -852,6 +1253,7 @@ function FieldControl({
                 className="h-3 w-3 rounded border-gray-300 text-indigo-600"
                 checked={selected.includes(opt.value)}
                 onChange={() => toggle(opt.value)}
+                disabled={disabled}
               />
               {opt.label || opt.value}
             </label>
@@ -868,6 +1270,7 @@ function FieldControl({
           type="text"
           value={(value as string) || ''}
           onChange={(e) => onChange(e.target.value)}
+          disabled={disabled}
           className="input mt-1"
           placeholder={field.placeholder}
         />

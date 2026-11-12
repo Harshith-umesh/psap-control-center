@@ -3,5 +3,13 @@ from app.models.reservation import Reservation
 from app.models.user import User
 from app.models.gpu_pod_history import GpuPodHistory
 from app.models.setting import Setting
+from app.models.user_preference import UserPreference
 
-__all__ = ["Cluster", "Reservation", "User", "GpuPodHistory", "Setting"]
+__all__ = [
+    "Cluster",
+    "Reservation",
+    "User",
+    "GpuPodHistory",
+    "Setting",
+    "UserPreference",
+]

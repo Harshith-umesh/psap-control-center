@@ -1,6 +1,14 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 from datetime import datetime
+
+
+class RefreshDisplayPreferenceUpdate(BaseModel):
+    mode: Literal["countdown", "last_update"]
+
+
+class RefreshDisplayPreferenceResponse(RefreshDisplayPreferenceUpdate):
+    updated_at: Optional[datetime] = None
 
 
 class ClusterBase(BaseModel):

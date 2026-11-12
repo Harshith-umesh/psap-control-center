@@ -77,3 +77,27 @@
 .rbc-toolbar button.rbc-active {
   @apply bg-[#06c] text-white border-[#06c];
 }
+
+/* Keep submit-form controls and guidance comfortable to read without changing
+   typography elsewhere in the application. */
+.submit-page label,
+.submit-page .text-sm {
+  font-size: 1rem;
+  line-height: 1.5rem;
+}
+
+.submit-page .text-xs {
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+}
+
+.submit-page input:not([type='checkbox']):not([type='radio']),
+.submit-page select,
+.submit-page textarea {
+  font-size: 1rem;
+  line-height: 1.5rem;
+}
+
+.submit-page button {
+  font-size: 0.9375rem;
+}

@@ -24,7 +24,7 @@ export default function YamlPreview({
         {open ? <ChevronDownIcon className="h-3.5 w-3.5" /> : <ChevronRightIcon className="h-3.5 w-3.5" />}
       </button>
       {open && (
-        <pre className="p-4 text-xs font-mono leading-relaxed overflow-x-auto bg-gray-900 text-gray-100 whitespace-pre">
+        <pre className="p-4 text-xs font-mono leading-relaxed overflow-x-auto bg-white text-gray-900 whitespace-pre">
           {yaml}
         </pre>
       )}

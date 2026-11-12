@@ -12,18 +12,24 @@ import {
   EyeSlashIcon,
   CheckCircleIcon,
   ExclamationTriangleIcon,
-  ClockIcon,
 } from '@heroicons/react/24/outline'
 import { useDropzone } from 'react-dropzone'
 import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useClusters, useCreateCluster, useDeleteCluster } from '../hooks/useClusters'
+import {
+  useClusters,
+  useClusterRefreshDisplayPreference,
+  useCreateCluster,
+  useDeleteCluster,
+  useSaveClusterRefreshDisplayPreference,
+} from '../hooks/useClusters'
 import { clusterApi } from '../services/api'
 import { format } from 'date-fns'
 import toast from 'react-hot-toast'
 import clsx from 'clsx'
-import type { GpuAllocationStatus, ClusterCost } from '../types'
+import type { ClusterCost, GpuAllocationStatus } from '../types'
 import GpuDonutChart from '../components/GpuDonutChart'
-import { isAdmin } from '../stores/authStore'
+import ClusterRefreshIndicator from '../components/ClusterRefreshIndicator'
+import { isAdmin, isAuthenticated } from '../stores/authStore'
 
 function timeAgo(dateStr: string): string {
   const diff = Date.now() - new Date(dateStr).getTime()
@@ -61,13 +67,21 @@ export default function Clusters() {
   const [kubeconfigFile, setKubeconfigFile] = useState<File | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [refreshProgress, setRefreshProgress] = useState<RefreshProgress | null>(null)
-  const [countdown, setCountdown] = useState('')
   const prevLastRefresh = useRef<string | null>(null)
 
   const queryClient = useQueryClient()
   const { data, isLoading, refetch } = useClusters()
   const createCluster = useCreateCluster()
   const deleteCluster = useDeleteCluster()
+  const authenticated = isAuthenticated()
+  const {
+    data: refreshDisplayPreference,
+    isLoading: refreshDisplayPreferenceLoading,
+  } = useClusterRefreshDisplayPreference(authenticated)
+  const saveRefreshDisplayPreference = useSaveClusterRefreshDisplayPreference()
+  const refreshDisplayMode = authenticated && refreshDisplayPreferenceLoading
+    ? 'last_update'
+    : refreshDisplayPreference?.mode ?? 'countdown'
 
   const { data: schedule } = useQuery({
     queryKey: ['cluster-refresh-schedule'],
@@ -84,22 +98,6 @@ export default function Clusters() {
     }
     prevLastRefresh.current = schedule.last_refresh
   }, [schedule?.last_refresh, refetch, queryClient])
-
-  // Tick the countdown every second
-  useEffect(() => {
-    if (!schedule?.next_refresh) { setCountdown(''); return }
-
-    const tick = () => {
-      const diff = Math.max(0, Math.floor((new Date(schedule.next_refresh!).getTime() - Date.now()) / 1000))
-      const m = Math.floor(diff / 60)
-      const s = diff % 60
-      setCountdown(`${m}:${s.toString().padStart(2, '0')}`)
-    }
-
-    tick()
-    const id = setInterval(tick, 1000)
-    return () => clearInterval(id)
-  }, [schedule?.next_refresh])
 
   const serverRefreshing = schedule?.in_progress ?? false
 
@@ -158,6 +156,19 @@ export default function Clusters() {
 
   const clusters = data?.clusters || []
 
+  const clusterCostQueries = useQueries({
+    queries: clusters.map((cluster) => ({
+      queryKey: ['clusterCost', cluster.id],
+      queryFn: () => clusterApi.getCost(cluster.id),
+      enabled: cluster.provider === 'ibm',
+      staleTime: 60_000,
+    })),
+  })
+  const costsByCluster = clusters.reduce<Record<string, ClusterCost[]>>((acc, cluster, index) => {
+    acc[cluster.id] = (clusterCostQueries[index]?.data as ClusterCost[] | undefined) || []
+    return acc
+  }, {})
+
   const gpuStatusQueries = useQueries({
     queries: clusters.map((c) => ({
       queryKey: ['gpu-status', c.id],
@@ -183,20 +194,6 @@ export default function Clusters() {
   })
   const gpuHistoryByCluster = clusters.reduce<Record<string, Array<{ name: string; namespace: string; gpu_count: number; node?: string; finished_at: string }>>>((acc, c, i) => {
     acc[c.id] = (gpuHistoryQueries[i]?.data as { pods: typeof acc[string] } | undefined)?.pods || []
-    return acc
-  }, {})
-
-  const costQueries = useQueries({
-    queries: clusters.map((c) => ({
-      queryKey: ['clusterCost', c.id],
-      queryFn: () => clusterApi.getCost(c.id),
-      enabled: c.provider === 'ibm',
-      staleTime: 60_000,
-    })),
-  })
-  const costsByCluster = clusters.reduce<Record<string, ClusterCost[]>>((acc, c, i) => {
-    const costs = costQueries[i]?.data as ClusterCost[] | undefined
-    acc[c.id] = costs || []
     return acc
   }, {})
 
@@ -287,22 +284,17 @@ export default function Clusters() {
           <div className="mt-1 flex items-center gap-4 text-sm text-gray-500">
             <span>Manage your OCP clusters and their kubeconfigs</span>
             {schedule && (
-              <span className="flex items-center gap-3 text-xs text-gray-400 border-l border-gray-200 pl-4">
-                <ClockIcon className="h-3.5 w-3.5 flex-shrink-0" />
-                {schedule.last_refresh ? (
-                  <span>Updated {format(new Date(schedule.last_refresh), 'MMM d, HH:mm:ss')}</span>
-                ) : (
-                  <span>No refresh yet</span>
-                )}
-                {schedule.in_progress ? (
-                  <span className="flex items-center gap-1 text-primary-600 font-medium">
-                    <ArrowPathIcon className="h-3 w-3 animate-spin" />
-                    Refreshing...
-                  </span>
-                ) : countdown ? (
-                  <span>Next in <span className="font-mono font-medium text-gray-600">{countdown}</span></span>
-                ) : null}
-              </span>
+              <ClusterRefreshIndicator
+                schedule={schedule}
+                mode={refreshDisplayMode}
+                canSavePreference={authenticated && !refreshDisplayPreferenceLoading}
+                saving={saveRefreshDisplayPreference.isPending}
+                onModeChange={(mode) => {
+                  if (mode !== refreshDisplayMode) {
+                    saveRefreshDisplayPreference.mutate(mode)
+                  }
+                }}
+              />
             )}
           </div>
         </div>
@@ -463,6 +455,10 @@ export default function Clusters() {
                   const gpuData = gpuStatusByCluster[cluster.id]
                   const cTotal = gpuData?.total_gpus ?? parseInt(cluster.gpu_count || '0')
                   const cUsed = gpuData?.allocated_gpus ?? 0
+                  const gpuNodeCount = gpuData?.gpu_types.reduce(
+                    (total, gpuType) => total + gpuType.node_count,
+                    0,
+                  )
                   return (
                     <div className="mt-4 flex items-center gap-4">
                       {cTotal > 0 && (
@@ -470,11 +466,15 @@ export default function Clusters() {
                       )}
                       <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm flex-1">
                         <div>
-                          <p className="text-gray-500">Nodes</p>
+                          <p className="text-gray-500">Cluster nodes</p>
                           <p className="font-semibold text-gray-900">{cluster.node_count || 'N/A'}</p>
                         </div>
                         <div>
-                          <p className="text-gray-500">GPUs</p>
+                          <p className="text-gray-500" title="Nodes with at least one detected GPU">GPU nodes</p>
+                          <p className="font-semibold text-gray-900">{gpuNodeCount ?? 'N/A'}</p>
+                        </div>
+                        <div>
+                          <p className="text-gray-500">GPUs used</p>
                           <p className="font-semibold text-gray-900">
                             {gpuData ? `${cUsed} / ${cTotal}` : `– / ${cTotal}`}
                           </p>
@@ -494,31 +494,6 @@ export default function Clusters() {
                           </p>
                         </div>
                       </div>
-                    </div>
-                  )
-                })()}
-
-                {(() => {
-                  const costs = costsByCluster[cluster.id]
-                  if (!costs || costs.length === 0) return null
-                  const valid = costs.filter((c) => !c.error && c.total_cost != null)
-                  if (valid.length === 0) {
-                    return (
-                      <div className="mt-4 pt-4 border-t border-gray-100 text-sm text-gray-400">
-                        No billing data
-                      </div>
-                    )
-                  }
-                  return (
-                    <div className="mt-4 pt-4 border-t border-gray-100 space-y-1 text-sm">
-                      {valid.map((cost) => (
-                        <div key={cost.billing_month} className="flex items-center justify-between">
-                          <span className="text-gray-400">{cost.billing_month}</span>
-                          <span className="font-semibold text-gray-900">
-                            {cost.total_cost!.toLocaleString(undefined, { style: 'currency', currency: cost.currency })}
-                          </span>
-                        </div>
-                      ))}
                     </div>
                   )
                 })()}
@@ -574,6 +549,30 @@ export default function Clusters() {
                           </div>
                         ))}
                       </div>
+                    </div>
+                  )
+                })()}
+
+                {cluster.provider === 'ibm' && (() => {
+                  const costs = costsByCluster[cluster.id] || []
+                  const valid = costs.filter((cost) => !cost.error && cost.total_cost != null)
+                  if (valid.length === 0) {
+                    return (
+                      <div className="mt-4 border-t border-gray-100 pt-4 text-sm text-gray-400">
+                        No billing data
+                      </div>
+                    )
+                  }
+                  return (
+                    <div className="mt-4 space-y-1 border-t border-gray-100 pt-4 text-sm">
+                      {valid.map((cost, index) => (
+                        <div key={`${cost.billing_month || 'latest'}-${index}`} className="flex items-center justify-between">
+                          <span className="text-gray-400">{cost.billing_month || 'Latest'}</span>
+                          <span className="font-semibold text-gray-900">
+                            {cost.total_cost!.toLocaleString(undefined, { style: 'currency', currency: cost.currency })}
+                          </span>
+                        </div>
+                      ))}
                     </div>
                   )
                 })()}

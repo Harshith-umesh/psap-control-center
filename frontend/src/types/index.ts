@@ -150,6 +150,13 @@ export interface ClusterListResponse {
   total: number
 }
 
+export type RefreshDisplayMode = 'countdown' | 'last_update'
+
+export interface RefreshDisplayPreference {
+  mode: RefreshDisplayMode
+  updated_at?: string | null
+}
+
 export interface NodeCostInfo {
   node: string
   instance_name?: string
@@ -437,10 +444,14 @@ export interface FournosJobSummary {
   project: string
   preset: string
   cluster: string
+  gpu_type?: string | null
+  gpu_count?: number | null
   pipeline: string
   owner: string
   status: string
   message: string
+  current_step: CurrentStep | null
+  task_progress: TaskProgress | null
   created_at: string | null
   completed_at: string | null
   duration_seconds: number | null
@@ -451,6 +462,52 @@ export interface FournosJobSummary {
    * created_at (when the CR was created). Powers the scheduling calendar. */
   scheduled_start_time: string | null
   source: 'live' | 'history'
+  source_repository: string
+  source_pr_number: number | null
+  source_pr_url: string
+  source_head_branch: string
+  source_requested_sha: string
+  source_resolved_sha: string
+  forge_git_version: string
+  forge_image_digest: string
+  forge_provenance_state: string
+  work_items: WorkItemReference[]
+  run_groups: RunGroupReference[]
+}
+
+export interface WorkItemReference {
+  provider: string
+  key: string
+  url: string
+}
+
+export interface WorkItemConfig {
+  enabled: boolean
+  providers: string[]
+}
+
+export type RunGroupType = 'experiment' | 'workload' | 'campaign' | 'cohort'
+
+export interface RunGroupReference {
+  id: string
+  group_type: RunGroupType
+  key: string
+  display_name: string
+  description: string
+  archived: boolean
+}
+
+export interface RunGroupCreate {
+  group_type: RunGroupType
+  key: string
+  display_name: string
+  description?: string
+}
+
+export interface RunGroupUpdate {
+  display_name?: string
+  description?: string
+  archived?: boolean
 }
 
 export interface FournosJobListResponse {
@@ -460,6 +517,57 @@ export interface FournosJobListResponse {
   per_page: number
 }
 
+export interface FournosLiveJobSummaryResponse {
+  total: number
+  by_status: Record<string, number>
+  by_cluster: Record<string, { queued: number; running: number; active: number }>
+}
+
+export interface HistoryViewState {
+  query: string
+  project: string
+  cluster: string
+  status: string
+  requester_scope: 'all' | 'mine'
+  identity: string
+  failure_outcome: string
+  repository: string
+  pr_number: number | null
+  source_sha: string
+  forge: string
+  work_item_provider: string
+  work_item_key: string
+  tags: string[]
+  history_date: string
+  from_time: string
+  to_time: string
+  sort_by: 'name' | 'project' | 'cluster' | 'status' | 'owner' | 'date' | 'duration' | 'triggered_by'
+  sort_dir: 'asc' | 'desc'
+  per_page: number
+}
+
+export interface HistoryPreferenceResponse {
+  schema_version: number
+  state: HistoryViewState
+  updated_at: string | null
+}
+
+export interface HistoryFilterOptionsResponse {
+  identities: string[]
+  repositories: string[]
+  pr_numbers: number[]
+  source_shas: string[]
+  forge: string[]
+  tags: string[]
+  work_item_providers: string[]
+  work_item_keys: string[]
+}
+
+export interface AuthConfig {
+  google_enabled: boolean
+  local_login_enabled: boolean
+}
+
 export interface PipelineStage {
   name: string
   displayName: string
@@ -467,6 +575,25 @@ export interface PipelineStage {
   startTime: string | null
   completionTime: string | null
   finally: boolean
+  outcome?: string
+  reason?: string
+  reasonCode?: string
+  reasonSource?: string
+  failedStep?: string
+  exitCode?: number | null
+}
+
+export interface FailureSummary {
+  outcome: 'failed' | 'cancelled' | 'infrastructure_error' | 'unknown'
+  stage: string
+  stageDisplayName: string
+  step: string
+  reason: string
+  reasonCode: string
+  source: string
+  artifactPath: string
+  executionReason?: string
+  executionSource?: string
 }
 
 export interface TaskProgress {
@@ -503,6 +630,23 @@ export interface ForgeInfo {
   pr_number: string
   pr_title: string
   pr_url: string
+  repository: string
+  head_branch: string
+  requested_sha: string
+  resolved_sha: string
+}
+
+export interface ForgeExecutionProvenance {
+  images: Array<{
+    image: string
+    imageID: string
+    container: string
+  }>
+  gitVersions: Array<{
+    version: string
+    artifactPath: string
+  }>
+  observedAt: string | null
 }
 
 export interface FournosJobDetailResponse {
@@ -520,6 +664,14 @@ export interface FournosJobDetailResponse {
   current_step: CurrentStep | null
   forge_info: ForgeInfo
   task_progress: TaskProgress | null
+  failure_summary: FailureSummary | null
+  failure_enrichment_state: string
+  forge_execution: ForgeExecutionProvenance
+  forge_provenance_state: string
+  work_items: WorkItemReference[]
+  can_edit_work_items: boolean
+  run_groups: RunGroupReference[]
+  can_edit_run_groups: boolean
 }
 
 export interface FournosJobEvent {
@@ -620,7 +772,25 @@ export interface GitHubPR {
   author: string
   head_sha: string
   branch: string
+  repository: string
+  url: string
   draft: boolean
+}
+
+export interface PullRequestSelection {
+  repository: string
+  number: number
+  url: string
+  head_branch: string
+  requested_sha: string
+}
+
+export interface GitHubRelease {
+  tag_name: string
+  name: string
+  prerelease: boolean
+  published_at: string | null
+  html_url: string
 }
 
 export interface GithubSyncStatus {
@@ -641,7 +811,9 @@ export interface SubmitJobRequest {
   owner: string
   exclusive: boolean
   config_overrides: Record<string, string>
+  pull_request?: PullRequestSelection | null
   pull_sha: string
+  use_latest_main?: boolean
   priority?: string
   gpu_type?: string
   gpu_count?: number
@@ -649,6 +821,8 @@ export interface SubmitJobRequest {
   scheduled_start_time?: string | null
   /** Cron expression, UTC — mutually exclusive with `scheduled_start_time`. Makes this a recurring template. */
   schedule?: string
+  work_items?: WorkItemReference[]
+  run_group_ids?: string[]
 }
 
 export interface SubmitJobResponse {
@@ -663,8 +837,11 @@ export interface SubmitJobResponse {
 
 export interface SubmitMatrixModelInput {
   key: string
+  label?: string
   overrides: Record<string, unknown>
   gpu_count?: number | null
+  /** Supported workloads, intersected with SubmitMatrixRequest.workloads. */
+  workloads?: string[] | null
 }
 
 export interface SubmitMatrixRequest {
@@ -675,14 +852,26 @@ export interface SubmitMatrixRequest {
   config_overrides: Record<string, string>
   models: SubmitMatrixModelInput[]
   workloads: string[]
+  matrix_mode_id: string
+  selected_pipeline_key: string
+  matrix_pipeline_key?: string
+  version_label?: string
+  accelerator?: string
+  engine?: string
+  engine_version?: string
+  configured_model_count?: number
   /** Compatibility/display field; the backend records the authenticated requester. */
   owner: string
   priority: string
   exclusive: boolean
+  pull_request?: PullRequestSelection | null
   pull_sha: string
+  use_latest_main?: boolean
   gpu_type: string
   scheduled_start_time?: string | null
   schedule?: string
+  work_items?: WorkItemReference[]
+  run_group_ids?: string[]
 }
 
 export interface SubmitMatrixResultItem {
@@ -696,6 +885,110 @@ export interface SubmitMatrixResponse {
   status: string
   jobs: SubmitMatrixResultItem[]
   total: number
+  cpt_run_id?: string | null
+  cpt_group_id?: string | null
+}
+
+export interface CptProfileResult {
+  profile: string
+  status: string
+  job_name: string | null
+  message: string
+  run_id: string
+  created_at: string
+  source: string
+}
+
+export interface CptRunModel {
+  model_key: string
+  model_name: string
+  status: string
+  submitted: boolean
+  attempt_count: number
+  cells: Record<string, CptProfileResult>
+  latest_job_name: string | null
+  latest_created_at: string
+}
+
+export interface CptRunAttempt {
+  id: string
+  status: string
+  job_count: number
+  succeeded_jobs: number
+  failed_jobs: number
+  stopped_jobs: number
+  model_names: string[]
+  created_at: string
+  owner: string
+  source: string
+  jobs: Array<{ name: string | null; model: string; status: string }>
+}
+
+export interface CptRunGroup {
+  id: string
+  project: string
+  pipeline_key: string
+  version_label: string
+  cluster: string
+  accelerator: string
+  engine: string
+  engine_version: string
+  fournos_pipeline: string
+  status: string
+  attempt_count: number
+  models: CptRunModel[]
+  profiles: string[]
+  configured_model_count: number | null
+  submitted_model_count: number
+  not_submitted_model_count: number
+  passed_profile_count: number
+  failed_profile_count: number
+  stopped_profile_count: number
+  active_profile_count: number
+  total_profile_count: number
+  sources: string[]
+  source_label: string
+  owners: string[]
+  owner_label: string
+  latest_created_at: string
+  attempts: CptRunAttempt[]
+  active_jobs: string[]
+}
+
+export interface CptRunListResponse {
+  projects: string[]
+  groups: CptRunGroup[]
+  total: number
+  page: number
+  per_page: number
+  hidden_stopped_count: number
+  filter_options: {
+    versions: string[]
+    accelerators: string[]
+    clusters: string[]
+    owners: string[]
+  }
+}
+
+export interface StopCptRunGroupResponse {
+  status: string
+  requested: number
+  failed: number
+  jobs: Array<{ job_name: string; status: string; message: string }>
+}
+
+export interface UpdateCptRunVersionResponse {
+  status: string
+  version_label: string
+  group_id: string
+}
+
+export interface InferenceServerLogs {
+  pod: string | null
+  phase: string
+  container: string
+  logs: string
+  message: string
 }
 
 // ─── Generic project UI schema (projects/<name>/ui/submit.yaml) ───────
@@ -760,6 +1053,8 @@ export interface UiPipelineModel {
   label: string
   overrides: Record<string, unknown>
   tp?: number | null
+  /** Workloads supported by this model; absent means use the pipeline list. */
+  workloads?: string[] | null
 }
 
 export interface UiPipeline {
@@ -768,6 +1063,10 @@ export interface UiPipeline {
   models: UiPipelineModel[]
   workloads: string[]
   overrides: Record<string, unknown>
+  engine?: string | null
+  accelerator?: string | null
+  gpu_type?: string | null
+  clusters?: string[]
 }
 
 export interface UiMode {

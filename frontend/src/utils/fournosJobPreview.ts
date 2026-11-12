@@ -1,14 +1,33 @@
 import { dump } from 'js-yaml'
+import type { PullRequestSelection } from '../types'
 
 // Mirrors the FournosJob CR construction in backend/app/api/fournos.py
 // (submit_job / submit_matrix) field-for-field, so what's previewed here on
 // the Review & Submit step matches exactly what gets POSTed to the cluster.
 // Defaults (namespace, apiVersion) match app/core/config.py's Settings
 // defaults — if those are ever overridden via env vars in a real
-// deployment, this preview is illustrative rather than exact.
+// deployment, this preview is illustrative rather than exact. The backend
+// applies its configured TTL policy, so TTL is omitted from this client preview.
 
 const NAMESPACE = 'fournos-jobs'
 const API_VERSION = 'fournos.dev/v1'
+
+export function mergeMatrixConfigOverrides(
+  pipelineOverrides: Record<string, unknown>,
+  formOverrides: Record<string, string>,
+): Record<string, string> {
+  const normalizedPipeline = Object.fromEntries(
+    Object.entries(pipelineOverrides).map(([key, value]) => [
+      key,
+      Array.isArray(value)
+        ? JSON.stringify(value)
+        : typeof value === 'boolean'
+          ? value ? 'true' : 'false'
+          : value == null ? '' : String(value),
+    ]),
+  )
+  return { ...normalizedPipeline, ...formOverrides }
+}
 
 /** Mirrors fournos_k8s_client.sanitize_job_name(prefix). */
 function sanitizeJobName(prefix: string): string {
@@ -23,11 +42,6 @@ function sanitizeJobName(prefix: string): string {
   return name.slice(0, 63)
 }
 
-/** Mirrors the inline generate_name sanitization in submit_matrix(). */
-function sanitizeGenerateName(project: string, modelKey: string): string {
-  return `${project}-${modelKey}-`.toLowerCase().replace(/[^a-z0-9-]/g, '-')
-}
-
 interface SharedInput {
   project: string
   cluster: string
@@ -36,13 +50,31 @@ interface SharedInput {
   priority: string
   exclusive: boolean
   pullSha: string
+  pullRequest?: PullRequestSelection | null
   args: string[]
   configOverrides: Record<string, string>
   gpuType?: string
+  gpuCount?: number
   /** Cron expression, UTC — mutually exclusive with scheduledStartTime. */
   schedule?: string
   /** ISO 8601 UTC — mutually exclusive with schedule. */
   scheduledStartTime?: string | null
+}
+
+function sourceEnvironment(input: Pick<SharedInput, 'pullSha' | 'pullRequest'>): Record<string, string> | null {
+  if (input.pullRequest) {
+    const [owner, name] = input.pullRequest.repository.split('/', 2)
+    return {
+      REPO_OWNER: owner,
+      REPO_NAME: name,
+      PULL_NUMBER: String(input.pullRequest.number),
+      PULL_HEAD_REF: input.pullRequest.head_branch,
+      PULL_PULL_SHA: input.pullRequest.requested_sha,
+      CONTROL_CENTER_REQUESTED_SHA: input.pullRequest.requested_sha,
+      CONTROL_CENTER_PR_URL: input.pullRequest.url,
+    }
+  }
+  return input.pullSha.trim() ? { PULL_PULL_SHA: input.pullSha.trim() } : null
 }
 
 function applyScheduling(spec: Record<string, unknown>, input: Pick<SharedInput, 'schedule' | 'scheduledStartTime'>): void {
@@ -61,7 +93,6 @@ export function buildSingleJobPreview(input: SharedInput): Record<string, unknow
     owner: input.owner || 'fournos-dashboard',
     pipeline: input.pipeline,
     exclusive: input.exclusive,
-    priority: input.priority,
     executionEngine: {
       forge: {
         project: input.project,
@@ -70,12 +101,12 @@ export function buildSingleJobPreview(input: SharedInput): Record<string, unknow
       },
     },
   }
+  if (input.priority.trim()) spec.priority = input.priority.trim()
   if (input.gpuType?.trim()) {
-    spec.hardware = { gpuType: input.gpuType.trim(), gpuCount: 1 }
+    spec.hardware = { gpuType: input.gpuType.trim(), gpuCount: input.gpuCount || 1 }
   }
-  if (input.pullSha.trim()) {
-    spec.env = { PULL_PULL_SHA: input.pullSha.trim() }
-  }
+  const env = sourceEnvironment(input)
+  if (env) spec.env = env
   applyScheduling(spec, input)
 
   return {
@@ -93,12 +124,18 @@ export function buildSingleJobPreview(input: SharedInput): Record<string, unknow
 
 export function buildMatrixJobPreviews(
   input: SharedInput & {
-    models: { key: string; overrides: Record<string, string>; gpuCount?: number | null }[]
+    models: {
+      key: string
+      overrides: Record<string, string>
+      gpuCount?: number | null
+      workloads?: string[]
+    }[]
     workloads: string[]
   }
 ): Record<string, unknown>[] {
   return input.models.map((model) => {
-    const args = [...input.args, model.key, ...input.workloads]
+    const workloads = model.workloads ?? input.workloads
+    const args = [...input.args, model.key, ...workloads]
     const overrides = { ...input.configOverrides, ...model.overrides }
     const displayName = `${input.project}-${model.key}-${input.cluster}`
 
@@ -108,24 +145,23 @@ export function buildMatrixJobPreviews(
       owner: input.owner,
       pipeline: input.pipeline,
       exclusive: input.exclusive,
-      priority: input.priority,
       executionEngine: {
         forge: { project: input.project, args, configOverrides: overrides },
       },
     }
+    if (input.priority.trim()) spec.priority = input.priority.trim()
     if (input.gpuType?.trim() || model.gpuCount) {
       spec.hardware = { gpuType: input.gpuType?.trim() || 'unknown', gpuCount: model.gpuCount || 1 }
     }
-    if (input.pullSha.trim()) {
-      spec.env = { PULL_PULL_SHA: input.pullSha.trim() }
-    }
+    const env = sourceEnvironment(input)
+    if (env) spec.env = env
     applyScheduling(spec, input)
 
     return {
       apiVersion: API_VERSION,
       kind: 'FournosJob',
       metadata: {
-        generateName: sanitizeGenerateName(input.project, model.key),
+        name: sanitizeJobName(`${input.project}-${model.key}`),
         namespace: NAMESPACE,
       },
       spec,
@@ -149,4 +185,21 @@ export function withVersionOverride(
 export function toYamlPreview(docs: Record<string, unknown> | Record<string, unknown>[]): string {
   const arr = Array.isArray(docs) ? docs : [docs]
   return arr.map((d) => dump(d, { indent: 2, lineWidth: 100, noRefs: true })).join('---\n')
+}
+
+/**
+ * Render the same concise FournosJob document shown by the FourNos dashboard:
+ * apiVersion, kind, metadata.name, and the submitted spec (not runtime status
+ * or private/requester annotations).
+ */
+export function buildFournosJobYaml(job: {
+  metadata?: Record<string, unknown>
+  spec?: Record<string, unknown>
+}): string {
+  return dump({
+    apiVersion: 'fournos.dev/v1',
+    kind: 'FournosJob',
+    metadata: { name: job.metadata?.name || '' },
+    spec: job.spec || {},
+  }, { indent: 2, lineWidth: 80, noRefs: true, sortKeys: false })
 }

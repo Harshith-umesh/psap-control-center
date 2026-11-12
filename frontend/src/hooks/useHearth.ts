@@ -22,10 +22,11 @@ export function useHearthStatus() {
   })
 }
 
-export function useHearthClusters() {
+export function useHearthClusters(enabled = true) {
   return useQuery({
     queryKey: ['hearthClusters'],
     queryFn: hearthApi.listClusters,
+    enabled,
     refetchInterval: 30000,
     retry: 1,
   })

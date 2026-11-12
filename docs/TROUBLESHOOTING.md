@@ -208,6 +208,21 @@ connection through its service account.
 oc get fournosclusters -n hearth --kubeconfig=<management-kubeconfig>
 ```
 
+### Testing Pods have status but the Pipeline Timeline is Pending or Unknown
+
+**Cause**: The management-cluster identity can read Pods and PipelineRuns but
+cannot read `taskruns.tekton.dev` in the configured Fournos namespace. Active
+stages therefore appear `Pending`; terminal stages appear `UNKNOWN`, and stage
+snapshots cannot be preserved.
+
+**Check**: Run the TaskRun `oc auth can-i` checks in the
+[deployment guide](../deploy/README.md#hearthmanagement-cluster-permissions)
+using the same management-cluster kubeconfig supplied to Control Center.
+
+**Fix**: Have an authorized management-cluster administrator grant the
+connected user namespace-scoped `get`, `list`, and `watch` access to TaskRuns.
+Control Center intentionally does not elevate the connected identity.
+
 ## Logging
 
 ### Enabling debug logs

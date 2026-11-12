@@ -1,4 +1,5 @@
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -6,6 +7,7 @@ from app.services import github_sync_service
 from app.services import github_content
 from app.services import pipeline_definitions
 from app.services import project_ui_schema
+from app.api import fournos as fournos_api
 
 
 def test_concurrent_refresh_callers_receive_complete_status(monkeypatch):
@@ -84,6 +86,33 @@ def test_failed_refresh_attempts_are_backed_off(monkeypatch):
         assert calls == 1
         assert github_sync_service._status["last_synced_at"] is None
         assert github_sync_service._status["last_attempted_at"] is not None
+
+    asyncio.run(scenario())
+
+
+def test_shared_sync_refreshes_open_prs_and_releases(monkeypatch):
+    async def scenario():
+        open_prs = AsyncMock(return_value=[])
+        releases = AsyncMock(return_value=[])
+        monkeypatch.setattr(github_content, "refresh_snapshot", lambda: None)
+        monkeypatch.setattr(
+            github_sync_service.forge_discovery,
+            "discover_projects",
+            lambda *_args: [],
+        )
+        monkeypatch.setattr(
+            github_sync_service.pipeline_definitions,
+            "refresh_all",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(fournos_api, "refresh_open_prs", open_prs)
+        monkeypatch.setattr(fournos_api, "refresh_releases", releases)
+
+        result = await github_sync_service._do_refresh()
+
+        assert result == {"project_count": 0}
+        open_prs.assert_awaited_once()
+        releases.assert_awaited_once()
 
     asyncio.run(scenario())
 

@@ -220,6 +220,9 @@ billing, and cost-management operations require the `admin` role.
 | DELETE | `/history/{name}` | Admin | Delete an archived job |
 | POST | `/submit` | User | Submit one job, defer it, or create a recurring parent |
 | POST | `/submit-matrix` | User | Submit a matrix of jobs |
+| GET/POST | `/run-groups` | User | List or create reusable generic run groups |
+| PATCH | `/run-groups/{id}` | Owner/Admin | Rename, describe, archive, or restore a group |
+| GET/PUT | `/jobs/{name}/run-groups` | User / Requester/Admin | Read or replace one run's group memberships |
 | GET | `/projects`, `/pipelines` | No | Discover Forge projects, schemas, and pipelines |
 | GET | `/recurring-jobs` | No | List recurring jobs; creation uses `/submit` |
 | GET/POST | `/cluster-locks` | No / User | List or create cluster locks |

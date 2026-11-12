@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
 
 from app.core.database import get_db
-from app.core.auth import require_admin
+from app.core.auth import require_admin, require_auth
 from app.services.cluster_service import ClusterService
 from app.services.kubernetes_service import KubernetesService
 from app.schemas.cluster import (
@@ -18,13 +18,17 @@ from app.schemas.cluster import (
     ClusterCostResponse,
     ClusterCostListResponse,
     GpuAllocationStatus as GpuAllocationStatusSchema,
+    RefreshDisplayPreferenceResponse,
+    RefreshDisplayPreferenceUpdate,
 )
+from app.services import user_preference_service
 from app.utils.logger import create_logger
 
 router = APIRouter()
 logger = create_logger("ClustersAPI")
 
 _k8s_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="k8s-api")
+REFRESH_DISPLAY_PREFERENCE_KEY = "clusters.refresh_display_mode"
 
 
 async def _run_in_thread(fn, *args):
@@ -51,6 +55,54 @@ async def get_refresh_schedule():
         "total": cluster_refresh_state.get("total", 0),
         "completed": cluster_refresh_state.get("completed", 0),
     }
+
+
+@router.get(
+    "/refresh-display-preference",
+    response_model=RefreshDisplayPreferenceResponse,
+)
+async def get_refresh_display_preference(
+    user: dict = Depends(require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    preference = await user_preference_service.get_preference(
+        db,
+        subject=str(user["subject"]),
+        preference_key=REFRESH_DISPLAY_PREFERENCE_KEY,
+    )
+    if preference is None:
+        return RefreshDisplayPreferenceResponse(mode="countdown")
+
+    value = preference.value if isinstance(preference.value, dict) else {}
+    mode = value.get("mode")
+    if mode not in {"countdown", "last_update"}:
+        mode = "countdown"
+    return RefreshDisplayPreferenceResponse(
+        mode=mode,
+        updated_at=preference.updated_at,
+    )
+
+
+@router.put(
+    "/refresh-display-preference",
+    response_model=RefreshDisplayPreferenceResponse,
+)
+async def update_refresh_display_preference(
+    body: RefreshDisplayPreferenceUpdate,
+    user: dict = Depends(require_auth),
+    db: AsyncSession = Depends(get_db),
+):
+    preference = await user_preference_service.save_preference(
+        db,
+        subject=str(user["subject"]),
+        preference_key=REFRESH_DISPLAY_PREFERENCE_KEY,
+        value={"mode": body.mode},
+    )
+    await db.commit()
+    return RefreshDisplayPreferenceResponse(
+        mode=body.mode,
+        updated_at=preference.updated_at,
+    )
 
 
 # Static routes must be registered before dynamic /{cluster_id} routes

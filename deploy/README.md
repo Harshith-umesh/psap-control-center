@@ -90,6 +90,13 @@ podman push quay.io/${QUAY_ORG}/psap-control-center-frontend:latest
 > are building on an x86_64 host, you can omit `--platform linux/amd64` and
 > use the standard multi-stage `frontend/Dockerfile` directly.
 
+Set any `VITE_*_URL` sidebar destinations in the build environment before
+running `npm run build`. Unset destinations are hidden from the sidebar. These
+values are baked into the static frontend image; each environment needs a build
+with its own configured URLs. `FOURNOS_DEFAULT_JOB_TTL` is optional and unset
+by default so the Fournos operator applies its own retention policy. Job
+priority defaults to `manual` for both single jobs and CPT submissions.
+
 ### 3. Create the namespace
 
 ```bash
@@ -176,6 +183,120 @@ oc get pods
 oc get route psap-control-center
 curl -k https://control-center.<apps-domain>/api/v1/health
 ```
+
+## Hearth/Management-Cluster Permissions
+
+The Hearth connection is also the Kubernetes connection used by the Testing
+tab. Control Center uses the identity from the uploaded management-cluster
+kubeconfig or from the OpenShift username/password login; it does not replace
+that identity with the Control Center pod's service account and does not
+elevate its permissions.
+
+Before connecting Hearth, ensure that identity has the required permissions in
+the configured namespaces:
+
+- In `HEARTH_NAMESPACE` (default: `hearth`), read access to
+  `fournosclusters.fournos.dev`.
+- In `FOURNOS_NAMESPACE` (default: `psap-automation`), read access to
+  `fournosjobs.fournos.dev`, `pipelineruns.tekton.dev`,
+  `taskruns.tekton.dev`, Pods, and the Pod log subresource.
+- Set `FOURNOS_NAMESPACE` to the same value configured on the Fournos UI
+  deployment; the Control Center watcher archives jobs from this namespace.
+- Testing actions additionally require the corresponding `create`, `patch`, or
+  `delete` permission on `fournosjobs.fournos.dev`.
+- RHAIIS inference-server logs additionally require `get` access to the
+  target-cluster kubeconfig Secrets in `TARGET_CLUSTER_SECRETS_NAMESPACE`
+  (default: `psap-secrets`). The backend uses the Secret named
+  `kubeconfig-<cluster>` only for a currently running RHAIIS job. It never
+  returns credential data to the browser, and it authorizes log access only
+  for the job requester or an administrator. Apply this permission only to
+  the management-cluster identity used by Control Center.
+
+Use the same kubeconfig that will be supplied to Control Center to verify the
+timeline permissions:
+
+```bash
+oc --kubeconfig=<management-kubeconfig> auth can-i get taskruns.tekton.dev \
+  -n <fournos-namespace>
+oc --kubeconfig=<management-kubeconfig> auth can-i list taskruns.tekton.dev \
+  -n <fournos-namespace>
+oc --kubeconfig=<management-kubeconfig> auth can-i watch taskruns.tekton.dev \
+  -n <fournos-namespace>
+```
+
+If an existing Fournos user has all other required permissions but lacks
+TaskRun read access, a management-cluster RBAC administrator can apply this
+least-privilege grant. Replace the namespace and subject with the values used
+by that deployment:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: psap-control-center-taskrun-reader
+  namespace: <fournos-namespace>
+rules:
+  - apiGroups: ["tekton.dev"]
+    resources: ["taskruns"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: psap-control-center-taskrun-reader
+  namespace: <fournos-namespace>
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: psap-control-center-taskrun-reader
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: <management-cluster-user>
+```
+
+Without TaskRun read access, the Pods view may still show accurate status while
+the Pipeline Timeline remains `Pending` for active runs or `UNKNOWN` for
+terminal runs. Control Center also cannot preserve durable stage snapshots in
+that state. The connected user usually cannot grant this permission to itself;
+the Role and RoleBinding must be created by an appropriately authorized
+management-cluster user.
+
+For inference-server logs, grant only `get` on the specific kubeconfig Secrets
+the Control Center should be allowed to use. Replace the example names and
+subject with the target clusters and management-cluster identity configured in
+Control Center. No `list` permission is needed:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: psap-control-center-target-kubeconfig-reader
+  namespace: psap-secrets
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["kubeconfig-hera", "kubeconfig-mi355x"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: psap-control-center-target-kubeconfig-reader
+  namespace: psap-secrets
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: psap-control-center-target-kubeconfig-reader
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: <management-cluster-user>
+```
+
+This permission is separate from permissions on each target cluster. The
+credentials stored in each Secret must themselves have the minimum KServe
+InferenceService and Pod/log read access required for the selected cluster.
 
 ## CI/CD: Automatic Build & Deploy
 

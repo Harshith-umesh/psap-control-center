@@ -1,0 +1,614 @@
+import type { Dispatch, ReactNode, SetStateAction } from 'react'
+import ReviewRow, { ReviewSection } from '../ReviewRow'
+import type { UiField, UiMode, UiOption, UiSection } from '../../types'
+
+export interface ProjectSubmitBasics {
+  cluster: string
+  clusterGpuType?: string
+}
+
+export interface ProjectDerivedState {
+  gpuType: string
+  selectedModelTp: number
+  tpSize: number
+  gpuCount: number
+}
+
+interface FieldChangeContext {
+  field: UiField
+  value: unknown
+  values: Record<string, unknown>
+  modelField?: UiField
+  engineField?: UiField
+  autoEngineVersion: string
+}
+
+interface FieldChangeResult {
+  updates: Record<string, unknown>
+  autoEngineVersion?: string
+}
+
+interface SubmissionContext {
+  values: Record<string, unknown>
+  modelField?: UiField
+  workloadField?: UiField
+  derived: ProjectDerivedState
+  overrides: Record<string, string>
+}
+
+interface RenderContext {
+  field: UiField
+  values: Record<string, unknown>
+  derived: ProjectDerivedState
+  setFieldValue: (key: string, value: unknown) => void
+  setValues: Dispatch<SetStateAction<Record<string, unknown>>>
+}
+
+export interface ProjectSubmitAdapter {
+  requiresBuildSource: boolean
+  buildSourceLabel: string
+  getInitialValues(mode: UiMode): Record<string, unknown>
+  getDerivedState(
+    basics: ProjectSubmitBasics,
+    activeFields: UiField[],
+    values: Record<string, unknown>,
+  ): ProjectDerivedState
+  handleFieldChange(context: FieldChangeContext): FieldChangeResult
+  appendBasicsArgs(args: string[], basics: ProjectSubmitBasics): void
+  skipField(field: UiField): boolean
+  augmentSubmission(context: SubmissionContext): void
+  validate(
+    activeMode: UiMode,
+    values: Record<string, unknown>,
+    derived: ProjectDerivedState,
+  ): boolean
+  isCustomWorkloadSelected(values: Record<string, unknown>): boolean
+  sectionLabel(section: UiSection): string
+  orderFieldOptions?(field: UiField, options: UiOption[]): UiOption[]
+  fieldPresentation(
+    field: UiField,
+    values: Record<string, unknown>,
+    activeMode: UiMode,
+  ): { hidden: boolean; label: string; disabled: boolean }
+  renderFieldExtras(context: RenderContext): ReactNode
+  renderSectionExtras(
+    section: UiSection,
+    context: Omit<RenderContext, 'field'>,
+  ): ReactNode
+  renderAdditionalConfig(context: Omit<RenderContext, 'field'>): ReactNode
+  renderMatrixExtras?(selectedWorkloads: string[]): ReactNode
+  applyMatrixWorkloads?(
+    overrides: Record<string, string>,
+    workloads: string[],
+  ): Record<string, string>
+  renderReviewBasics(derived: ProjectDerivedState): ReactNode
+  renderAdditionalReview(
+    values: Record<string, unknown>,
+    derived: ProjectDerivedState,
+  ): ReactNode
+}
+
+const CLUSTER_GPU_TYPES: Record<string, string> = {
+  hera: 'h200',
+  zeus: 'h200',
+  'old-zeus': 'h200',
+  b200: 'b200',
+  mi355x: 'mi355x',
+}
+
+const GPU_PRODUCT_PATTERNS: Array<[RegExp, string]> = [
+  [/mi[-_\s]?355x/i, 'mi355x'],
+  [/\bb[-_\s]?200\b/i, 'b200'],
+  [/\bh[-_\s]?200\b/i, 'h200'],
+  [/\bgh[-_\s]?200\b/i, 'gh200'],
+  [/\bh[-_\s]?100\b/i, 'h100'],
+  [/\ba[-_\s]?100\b/i, 'a100'],
+  [/\bl[-_\s]?40s\b/i, 'l40s'],
+  [/\ba[-_\s]?10\b/i, 'a10'],
+  [/\bv[-_\s]?100\b/i, 'v100'],
+  [/\bt[-_\s]?4\b/i, 't4'],
+]
+
+export function canonicalFournosGpuType(value: string | undefined): string {
+  const raw = value?.trim() || ''
+  if (!raw) return ''
+  for (const [pattern, shortName] of GPU_PRODUCT_PATTERNS) {
+    if (pattern.test(raw)) return shortName
+  }
+  const normalized = raw.toLowerCase()
+  if (['amd', 'nvidia', 'intel'].includes(normalized)) return ''
+  return /^[a-z0-9]+$/.test(normalized) ? normalized : ''
+}
+
+function setTensorParallelOverride(
+  overrides: Record<string, string>,
+  engineValue: unknown,
+  tpSize: number,
+): void {
+  const engine = String(engineValue || 'vllm').trim().toLowerCase()
+  const paths: Record<string, string> = {
+    vllm: 'rhaiis.engines.vllm.args.tensor-parallel-size',
+    sglang: 'rhaiis.engines.sglang.args.tp-size',
+    trtllm: 'rhaiis.engines.trtllm.args.tp_size',
+  }
+  overrides[paths[engine] || paths.vllm] = stringifyValue(tpSize)
+}
+
+function orderRhaiisFieldOptions(field: UiField, options: UiOption[]): UiOption[] {
+  if (field.key !== 'model') return options
+
+  const isPinnedModel = (option: UiOption) =>
+    [option.value, option.label].some((name) =>
+      name.toLowerCase().replace(/[^a-z0-9]/g, '').includes('qwen306b'),
+    )
+  const pinned = options.find(isPinnedModel)
+  const custom = options.find((option) => option.value === '__custom_model__')
+  const remaining = options
+    .filter((option) => option !== pinned && option.value !== '__custom_model__')
+    .sort((a, b) =>
+      a.label.localeCompare(b.label, undefined, { sensitivity: 'base', numeric: true })
+      || a.value.localeCompare(b.value, undefined, { sensitivity: 'base', numeric: true }),
+    )
+
+  return [...(pinned ? [pinned] : []), ...remaining, ...(custom ? [custom] : [])]
+}
+
+function stringifyValue(value: unknown): string {
+  if (Array.isArray(value)) return JSON.stringify(value)
+  if (typeof value === 'boolean') return value ? 'true' : 'false'
+  return value == null ? '' : String(value)
+}
+
+const RHAIIS_OVERRIDE_EXAMPLES = `# Engine / vLLM args
+rhaiis.engines.vllm.images.nvidia: vllm/vllm-openai:v0.24.0
+rhaiis.engines.vllm.images.amd: vllm/vllm-openai-rocm:v0.26.0
+rhaiis.engines.vllm.args.tensor-parallel-size: 1
+rhaiis.engines.vllm.args.max-model-len: 4096
+rhaiis.engines.vllm.args.kv-cache-dtype: fp8
+rhaiis.engines.vllm.args.enable-auto-tool-choice: true
+rhaiis.engines.vllm.args.tool-call-parser: openai
+
+# Environment variables
+rhaiis.env_vars.VLLM_SOME_FLAG: "1"
+rhaiis.env_vars.ANOTHER_VAR: "value"
+
+# Speculative decoding
+rhaiis.engines.vllm.args.speculative-config: '{"model":"...","num_speculative_tokens":7,"method":"eagle3"}'
+
+# Workload tuning (per-profile overrides)
+workloads.profile1.rates: [1,50]
+workloads.profile1.max_seconds: 30
+workloads.profile1.rampup: 0
+workloads.profile1.samples: 50
+
+# Deployment / cluster
+rhaiis.cluster_tag: "hera2"
+rhaiis.deploy.image_pull_secrets: ["my-image-pull"]
+benchmarks.guidellm.fs_group: 0`
+
+function rawOptionValue(field: UiField | undefined, value: unknown): unknown {
+  const option = field?.options.find((item) => item.value === value)
+  if (option && field?.maps_to && Object.prototype.hasOwnProperty.call(option.overrides, field.maps_to)) {
+    return option.overrides[field.maps_to]
+  }
+  return value
+}
+
+function modelTpSize(field: UiField | undefined, value: unknown): number | null {
+  if (!field || typeof value !== 'string') return null
+  const option = field.options.find((item) => item.value === value)
+  const extra = option?.extra || {}
+  const vllmArgs = extra.vllm_args as Record<string, unknown> | undefined
+  const sglangArgs = extra.sglang_args as Record<string, unknown> | undefined
+  const raw = vllmArgs?.['tensor-parallel-size']
+    ?? sglangArgs?.['tp-size']
+    ?? extra.tensor_parallel
+    ?? extra.tp_size
+    ?? extra.tp
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null
+}
+
+function parseOverrideLines(raw: string): Record<string, string> {
+  const overrides: Record<string, string> = {}
+  raw.split('\n').forEach((line) => {
+    const index = line.indexOf(':')
+    if (index > 0) overrides[line.slice(0, index).trim()] = line.slice(index + 1).trim()
+  })
+  return overrides
+}
+
+function workloadSelectionIncludesProfile5(field: UiField, selected: unknown): boolean {
+  if (!Array.isArray(selected)) return false
+  return selected.some((value) => {
+    const raw = rawOptionValue(field, value)
+    return raw === 'profile5' || (Array.isArray(raw) && raw.includes('profile5'))
+  })
+}
+
+function renderProfile5RunNote(benchmarkDescription: string): ReactNode {
+  return (
+    <div className="mt-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800" role="note">
+      <strong>Profile 5 (ultra-long context):</strong> PyTorch profiling and warmup never run for this profile. {benchmarkDescription}
+    </div>
+  )
+}
+
+const rhaiisSubmitAdapter: ProjectSubmitAdapter = {
+  requiresBuildSource: true,
+  buildSourceLabel: 'Build source',
+
+  getInitialValues(mode) {
+    const initial: Record<string, unknown> = {}
+    for (const field of mode.sections.flatMap((section) => section.fields)) {
+      if (field.key === 'warmup' || field.key === 'slack') initial[field.key] = true
+    }
+    return {
+      ...initial,
+      advanced_overrides: '',
+      custom_model_tp: 1,
+      custom_workload_data: 'prompt_tokens=1000,output_tokens=1000',
+      custom_workload_concurrencies: '1',
+      custom_workload_max_seconds: 450,
+      custom_workload_samples: '',
+    }
+  },
+
+  getDerivedState(basics, activeFields, values) {
+    const modelField = activeFields.find((field) => field.key === 'model')
+    const selectedModelTp = modelTpSize(modelField, values.model) || 1
+    const tpSize = Math.max(Number(values.tp_size) || selectedModelTp, 1)
+    return {
+      gpuType: canonicalFournosGpuType(basics.clusterGpuType)
+        || CLUSTER_GPU_TYPES[basics.cluster.trim().toLowerCase()]
+        || '',
+      selectedModelTp,
+      tpSize,
+      gpuCount: Math.max(Number(values.gpu_count) || 1, tpSize),
+    }
+  },
+
+  handleFieldChange({ field, value, values, modelField, engineField, autoEngineVersion }): FieldChangeResult {
+    if (field.key === 'model') {
+      const nextTp = value === '__custom_model__' ? 1 : modelTpSize(modelField, value) || 1
+      return { updates: { model: value, tp_size: nextTp, gpu_count: nextTp } }
+    }
+    if (field.key === 'tp_size') {
+      const nextTp = Math.max(Number(value) || 1, 1)
+      return {
+        updates: {
+          tp_size: nextTp,
+          gpu_count: Math.max(Number(values.gpu_count) || 1, nextTp),
+        },
+      }
+    }
+    if (field.key === 'engine' || field.key === 'accelerator') {
+      const nextEngine = field.key === 'engine' ? value : values.engine
+      const nextAccelerator = field.key === 'accelerator' ? value : values.accelerator
+      const engineOption = engineField?.options.find((option) => option.value === nextEngine)
+      const images = engineOption?.extra?.images as Record<string, unknown> | undefined
+      const defaultImage = typeof images?.[String(nextAccelerator)] === 'string'
+        ? String(images[String(nextAccelerator)])
+        : ''
+      if (defaultImage && (!values.engine_version || values.engine_version === autoEngineVersion)) {
+        return { updates: { engine_version: defaultImage }, autoEngineVersion: defaultImage }
+      }
+    }
+    if (field.key === 'engine_version') return { updates: {}, autoEngineVersion: '' }
+    if (field.key === 'agent_analysis' && value === true) {
+      return { updates: { compare_versions: true } }
+    }
+    return { updates: {} }
+  },
+
+  appendBasicsArgs(args, basics) {
+    if (basics.cluster.trim()) args.push(basics.cluster.trim())
+  },
+
+  skipField(field) {
+    return field.key === 'model' || field.key === 'workload'
+  },
+
+  augmentSubmission({ values, modelField, workloadField, derived, overrides }) {
+    const selectedModel = values.model
+    if (selectedModel === '__custom_model__') {
+      overrides['tests.rhaiis.model_key'] = 'custom'
+      const customName = String(values.custom_model_name || '').trim()
+      const customId = String(values.custom_model_id || '').trim()
+      if (customName) overrides['models.custom.name'] = customName
+      if (customId) overrides['models.custom.hf_model_id'] = customId
+      setTensorParallelOverride(overrides, values.engine, derived.tpSize)
+    } else if (selectedModel) {
+      overrides['tests.rhaiis.model_key'] = stringifyValue(rawOptionValue(modelField, selectedModel))
+      if (Number(values.tp_size) && Number(values.tp_size) !== derived.selectedModelTp) {
+        setTensorParallelOverride(overrides, values.engine, derived.tpSize)
+      }
+    }
+
+    const selectedWorkloads = Array.isArray(values.workload) ? values.workload as string[] : []
+    if (selectedWorkloads.length > 0) {
+      const workloadKeys = selectedWorkloads.map((item) =>
+        item === '__custom_workload__' ? 'custom' : rawOptionValue(workloadField, item)
+      )
+      overrides['tests.rhaiis.workload_keys'] = stringifyValue(workloadKeys)
+      if (selectedWorkloads.includes('__custom_workload__')) {
+        const customData = String(values.custom_workload_data || '').trim()
+        const customConcurrencies = String(values.custom_workload_concurrencies || '').trim()
+        if (customData) overrides['workloads.custom.data'] = customData
+        if (customConcurrencies) {
+          overrides['workloads.custom.rates'] = stringifyValue(
+            customConcurrencies.split(',').map((item) => Number(item.trim()) || 0)
+          )
+        }
+        if (values.custom_workload_max_seconds !== '' && values.custom_workload_max_seconds != null) {
+          overrides['workloads.custom.max_seconds'] = stringifyValue(Number(values.custom_workload_max_seconds) || 450)
+        }
+        if (values.custom_workload_samples !== '' && values.custom_workload_samples != null) {
+          overrides['workloads.custom.samples'] = stringifyValue(Number(values.custom_workload_samples))
+        }
+      }
+    }
+
+    const slackMember = String(values.slack_member_id || '').trim()
+    if (slackMember) overrides['tests.rhaiis.slack_user'] = slackMember
+    delete overrides['tests.rhaiis.slack_member_id']
+
+    const compareVersion = String(values.compare_version || '').trim()
+    if (compareVersion) overrides['tests.rhaiis.compare_version'] = compareVersion
+    delete overrides['rhaiis.compare_versions.enabled']
+
+    const engine = String(values.engine || '').trim()
+    if (values.prefix_caching !== undefined && engine) {
+      delete overrides['rhaiis.engines.vllm.args.enable-prefix-caching']
+      delete overrides['rhaiis.engines.vllm.args.no-enable-prefix-caching']
+      delete overrides['rhaiis.engines.sglang.args.disable-radix-cache']
+      delete overrides['rhaiis.engines.trtllm.trtllm_config.kv_cache_config.enable_block_reuse']
+      const prefixCaching = values.prefix_caching === true
+      if (engine === 'sglang') {
+        overrides['rhaiis.engines.sglang.args.disable-radix-cache'] = stringifyValue(!prefixCaching)
+      } else if (engine === 'trtllm') {
+        overrides['rhaiis.engines.trtllm.trtllm_config.kv_cache_config.enable_block_reuse'] = stringifyValue(prefixCaching)
+      } else {
+        overrides[prefixCaching
+          ? 'rhaiis.engines.vllm.args.enable-prefix-caching'
+          : 'rhaiis.engines.vllm.args.no-enable-prefix-caching'] = 'true'
+      }
+    }
+
+    Object.assign(overrides, parseOverrideLines(String(values.advanced_overrides || '')))
+  },
+
+  validate(activeMode, values, derived) {
+    const customModelValid = values.model !== '__custom_model__'
+      || !!String(values.custom_model_id || '').trim()
+    const customWorkloadSelected = this.isCustomWorkloadSelected(values)
+    const customWorkloadValid = !customWorkloadSelected || (
+      !!String(values.custom_workload_data || '').trim()
+      && !!String(values.custom_workload_concurrencies || '').trim()
+    )
+    const sizingValid = !!derived.gpuType && derived.gpuCount >= derived.tpSize
+    const slackValid = activeMode.id !== 'single'
+      || values.slack !== true
+      || !!String(values.slack_member_id || '').trim()
+    return customModelValid && customWorkloadValid && sizingValid && slackValid
+  },
+
+  isCustomWorkloadSelected(values) {
+    return Array.isArray(values.workload) && values.workload.includes('__custom_workload__')
+  },
+
+  sectionLabel(section) {
+    return section.id === 'model' ? 'Workload' : section.label
+  },
+
+  orderFieldOptions: orderRhaiisFieldOptions,
+
+  fieldPresentation(field, values, activeMode) {
+    return {
+      hidden: field.key === 'tp_size' && (!values.model || values.model === '__custom_model__'),
+      label: field.key === 'slack' ? 'Slack Notifications (always on)' : field.label || field.key,
+      disabled: field.key === 'slack' && activeMode.id === 'single',
+    }
+  },
+
+  renderFieldExtras({ field, values, setFieldValue, setValues }) {
+    if (field.key === 'model' && values.model === '__custom_model__') {
+      return (
+        <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
+          <label className="text-xs text-gray-600">
+            Model Name
+            <input
+              type="text"
+              value={String(values.custom_model_name || '')}
+              onChange={(e) => setFieldValue('custom_model_name', e.target.value)}
+              className="input mt-1"
+              placeholder="e.g. Llama-3.3-70B-Instruct-FP8"
+            />
+          </label>
+          <label className="text-xs text-gray-600 sm:col-span-2">
+            HuggingFace Model ID <span className="text-red-500">*</span>
+            <input
+              type="text"
+              value={String(values.custom_model_id || '')}
+              onChange={(e) => setFieldValue('custom_model_id', e.target.value)}
+              className="input mt-1"
+              placeholder="org/model"
+            />
+          </label>
+          <label className="text-xs text-gray-600">
+            TP Size
+            <input
+              type="number"
+              min={1}
+              value={Number(values.custom_model_tp) || 1}
+              onChange={(e) => {
+                const next = e.target.value === '' ? '' : Number(e.target.value)
+                setValues((prev) => ({
+                  ...prev,
+                  custom_model_tp: next,
+                  tp_size: next,
+                  gpu_count: Math.max(Number(prev.gpu_count) || 1, Number(next) || 1),
+                }))
+              }}
+              className="input mt-1"
+            />
+          </label>
+        </div>
+      )
+    }
+
+    if (field.key === 'workload') {
+      const customWorkload = this.isCustomWorkloadSelected(values)
+      const selectedProfile5 = workloadSelectionIncludesProfile5(field, values.workload)
+      if (!customWorkload && !selectedProfile5) return null
+      return (
+        <>
+          {customWorkload && (
+            <div className="mt-3 space-y-3 rounded-md border border-gray-200 bg-gray-50 p-3">
+              <label className="block text-xs text-gray-600">
+                Data <span className="text-red-500">*</span>
+                <input
+                  type="text"
+                  value={String(values.custom_workload_data || '')}
+                  onChange={(e) => setFieldValue('custom_workload_data', e.target.value)}
+                  className="input mt-1"
+                  placeholder="prompt_tokens=1000,output_tokens=1000"
+                />
+              </label>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <label className="text-xs text-gray-600">
+                  Concurrencies <span className="text-red-500">*</span>
+                  <input
+                    type="text"
+                    value={String(values.custom_workload_concurrencies || '')}
+                    onChange={(e) => setFieldValue('custom_workload_concurrencies', e.target.value)}
+                    className="input mt-1"
+                    placeholder="1,50,100"
+                  />
+                </label>
+                <label className="text-xs text-gray-600">
+                  Max Seconds
+                  <input
+                    type="number"
+                    min={1}
+                    value={Number(values.custom_workload_max_seconds) || 450}
+                    onChange={(e) => setFieldValue('custom_workload_max_seconds', e.target.value === '' ? '' : Number(e.target.value))}
+                    className="input mt-1"
+                  />
+                </label>
+                <label className="text-xs text-gray-600">
+                  Samples (optional)
+                  <input
+                    type="number"
+                    min={1}
+                    value={values.custom_workload_samples === '' ? '' : Number(values.custom_workload_samples) || ''}
+                    onChange={(e) => setFieldValue('custom_workload_samples', e.target.value === '' ? '' : Number(e.target.value))}
+                    className="input mt-1"
+                  />
+                </label>
+              </div>
+            </div>
+          )}
+          {selectedProfile5 && (
+            renderProfile5RunNote("Its benchmark still runs when Benchmark is enabled.")
+          )}
+        </>
+      )
+    }
+    return null
+  },
+
+  renderMatrixExtras(selectedWorkloads) {
+    if (!selectedWorkloads.includes('profile5')) return null
+    return (
+      renderProfile5RunNote("Its benchmark follows the pipeline's benchmark setting.")
+    )
+  },
+
+  applyMatrixWorkloads(overrides, workloads) {
+    return {
+      ...overrides,
+      'tests.rhaiis.workload_keys': JSON.stringify(workloads),
+    }
+  },
+
+  renderSectionExtras(section, { derived }) {
+    if (section.id !== 'infra') return null
+    return (
+      <div>
+        <label className="block text-sm font-medium text-gray-700">GPU Type</label>
+        <input
+          type="text"
+          value={derived.gpuType || 'Select a registered cluster or profile'}
+          readOnly
+          className="input mt-1 bg-gray-50 text-gray-500"
+        />
+        <p className="mt-1 text-xs text-gray-400">Derived from the selected Control Center cluster, with the RHAIIS profile as fallback.</p>
+      </div>
+    )
+  },
+
+  renderAdditionalConfig({ values, setFieldValue }) {
+    return (
+      <div className="rounded-lg border border-gray-200 p-4">
+        <label className="block text-sm font-medium text-gray-700">Advanced Config Overrides</label>
+        <details className="mt-3">
+          <summary className="inline-flex cursor-pointer list-none items-center rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm font-medium text-blue-700 hover:bg-blue-100">
+            📋 Show override examples
+          </summary>
+          <pre className="mt-2 overflow-x-auto whitespace-pre rounded-md border border-blue-100 bg-blue-50/60 p-3 font-mono text-xs leading-relaxed text-gray-800">
+            {RHAIIS_OVERRIDE_EXAMPLES}
+          </pre>
+        </details>
+        <textarea
+          value={String(values.advanced_overrides || '')}
+          onChange={(e) => setFieldValue('advanced_overrides', e.target.value)}
+          rows={4}
+          className="input mt-1 font-mono"
+          placeholder="key: value (one per line)"
+        />
+        <p className="mt-1 text-xs text-gray-400">
+          Optional Forge overrides. Use one <code>key: value</code> per line; these are applied last. To set runtime environment variables, use keys such as <code>rhaiis.env_vars.VLLM_SOME_FLAG</code>.
+        </p>
+      </div>
+    )
+  },
+
+  renderReviewBasics(derived) {
+    return <ReviewRow label="GPU type / count" value={`${derived.gpuType || 'auto'} / ${derived.gpuCount}`} />
+  },
+
+  renderAdditionalReview(values, derived) {
+    const customWorkloadSelected = this.isCustomWorkloadSelected(values)
+    const hasAdditionalSettings = values.model === '__custom_model__'
+      || customWorkloadSelected
+      || String(values.advanced_overrides || '').trim()
+    if (!hasAdditionalSettings) return null
+    return (
+      <ReviewSection title="Additional RHAIIS Settings">
+        {values.model === '__custom_model__' && (
+          <>
+            <ReviewRow label="Custom model name" value={String(values.custom_model_name || '') || '-'} />
+            <ReviewRow label="HuggingFace model ID" value={String(values.custom_model_id || '')} missing={!String(values.custom_model_id || '').trim()} />
+            <ReviewRow label="TP size" value={String(derived.tpSize)} />
+          </>
+        )}
+        {customWorkloadSelected && (
+          <>
+            <ReviewRow label="Custom workload data" value={String(values.custom_workload_data || '')} missing={!String(values.custom_workload_data || '').trim()} />
+            <ReviewRow label="Custom concurrencies" value={String(values.custom_workload_concurrencies || '')} missing={!String(values.custom_workload_concurrencies || '').trim()} />
+            <ReviewRow label="Custom max seconds" value={String(values.custom_workload_max_seconds || '')} />
+            {values.custom_workload_samples !== '' && <ReviewRow label="Custom samples" value={String(values.custom_workload_samples)} />}
+          </>
+        )}
+        {String(values.advanced_overrides || '').trim() && (
+          <ReviewRow label="Advanced overrides" value={String(values.advanced_overrides)} mono />
+        )}
+      </ReviewSection>
+    )
+  },
+}
+
+export function getProjectSubmitAdapter(project: string): ProjectSubmitAdapter | null {
+  return project === 'rhaiis' ? rhaiisSubmitAdapter : null
+}
