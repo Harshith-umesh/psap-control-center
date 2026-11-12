@@ -9,6 +9,7 @@ from app.core.database import get_db
 from app.core.auth import require_admin
 from app.services.cluster_service import ClusterService
 from app.services.kubernetes_service import KubernetesService
+from app.services import gpu_status_cache
 from app.schemas.cluster import (
     ClusterCreate,
     ClusterUpdate,
@@ -365,7 +366,7 @@ async def get_gpu_status(
     cluster_id: str,
     db: AsyncSession = Depends(get_db)
 ):
-    """Get live GPU allocation status via DRA or legacy counting."""
+    """Return the latest cluster-refresh snapshot, falling back to a live read."""
     service = ClusterService(db)
     cluster = await service.get_cluster(cluster_id)
 
@@ -376,20 +377,17 @@ async def get_gpu_status(
         raise HTTPException(status_code=400, detail="Cluster has no kubeconfig configured")
 
     try:
+        cached = gpu_status_cache.get(cluster_id)
+        if cached is not None:
+            allocation = GpuAllocationStatusSchema.model_validate(cached)
+            await _sync_gpu_pod_history(db, cluster_id, allocation.gpu_pods or [])
+            return allocation
+
         k8s_service = KubernetesService(cluster.kubeconfig_path)
         allocation = await _run_in_thread(k8s_service.get_gpu_allocation)
 
         # Persist GPU pod sightings so we can show history later
-        from app.services.gpu_pod_history_service import sync_gpu_pods
-        try:
-            await sync_gpu_pods(db, cluster_id, [
-                {"name": p.name, "namespace": p.namespace, "gpu_count": p.gpu_count, "node": p.node}
-                for p in allocation.gpu_pods
-            ])
-        except Exception as sync_err:
-            logger.warning(f"GPU pod history sync failed: {sync_err}")
-
-        return GpuAllocationStatusSchema(
+        result = GpuAllocationStatusSchema(
             gpu_allocation_mode=allocation.gpu_allocation_mode,
             dra_available=allocation.dra_available,
             dra_api_version=allocation.dra_api_version,
@@ -410,12 +408,33 @@ async def get_gpu_status(
                 "node": p.node,
             } for p in allocation.gpu_pods],
         )
+        gpu_status_cache.store(cluster_id, result.model_dump())
+        await _sync_gpu_pod_history(db, cluster_id, result.gpu_pods or [])
+        return result
     except Exception as e:
         logger.error(f"Failed to fetch GPU status for cluster {cluster_id}: {e}")
         raise HTTPException(
             status_code=500,
             detail="Failed to fetch GPU allocation status",
         ) from e
+
+
+async def _sync_gpu_pod_history(db, cluster_id: str, gpu_pods) -> None:
+    """Keep GPU pod history in sync while serving cached or live status."""
+    from app.services.gpu_pod_history_service import sync_gpu_pods
+
+    try:
+        await sync_gpu_pods(db, cluster_id, [
+            {
+                "name": pod.name,
+                "namespace": pod.namespace,
+                "gpu_count": pod.gpu_count,
+                "node": pod.node,
+            }
+            for pod in gpu_pods
+        ])
+    except Exception as sync_err:
+        logger.warning(f"GPU pod history sync failed: {sync_err}")
 
 
 @router.get("/{cluster_id}/gpu-pod-history")

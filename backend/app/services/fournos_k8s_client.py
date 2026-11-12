@@ -255,6 +255,7 @@ def watch_fournos_jobs(
         )
     except ApiException as exc:
         logger.warning("Watch stream ended: %s", exc.reason)
+        raise
 
 
 # -- Tekton PipelineRun / TaskRun --
