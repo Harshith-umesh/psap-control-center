@@ -23,7 +23,7 @@ import { useHearthStatus, useDisconnectHearth } from '../hooks/useHearth'
 const navigation = [
   { name: 'Dashboard', href: '/dashboard', icon: HomeIcon },
   { name: 'Calendar', href: '/calendar', icon: CalendarDaysIcon },
-  { name: 'Testing', href: '/testing', icon: BeakerIcon, badge: 'Experimental' },
+  { name: 'Testing', href: '/testing', icon: BeakerIcon },
   { name: 'Results', href: '/results', icon: ChartBarIcon, comingSoon: true },
   { name: 'Cost Explorer', href: '/cost-explorer', icon: CurrencyDollarIcon, adminOnly: true },
   { name: 'Settings', href: '/settings', icon: Cog6ToothIcon, adminOnly: true },
