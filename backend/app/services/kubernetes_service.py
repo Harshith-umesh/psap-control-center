@@ -511,7 +511,6 @@ class KubernetesService:
         gpu_config = self._load_gpu_config_from_configmap()
         gpu_resource = gpu_config.get("gpu_resource_name", "nvidia.com/gpu")
         gpu_pods: List[GpuPodInfo] = []
-        dra_managed_nodes = set(node_gpus.keys())
         try:
             pods = self._list_pods_snapshot()
             for pod in pods.items:
@@ -532,10 +531,10 @@ class KubernetesService:
                     gpu_req = int(reqs.get(gpu_resource, 0))
                     if gpu_req > 0:
                         pod_total_gpu += gpu_req
-                        # Only increment allocation for nodes NOT already
-                        # tracked by DRA ResourceClaims
-                        if (pod_node and pod_node in node_gpus
-                                and pod_node not in dra_managed_nodes):
+                        # DRA-backed pods are skipped above via resource_claims.
+                        # Traditional GPU requests must still count on nodes
+                        # that also publish DRA ResourceSlices.
+                        if pod_node and pod_node in node_gpus:
                             node_gpus[pod_node].gpu_allocated += gpu_req
                 if pod_total_gpu > 0:
                     gpu_pods.append(GpuPodInfo(
