@@ -301,9 +301,7 @@ function JobsTable({
                   {job.name}
                 </Link>
               </td>
-              <td className="px-4 py-3 text-sm text-gray-500" title={!isAuthenticated() ? 'Sign in to view the job owner' : undefined}>
-                {job.owner || (isAuthenticated() ? '-' : 'Sign in to view')}
-              </td>
+              <td className="px-4 py-3 text-sm text-gray-500">{job.owner || '-'}</td>
               <td className="px-4 py-3 text-sm text-gray-900">{job.project || '-'}</td>
               <td className="px-4 py-3 text-sm text-gray-900">{job.cluster || '-'}</td>
               <td className="px-4 py-3 text-sm text-gray-500">
