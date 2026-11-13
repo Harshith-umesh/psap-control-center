@@ -43,7 +43,7 @@ type NavigationItem = {
 const navigation: NavigationItem[] = [
   { name: 'Overview', href: '/dashboard', icon: HomeIcon },
   { name: 'Calendar', href: '/calendar', icon: CalendarDaysIcon },
-  { name: 'Fournos Dashboard', href: '/testing?tab=live', icon: BeakerIcon, badge: 'Experimental' },
+  { name: 'Fournos Dashboard', href: '/testing?tab=live', icon: BeakerIcon },
   { name: 'Results', href: '/results', icon: ChartBarIcon, comingSoon: true },
   { name: 'Cost Explorer', href: '/cost-explorer', icon: CurrencyDollarIcon, adminOnly: true },
   { name: 'Settings', href: '/settings', icon: Cog6ToothIcon, adminOnly: true },
