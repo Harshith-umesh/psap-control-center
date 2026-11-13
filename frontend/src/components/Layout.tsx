@@ -12,9 +12,7 @@ import { Dialog, Transition } from '@headlessui/react'
 import {
   Bars3Icon,
   HomeIcon,
-  ServerStackIcon,
   CalendarDaysIcon,
-  ClipboardDocumentListIcon,
   BeakerIcon,
   ChartBarIcon,
   ArrowTopRightOnSquareIcon,
@@ -32,7 +30,6 @@ import HearthConnectModal from './HearthConnectModal'
 import { isAuthenticated, isAdmin, getDisplayName, clearSession } from '../stores/authStore'
 import { authApi } from '../services/api'
 import { useHearthStatus, useDisconnectHearth } from '../hooks/useHearth'
-import { useReservations } from '../hooks/useReservations'
 
 type NavigationItem = {
   name: string
@@ -45,10 +42,8 @@ type NavigationItem = {
 
 const navigation: NavigationItem[] = [
   { name: 'Overview', href: '/dashboard', icon: HomeIcon },
-  { name: 'Clusters', href: '/clusters', icon: ServerStackIcon },
-  { name: 'Reservations', href: '/reservations', icon: ClipboardDocumentListIcon },
   { name: 'Calendar', href: '/calendar', icon: CalendarDaysIcon },
-  { name: 'Fournos Dashboard', href: '/testing?tab=live', icon: BeakerIcon, badge: 'Experimental' },
+  { name: 'Fournos Dashboard', href: '/testing?tab=live', icon: BeakerIcon },
   { name: 'Results', href: '/results', icon: ChartBarIcon, comingSoon: true },
   { name: 'Cost Explorer', href: '/cost-explorer', icon: CurrencyDollarIcon, adminOnly: true },
   { name: 'Settings', href: '/settings', icon: Cog6ToothIcon, adminOnly: true },
@@ -264,13 +259,6 @@ export default function Layout() {
 
   const { data: hearthStatus } = useHearthStatus()
   const admin = isAdmin()
-  const { data: pendingReservationsData } = useReservations(
-    { status: 'pending' },
-    { enabled: admin },
-  )
-  const pendingReservationCount = admin
-    ? (pendingReservationsData?.reservations?.length ?? 0)
-    : 0
   const filteredNav = navigation.filter(item => !item.adminOnly || admin)
 
   const syncAuth = useCallback(() => setAuthed(isAuthenticated()), [])
@@ -404,11 +392,6 @@ export default function Layout() {
                                 Soon
                               </span>
                             )}
-                            {item.name === 'Reservations' && pendingReservationCount > 0 && (
-                              <span className="ml-auto rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-300">
-                                {pendingReservationCount} pending
-                              </span>
-                            )}
                             {item.badge && (
                               <span className="ml-auto rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-300">
                                 {item.badge}
@@ -502,11 +485,6 @@ export default function Layout() {
                     {item.comingSoon && (
                       <span className="ml-auto text-xs text-gray-500 bg-white/10 px-2 py-0.5 rounded-full">
                         Soon
-                      </span>
-                    )}
-                    {item.name === 'Reservations' && pendingReservationCount > 0 && (
-                      <span className="ml-auto rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-300">
-                        {pendingReservationCount} pending
                       </span>
                     )}
                     {item.badge && (
