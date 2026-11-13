@@ -4,7 +4,7 @@ import { Dialog, Transition } from '@headlessui/react'
 import {
   Bars3Icon,
   HomeIcon,
-  CalendarDaysIcon,
+  ServerStackIcon,
   BeakerIcon,
   ChartBarIcon,
   CurrencyDollarIcon,
@@ -22,7 +22,7 @@ import { useHearthStatus, useDisconnectHearth } from '../hooks/useHearth'
 
 const navigation = [
   { name: 'Dashboard', href: '/dashboard', icon: HomeIcon },
-  { name: 'Calendar', href: '/calendar', icon: CalendarDaysIcon },
+  { name: 'Clusters', href: '/clusters', icon: ServerStackIcon },
   { name: 'Testing', href: '/testing', icon: BeakerIcon },
   { name: 'Results', href: '/results', icon: ChartBarIcon, comingSoon: true },
   { name: 'Cost Explorer', href: '/cost-explorer', icon: CurrencyDollarIcon, adminOnly: true },

@@ -274,12 +274,12 @@ function JobsTable({
       <table className="min-w-full divide-y divide-gray-200">
         <thead className="bg-gray-50">
           <tr>
+            <SortableTh label="Status" sortKey="status" sort={sort} onSort={onSort} />
             <SortableTh label="Name" sortKey="name" sort={sort} onSort={onSort} />
+            <SortableTh label="Owner" sortKey="owner" sort={sort} onSort={onSort} />
             <SortableTh label="Project" sortKey="project" sort={sort} onSort={onSort} />
             <SortableTh label="Cluster" sortKey="cluster" sort={sort} onSort={onSort} />
-            <SortableTh label="Status" sortKey="status" sort={sort} onSort={onSort} />
             <SortableTh label={source === 'live' ? 'Age' : 'Date'} sortKey={source === 'live' ? 'age' : 'date'} sort={sort} onSort={onSort} />
-            <SortableTh label="Owner" sortKey="owner" sort={sort} onSort={onSort} />
             <SortableTh label="Triggered By" sortKey="triggered_by" sort={sort} onSort={onSort} />
             {source === 'history' && <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">MLflow</th>}
             <th className="px-4 py-3" />
@@ -289,6 +289,11 @@ function JobsTable({
           {jobs.map((job) => (
             <tr key={job.name} className="hover:bg-gray-50">
               <td className="px-4 py-3 text-sm">
+                <span className={clsx('px-2 py-0.5 rounded-full text-xs font-medium', STATUS_COLORS[job.status] || STATUS_COLORS.Unknown)}>
+                  {job.status}
+                </span>
+              </td>
+              <td className="px-4 py-3 text-sm">
                 <Link
                   to={`/testing/jobs/${job.name}`}
                   className="text-indigo-600 hover:text-indigo-800 font-medium"
@@ -296,19 +301,16 @@ function JobsTable({
                   {job.name}
                 </Link>
               </td>
+              <td className="px-4 py-3 text-sm text-gray-500" title={!isAuthenticated() ? 'Sign in to view the job owner' : undefined}>
+                {job.owner || (isAuthenticated() ? '-' : 'Sign in to view')}
+              </td>
               <td className="px-4 py-3 text-sm text-gray-900">{job.project || '-'}</td>
               <td className="px-4 py-3 text-sm text-gray-900">{job.cluster || '-'}</td>
-              <td className="px-4 py-3 text-sm">
-                <span className={clsx('px-2 py-0.5 rounded-full text-xs font-medium', STATUS_COLORS[job.status] || STATUS_COLORS.Unknown)}>
-                  {job.status}
-                </span>
-              </td>
               <td className="px-4 py-3 text-sm text-gray-500">
                 {source === 'live'
                   ? formatAge(job.created_at)
                   : formatHistoryDate(job)}
               </td>
-              <td className="px-4 py-3 text-sm text-gray-500">{job.owner || '-'}</td>
               <td className="px-4 py-3 text-sm text-gray-500">
                 {job.trigger_type === 'recurring' && job.triggered_by_schedule ? (
                   <Link
