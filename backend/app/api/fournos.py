@@ -393,7 +393,9 @@ async def list_jobs(
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=200),
 ):
-    include_owner = get_current_user(request) is not None
+    # Owner names are visible in job summaries. Keep owner-specific filtering
+    # restricted to signed-in users.
+    can_filter_owner = get_current_user(request) is not None
     if tab == "live":
         jobs = await _get_live_jobs()
         if project:
@@ -411,13 +413,13 @@ async def list_jobs(
                 j for j in jobs
                 if j.get("status", {}).get("phase") == status
             ]
-        if owner and include_owner:
+        if owner and can_filter_owner:
             jobs = [
                 j for j in jobs
                 if j.get("spec", {}).get("owner") == owner
             ]
         summaries = [
-            _live_job_to_summary(j, include_owner=include_owner) for j in jobs
+            _live_job_to_summary(j, include_owner=True) for j in jobs
         ]
         key_fn = _live_sort_key(sort_by)
         summaries.sort(key=key_fn, reverse=(sort_dir == "desc"))
@@ -433,7 +435,7 @@ async def list_jobs(
                 project=project or None,
                 cluster=cluster or None,
                 status=status or None,
-                owner=(owner or None) if include_owner else None,
+                owner=(owner or None) if can_filter_owner else None,
                 created_after=created_after,
                 created_before=created_before,
                 sort_by=sort_by or None,
@@ -442,7 +444,7 @@ async def list_jobs(
                 offset=(page - 1) * per_page,
             )
         summaries = [
-            _db_job_to_summary(j, include_owner=include_owner) for j in db_jobs
+            _db_job_to_summary(j, include_owner=True) for j in db_jobs
         ]
 
     return {
