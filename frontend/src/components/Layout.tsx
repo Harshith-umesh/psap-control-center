@@ -12,7 +12,7 @@ import { Dialog, Transition } from '@headlessui/react'
 import {
   Bars3Icon,
   HomeIcon,
-  CalendarDaysIcon,
+  ServerStackIcon,
   BeakerIcon,
   ChartBarIcon,
   ArrowTopRightOnSquareIcon,
@@ -42,7 +42,7 @@ type NavigationItem = {
 
 const navigation: NavigationItem[] = [
   { name: 'Overview', href: '/dashboard', icon: HomeIcon },
-  { name: 'Calendar', href: '/calendar', icon: CalendarDaysIcon },
+  { name: 'Clusters', href: '/clusters', icon: ServerStackIcon },
   { name: 'Fournos Dashboard', href: '/testing?tab=live', icon: BeakerIcon },
   { name: 'Results', href: '/results', icon: ChartBarIcon, comingSoon: true },
   { name: 'Cost Explorer', href: '/cost-explorer', icon: CurrencyDollarIcon, adminOnly: true },
